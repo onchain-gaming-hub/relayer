@@ -89,8 +89,13 @@ impl GlobalThrottle {
                 }
             }
         };
-        let result = fut.await;
-        self.balance_inflight.borrow_mut().take();
+        let result = fut.clone().await;
+        // Clear the slot only if it still holds *this* future (a newer one may have replaced it).
+        let mut slot = self.balance_inflight.borrow_mut();
+        if slot.as_ref().is_some_and(|f| f.ptr_eq(&fut)) {
+            slot.take();
+        }
+        drop(slot);
         if let Ok(lamports) = result {
             self.balance
                 .set(Some((lamports, Date::now().as_millis() as f64)));

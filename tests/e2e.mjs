@@ -136,7 +136,7 @@ async function suiteA() {
   const t10 = mk(freshSeed());
   r = await relay(t10, {});
   check('T10 missing token', r.status === 401 && r.json?.code === 'unauthorized');
-  r = await relay(t10, { token: await tokenFor(t10.user_hex, { exp: String(Math.floor(Date.now() / 1000) - 10) }) });
+  r = await relay(t10, { token: await tokenFor(t10.user_hex, { exp: String(Math.floor(Date.now() / 1000) - 120) }) });
   check('T10 expired token', r.status === 401, r.json?.reason);
   r = await relay(t10, { token: await tokenFor(t10.user_hex, { aud: 'other-client' }) });
   check('T10 wrong aud', r.status === 401, r.json?.reason);
@@ -198,7 +198,12 @@ async function suiteA() {
   await setState({ send: 'http429' });
   r = await relayAs(freshSeed());
   check('T24 rpc http 429', r.status === 502 && r.json?.code === 'rpc_rejected');
+  await setState({ send: 'already' });
+  r = await relayAs(freshSeed());
+  check('already-processed -> 200 with signature', r.status === 200 && typeof r.json?.signature === 'string', `${r.status}`);
   await setState({ send: 'ok' });
+  const ct = await relay(mk(freshSeed()), { token: tok, contentType: 'application/jsonx' });
+  check('T11 exact media type', ct.status === 415, `${ct.status}`);
 
   // T15 + audit: D1 rows == RPC sends during this suite (4xx never written)
   await sleep(1500);

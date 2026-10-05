@@ -11,6 +11,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use solana_pubkey::Pubkey;
 
+use crate::config::JWT_LEEWAY_SECS;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Jwk {
     pub kid: String,
@@ -43,6 +45,7 @@ pub enum AuthError {
     UnknownKid(String),
     BadSignature,
     Expired,
+    NotYetValid,
     BadAudience,
     BadIssuer,
 }
@@ -89,8 +92,13 @@ pub fn verify(
         .get("exp")
         .and_then(Value::as_f64)
         .ok_or(AuthError::Malformed)?;
-    if now_secs >= exp {
+    if now_secs >= exp + JWT_LEEWAY_SECS {
         return Err(AuthError::Expired);
+    }
+    if let Some(nbf) = claims.get("nbf").and_then(Value::as_f64)
+        && nbf > now_secs + JWT_LEEWAY_SECS
+    {
+        return Err(AuthError::NotYetValid);
     }
     let aud_ok = match claims.get("aud") {
         Some(Value::String(a)) => a == aud,
@@ -207,6 +215,17 @@ mod tests {
         let jwks = [jwk];
         let t = token(&sk, json!({"alg":"ES256","kid":"k1"}), claims(500.0));
         assert_eq!(verify(&t, &jwks, 1000.0, AUD, ISS), Err(AuthError::Expired));
+        // within leeway
+        assert!(verify(&t, &jwks, 520.0, AUD, ISS).is_ok());
+        let t = token(
+            &sk,
+            json!({"alg":"ES256","kid":"k1"}),
+            json!({"aud":AUD,"iss":ISS,"exp":2000.0,"nbf":1500.0}),
+        );
+        assert_eq!(
+            verify(&t, &jwks, 1000.0, AUD, ISS),
+            Err(AuthError::NotYetValid)
+        );
         let t = token(
             &sk,
             json!({"alg":"ES256","kid":"k1"}),

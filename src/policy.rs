@@ -291,6 +291,39 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn rejects_message_v1() {
+        let (relayer, user) = setup();
+        let msg = solana_message::v1::Message::try_compile_with_config(
+            &relayer,
+            &[memo_ix(&user.pubkey(), b"m")],
+            Hash::new_from_array([7; 32]),
+            solana_message::v1::TransactionConfig {
+                priority_fee: Some(1_000_000_000),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let tx = signed(VersionedMessage::V1(msg), &user);
+        assert_eq!(
+            validate(&tx, &relayer, 128),
+            Err("unsupported message version")
+        );
+    }
+
+    #[test]
+    fn rejects_two_readonly_signers() {
+        let (relayer, user) = setup();
+        let mut tx = good_tx(&relayer, &user);
+        if let VersionedMessage::Legacy(m) = &mut tx.message {
+            m.header = MessageHeader {
+                num_readonly_signed_accounts: 2,
+                ..m.header
+            };
+        }
+        assert!(validate(&tx, &relayer, 128).is_err());
+    }
+
+    #[test]
     fn rejects_memo_with_no_accounts() {
         let (relayer, user) = setup();
         let mut tx = good_tx(&relayer, &user);

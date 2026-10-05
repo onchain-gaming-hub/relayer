@@ -50,6 +50,7 @@ http.createServer(async (req, res) => {
       switch (state.send) {
         case 'ok': return ok(crypto.randomBytes(32).toString('hex'));
         case 'reject': return json(res, 200, { jsonrpc: '2.0', id: rpc.id, error: { code: -32002, message: 'Transaction simulation failed: Blockhash not found' } });
+        case 'already': return json(res, 200, { jsonrpc: '2.0', id: rpc.id, error: { code: -32002, message: 'Transaction simulation failed: This transaction has already been processed' } });
         case 'http429': return json(res, 429, { error: 'Too many requests' });
         case 'http503': return json(res, 503, {});
         case 'hang': return; // never respond

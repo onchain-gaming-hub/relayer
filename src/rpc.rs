@@ -15,6 +15,8 @@ pub enum SendOutcome {
     Rejected { reason: String, http_429: bool },
     /// Timeout, transport error, HTTP 5xx, or unparseable 200: it may have been forwarded.
     Unknown(String),
+    /// The exact same signed tx already landed (resubmission).
+    AlreadyProcessed,
 }
 
 enum Raw {
@@ -72,6 +74,9 @@ pub fn classify_send(status: u16, text: &str) -> SendOutcome {
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or("rpc error");
+        if msg.contains("already been processed") || msg.contains("AlreadyProcessed") {
+            return SendOutcome::AlreadyProcessed;
+        }
         return SendOutcome::Rejected {
             reason: truncate(msg, 200),
             http_429: false,
@@ -178,6 +183,13 @@ mod tests {
                 ..
             }
         ));
+        assert_eq!(
+            classify_send(
+                200,
+                r#"{"error":{"code":-32002,"message":"Transaction simulation failed: This transaction has already been processed"}}"#
+            ),
+            SendOutcome::AlreadyProcessed
+        );
         assert!(matches!(
             classify_send(429, "Too many requests"),
             SendOutcome::Rejected { http_429: true, .. }

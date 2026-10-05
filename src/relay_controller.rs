@@ -4,7 +4,9 @@
 //! on a fetch (GlobalThrottle, RPC) lets another request for the same wallet in. The
 //! in-flight check-and-set below therefore runs synchronously before the first `await`.
 
-use std::cell::Cell;
+use std::{cell::Cell, time::Duration};
+
+use futures_util::future::{Either, select};
 
 use serde::Deserialize;
 use serde_json::json;
@@ -18,6 +20,7 @@ use crate::{
 };
 
 const COOLDOWN_KEY: &str = "cooldown_until";
+const ADMIT_MARGIN_MS: u64 = 2_000;
 
 #[derive(Deserialize)]
 pub struct RelayJob {
@@ -34,12 +37,18 @@ pub struct RelayController {
     inflight_since: Cell<Option<f64>>,
 }
 
-/// Clears the in-flight flag on every exit path, including early returns and errors.
-struct InflightGuard<'a>(&'a Cell<Option<f64>>);
+/// Clears the in-flight flag on every exit path — but only if it still holds *this*
+/// request's stamp. A stale lock taken over by a newer request must survive the old guard.
+struct InflightGuard<'a> {
+    flag: &'a Cell<Option<f64>>,
+    owner: f64,
+}
 
 impl Drop for InflightGuard<'_> {
     fn drop(&mut self) {
-        self.0.set(None);
+        if self.flag.get() == Some(self.owner) {
+            self.flag.set(None);
+        }
     }
 }
 
@@ -66,7 +75,10 @@ impl DurableObject for RelayController {
             return ApiError::in_progress().into_response();
         }
         self.inflight_since.set(Some(now));
-        let _guard = InflightGuard(&self.inflight_since);
+        let _guard = InflightGuard {
+            flag: &self.inflight_since,
+            owner: now,
+        };
 
         match self.relay(req, &cfg, now).await {
             Ok(resp) => Ok(resp),
@@ -97,12 +109,19 @@ impl RelayController {
             return Err(ApiError::cooldown(cooldown_until - now));
         }
 
-        self.admit().await?;
+        // Bounded: GlobalThrottle may itself wait up to one RPC timeout on getBalance.
+        let admit_budget = Duration::from_millis(cfg.rpc_timeout_ms + ADMIT_MARGIN_MS);
+        match select(Box::pin(self.admit()), Box::pin(Delay::from(admit_budget))).await {
+            Either::Left((result, _)) => result?,
+            Either::Right(_) => return Err(ApiError::upstream("global admit timeout")),
+        }
 
         let outcome = rpc::send_transaction(&cfg.rpc_url, cfg.rpc_timeout_ms, &job.tx).await;
         let done = Date::now().as_millis() as f64;
         let (cooldown_ms, audit) = match &outcome {
-            SendOutcome::Accepted(_) => (cfg.cooldown_ms, ("success", None)),
+            SendOutcome::Accepted(_) | SendOutcome::AlreadyProcessed => {
+                (cfg.cooldown_ms, ("success", None))
+            }
             SendOutcome::Rejected { reason, http_429 } => {
                 if *http_429 {
                     console_warn!("rpc http 429 (R6) for {}", job.user);
@@ -126,6 +145,11 @@ impl RelayController {
         match outcome {
             SendOutcome::Accepted(sig) => Response::from_json(&json!({ "signature": sig }))
                 .map_err(|e| ApiError::internal(e.to_string())),
+            // The same signed tx already landed: report it as the success it is.
+            SendOutcome::AlreadyProcessed => {
+                Response::from_json(&json!({ "signature": job.signature }))
+                    .map_err(|e| ApiError::internal(e.to_string()))
+            }
             SendOutcome::Rejected { reason, .. } => {
                 Err(ApiError::rpc_rejected(reason, cfg.reject_cooldown_ms))
             }

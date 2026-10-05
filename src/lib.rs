@@ -23,7 +23,8 @@ use solana_signer::Signer;
 use worker::*;
 
 use config::{
-    Config, DEVNET_GENESIS_HASH, JWKS_UNKNOWN_KID_REFETCH_MS, MAX_BODY_BYTES, WalletBinding,
+    Config, DEVNET_GENESIS_HASH, JWKS_TTL_MS, JWKS_UNKNOWN_KID_REFETCH_MS, MAX_BODY_BYTES,
+    WalletBinding,
 };
 use error::ApiError;
 
@@ -68,18 +69,25 @@ pub mod txcore {
 
 thread_local! {
     /// Per-isolate caches. Wasm workers are single-threaded.
-    static JWKS: RefCell<Option<Vec<jwt::Jwk>>> = const { RefCell::new(None) };
+    static JWKS: RefCell<Option<(Vec<jwt::Jwk>, f64)>> = const { RefCell::new(None) };
+    static RELAYER_KEYPAIR: RefCell<Option<Keypair>> = const { RefCell::new(None) };
     static JWKS_LAST_FORCED_REFETCH: Cell<f64> = const { Cell::new(f64::NEG_INFINITY) };
     static DEVNET_CONFIRMED: Cell<bool> = const { Cell::new(false) };
 }
 
+/// Decoded once per isolate (secrets do not change within an isolate's lifetime).
 fn relayer_keypair(env: &Env) -> std::result::Result<Keypair, ApiError> {
+    if let Some(kp) = RELAYER_KEYPAIR.with(|c| c.borrow().as_ref().map(Keypair::insecure_clone)) {
+        return Ok(kp);
+    }
     let secret = env
         .secret("RELAYER_PRIVATE_KEY")
         .map_err(|_| ApiError::internal("missing RELAYER_PRIVATE_KEY"))?
         .to_string();
-    Keypair::try_from_base58_string(secret.trim())
-        .map_err(|_| ApiError::internal("RELAYER_PRIVATE_KEY is not a valid base58 keypair"))
+    let kp = Keypair::try_from_base58_string(secret.trim())
+        .map_err(|_| ApiError::internal("RELAYER_PRIVATE_KEY is not a valid base58 keypair"))?;
+    RELAYER_KEYPAIR.with(|c| *c.borrow_mut() = Some(kp.insecure_clone()));
+    Ok(kp)
 }
 
 pub(crate) fn relayer_keypair_pubkey(env: &Env) -> std::result::Result<String, ApiError> {
@@ -142,6 +150,10 @@ fn relayer_info(env: &Env, cfg: &Config) -> std::result::Result<Response, ApiErr
         "cooldown_ms": cfg.cooldown_ms,
         "allowlist": [policy::MEMO_V2.to_string()],
         "max_memo_bytes": cfg.max_memo_bytes,
+        "wallet_binding": match cfg.wallet_binding {
+            WalletBinding::Wallets => "wallets",
+            WalletBinding::Off => "off",
+        },
     }))
     .map_err(|e| ApiError::internal(e.to_string()))
 }
@@ -163,10 +175,8 @@ async fn handle_relay(
         .ok()
         .flatten()
         .unwrap_or_default();
-    if !content_type
-        .to_ascii_lowercase()
-        .starts_with("application/json")
-    {
+    let media_type = content_type.split(';').next().unwrap_or_default().trim();
+    if !media_type.eq_ignore_ascii_case("application/json") {
         return Err(ApiError::content_type());
     }
     let body = read_body_limited(req, MAX_BODY_BYTES).await?;
@@ -302,19 +312,28 @@ async fn authenticate(
         WalletBinding::Wallets if !jwt::token_binds_wallet(&claims, user) => Err(
             ApiError::unauthorized("token does not belong to the transaction signer"),
         ),
-        _ => Ok(()),
+        WalletBinding::Wallets => Ok(()),
+        WalletBinding::Off => {
+            // R5 fallback: any valid Web3Auth user can relay for any keypair.
+            console_warn!("WALLET_BINDING=off: idToken not bound to signer {user}");
+            Ok(())
+        }
     }
 }
 
 async fn load_jwks(cfg: &Config, force: bool) -> std::result::Result<Vec<jwt::Jwk>, ApiError> {
-    if !force && let Some(keys) = JWKS.with(|c| c.borrow().clone()) {
+    let cached = JWKS.with(|c| c.borrow().clone());
+    if !force
+        && let Some((keys, fetched_at)) = cached
+        && now_ms() - fetched_at < JWKS_TTL_MS
+    {
         return Ok(keys);
     }
     let text = rpc::get_text(&cfg.web3auth_jwks_url, cfg.rpc_timeout_ms)
         .await
         .map_err(|e| ApiError::upstream(format!("jwks: {e}")))?;
     let keys = jwt::parse_jwks(&text).map_err(ApiError::upstream)?;
-    JWKS.with(|c| *c.borrow_mut() = Some(keys.clone()));
+    JWKS.with(|c| *c.borrow_mut() = Some((keys.clone(), now_ms())));
     Ok(keys)
 }
 

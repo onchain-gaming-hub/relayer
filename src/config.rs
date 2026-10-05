@@ -6,6 +6,8 @@ pub const DEVNET_GENESIS_HASH: &str = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkr
 pub const MAX_BODY_BYTES: usize = 4 * 1024;
 pub const BALANCE_CACHE_MS: f64 = 30_000.0;
 pub const INFLIGHT_STALE_MARGIN_MS: f64 = 5_000.0;
+pub const JWKS_TTL_MS: f64 = 60.0 * 60_000.0;
+pub const JWT_LEEWAY_SECS: f64 = 30.0;
 pub const JWKS_UNKNOWN_KID_REFETCH_MS: f64 = 5.0 * 60_000.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,7 +79,9 @@ impl Config {
         })
     }
 
+    /// Longest a healthy request can hold the lock: bounded admit (getBalance timeout +
+    /// margin) followed by sendTransaction (timeout), plus a safety margin.
     pub fn inflight_stale_ms(&self) -> f64 {
-        self.rpc_timeout_ms as f64 + INFLIGHT_STALE_MARGIN_MS
+        2.0 * self.rpc_timeout_ms as f64 + 2_000.0 + INFLIGHT_STALE_MARGIN_MS
     }
 }
