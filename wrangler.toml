@@ -1,0 +1,20 @@
+name = "gasless-relayer"
+main = "build/index.js"
+compatibility_date = "2026-10-01"
+
+[build]
+command = "worker-build --release"
+
+[vars]
+RPC_URL = "https://api.devnet.solana.com"
+ALLOWED_ORIGIN = "http://localhost:5173"
+
+[durable_objects]
+bindings = [
+  { name = "RELAY_CONTROLLER", class_name = "RelayController" },
+  { name = "GLOBAL_THROTTLE", class_name = "GlobalThrottle" },
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RelayController", "GlobalThrottle"]

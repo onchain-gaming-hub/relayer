@@ -1,0 +1,11 @@
+{
+  "name": "gasless-relayer",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "build": "worker-build --release"
+  },
+  "devDependencies": {
+    "wrangler": "4.147.0"
+  }
+}
