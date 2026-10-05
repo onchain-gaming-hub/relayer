@@ -7,7 +7,11 @@ use solana_signer::Signer;
 
 fn main() {
     let kp = Keypair::new();
-    let mut file = match OpenOptions::new().write(true).create_new(true).open(".dev.vars") {
+    let mut file = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(".dev.vars")
+    {
         Ok(f) => f,
         Err(e) => {
             eprintln!(".dev.vars not created: {e}");

@@ -1,0 +1,3 @@
+# Copy to .dev.vars (gitignored). Base58 of the 64-byte keypair.
+# Create one with: cargo run -q --example keygen   (writes .dev.vars, prints pubkey only)
+RELAYER_PRIVATE_KEY=

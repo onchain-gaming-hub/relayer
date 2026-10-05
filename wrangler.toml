@@ -5,9 +5,20 @@ compatibility_date = "2026-10-01"
 [build]
 command = "worker-build --release"
 
+# Non-secret config (spec §4.1). RELAYER_PRIVATE_KEY lives in .dev.vars / `wrangler secret put`.
 [vars]
 RPC_URL = "https://api.devnet.solana.com"
 ALLOWED_ORIGIN = "http://localhost:5173"
+WEB3AUTH_JWKS_URL = "https://api-auth.web3auth.io/jwks"
+WEB3AUTH_CLIENT_ID = "set-me"   # Web3Auth dashboard (Sapphire Devnet)
+WEB3AUTH_ISSUER = "set-me"      # from a real idToken (spike 0.2)
+WALLET_BINDING = "wallets"
+RPC_TIMEOUT_MS = "15000"
+COOLDOWN_MS = "10000"
+REJECT_COOLDOWN_MS = "3000"
+GLOBAL_RPM = "60"
+MIN_RELAYER_BALANCE_LAMPORTS = "50000000"
+MAX_MEMO_BYTES = "128"
 
 [durable_objects]
 bindings = [
@@ -18,3 +29,8 @@ bindings = [
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["RelayController", "GlobalThrottle"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "gasless-relayer-audit"
+database_id = "00000000-0000-0000-0000-000000000000" # local only — replace via runbook (`wrangler d1 create`)
