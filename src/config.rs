@@ -32,6 +32,7 @@ pub struct Config {
     pub wallet_binding: WalletBinding,
     pub cooldown_ms: f64,
     pub reject_cooldown_ms: f64,
+    pub reject_cooldown_max_ms: f64,
     pub global_rpm: u32,
     pub min_relayer_balance_lamports: u64,
     pub max_memo_bytes: usize,
@@ -76,6 +77,11 @@ impl Config {
             wallet_binding,
             cooldown_ms: num(var("COOLDOWN_MS"), "COOLDOWN_MS", 10_000.0)?,
             reject_cooldown_ms: num(var("REJECT_COOLDOWN_MS"), "REJECT_COOLDOWN_MS", 3_000.0)?,
+            reject_cooldown_max_ms: num(
+                var("REJECT_COOLDOWN_MAX_MS"),
+                "REJECT_COOLDOWN_MAX_MS",
+                60_000.0,
+            )?,
             global_rpm: num(var("GLOBAL_RPM"), "GLOBAL_RPM", 60)?,
             min_relayer_balance_lamports: num(
                 var("MIN_RELAYER_BALANCE_LAMPORTS"),
@@ -87,8 +93,35 @@ impl Config {
     }
 
     /// Longest a healthy request can hold the lock: bounded admit (getBalance timeout +
-    /// margin) followed by sendTransaction (timeout), plus a safety margin.
+    /// margin), sendTransaction (timeout), and on rejection the refund call (timeout),
+    /// plus a safety margin.
     pub fn inflight_stale_ms(&self) -> f64 {
-        2.0 * self.rpc_timeout_ms as f64 + 2_000.0 + INFLIGHT_STALE_MARGIN_MS
+        3.0 * self.rpc_timeout_ms as f64 + 2_000.0 + INFLIGHT_STALE_MARGIN_MS
+    }
+}
+
+/// Cooldown after the `streak`-th consecutive RPC rejection (D17): base, 2×base, 4×base … capped.
+pub fn reject_backoff_ms(base_ms: f64, streak: u32, max_ms: f64) -> f64 {
+    let doublings = streak.saturating_sub(1).min(30) as i32;
+    (base_ms * 2f64.powi(doublings)).min(max_ms)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reject_backoff_ms;
+
+    #[test]
+    fn reject_backoff_doubles_and_caps() {
+        let seq: Vec<f64> = (1..=7)
+            .map(|s| reject_backoff_ms(3_000.0, s, 60_000.0))
+            .collect();
+        assert_eq!(
+            seq,
+            [
+                3_000.0, 6_000.0, 12_000.0, 24_000.0, 48_000.0, 60_000.0, 60_000.0
+            ]
+        );
+        assert_eq!(reject_backoff_ms(3_000.0, 0, 60_000.0), 3_000.0);
+        assert_eq!(reject_backoff_ms(3_000.0, u32::MAX, 60_000.0), 60_000.0);
     }
 }

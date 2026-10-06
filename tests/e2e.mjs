@@ -191,6 +191,27 @@ async function suiteA() {
   check('T11 wrong origin', (await relay(t10, { token: tok, origin: 'https://evil.test' })).status === 403);
   check('T11 missing origin', (await relay(t10, { token: tok, origin: null })).status === 403);
 
+  // T27: consecutive rejects back off exponentially (base 1 s here); success resets the streak
+  const u9 = freshSeed();
+  await setState({ send: 'reject' });
+  r = await relayAs(u9);
+  const b1 = r.json?.retry_after_ms;
+  await sleep(b1 + 100);
+  r = await relayAs(u9);
+  const b2 = r.json?.retry_after_ms;
+  check('T27 reject backoff doubles', r.status === 502 && b1 >= 900 && b1 <= 1000 && b2 >= 1900 && b2 <= 2000, `b1=${b1} b2=${b2}`);
+  r = await relayAs(u9);
+  check('T27 backoff enforced', r.status === 429 && r.json?.retry_after_ms > 1500, `${r.status} ${r.json?.retry_after_ms}`);
+  await sleep(2100);
+  await setState({ send: 'ok' });
+  r = await relayAs(u9);
+  check('T27 success after backoff', r.status === 200, `${r.status}`);
+  await sleep(2100);
+  await setState({ send: 'reject' });
+  r = await relayAs(u9);
+  check('T27 streak reset after success', r.status === 502 && r.json?.retry_after_ms <= 1000, `${r.json?.retry_after_ms}`);
+  await setState({ send: 'ok' });
+
   // T17: unknown outcome counts the full cooldown and returns the signature
   const u6 = freshSeed();
   await setState({ send: 'http503' });
@@ -230,9 +251,22 @@ async function suiteA() {
 }
 
 async function suiteB() {
+  let r;
   // GLOBAL_RPM=3, COOLDOWN_MS=5000
+  // T26 (R8): rejected requests return their global slot, so 3 rejects + 3 successes fit in rpm=3
+  await setState({ send: 'reject' });
+  const rej = [];
+  for (let i = 0; i < 3; i++) rej.push((await relayAs(freshSeed())).status);
+  await setState({ send: 'ok' });
+  const ok = [];
+  for (let i = 0; i < 3; i++) ok.push((await relayAs(freshSeed())).status);
+  check('T26 rejected requests refund global quota', rej.every((s) => s === 502) && ok.every((s) => s === 200), `rej=${rej} ok=${ok}`);
+  r = await relayAs(freshSeed());
+  check('T26 quota still enforced for real sends', r.status === 429 && r.json?.code === 'global_throttle', `${r.status} ${r.json?.code}`);
+  console.log('… waiting 61 s for the global window to roll over');
+  await sleep(61_000);
   const a = freshSeed();
-  let r = await relayAs(a);
+  r = await relayAs(a);
   check('T16 setup user A', r.status === 200);
   const spam = [];
   for (let i = 0; i < 5; i++) spam.push((await relayAs(a)).json?.code);

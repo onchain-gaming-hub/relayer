@@ -12,12 +12,13 @@ use wasm_bindgen::JsValue;
 use worker::*;
 
 use crate::{
-    config::Config,
+    config::{Config, reject_backoff_ms},
     error::ApiError,
     rpc::{self, SendOutcome},
 };
 
 const COOLDOWN_KEY: &str = "cooldown_until";
+const REJECT_STREAK_KEY: &str = "reject_streak";
 const ADMIT_MARGIN_MS: u64 = 2_000;
 
 #[derive(Deserialize)]
@@ -108,7 +109,7 @@ impl RelayController {
         }
 
         // Bounded: GlobalThrottle may itself wait up to one RPC timeout on getBalance.
-        rpc::with_timeout(self.admit(), cfg.rpc_timeout_ms + ADMIT_MARGIN_MS)
+        let window = rpc::with_timeout(self.admit(), cfg.rpc_timeout_ms + ADMIT_MARGIN_MS)
             .await
             .ok_or_else(|| ApiError::upstream("global admit timeout"))??;
 
@@ -122,8 +123,12 @@ impl RelayController {
                 if *http_429 {
                     console_warn!("rpc http 429 (R6) for {}", job.user);
                 }
+                // D17: nothing went on-chain, so return the global slot, and back off this
+                // wallet exponentially while it keeps sending transactions the RPC rejects.
+                self.refund(window, cfg).await;
+                let streak = self.bump_reject_streak(&job.user).await;
                 (
-                    cfg.reject_cooldown_ms,
+                    reject_backoff_ms(cfg.reject_cooldown_ms, streak, cfg.reject_cooldown_max_ms),
                     ("rpc_error", Some(format!("rejected: {reason}"))),
                 )
             }
@@ -136,6 +141,11 @@ impl RelayController {
             // The tx may already be on its way; never turn that into an error response.
             console_error!("cooldown put failed for {}: {e}", job.user);
         }
+        if !matches!(outcome, SendOutcome::Rejected { .. })
+            && let Err(e) = storage.delete(REJECT_STREAK_KEY).await
+        {
+            console_error!("reject streak reset failed for {}: {e}", job.user);
+        }
         self.audit(&job, audit.0, audit.1, done);
 
         match outcome {
@@ -147,14 +157,53 @@ impl RelayController {
                     .map_err(|e| ApiError::internal(e.to_string()))
             }
             SendOutcome::Rejected { reason, .. } => {
-                Err(ApiError::rpc_rejected(reason, cfg.reject_cooldown_ms))
+                Err(ApiError::rpc_rejected(reason, cooldown_ms))
             }
             SendOutcome::Unknown(reason) => Err(ApiError::rpc_unknown(reason, job.signature)),
         }
     }
 
+    /// Returns the consecutive-reject count including this one. Storage errors fall back
+    /// to 1 (base cooldown) rather than failing a request whose outcome is already known.
+    async fn bump_reject_streak(&self, user: &str) -> u32 {
+        let storage = self.state.storage();
+        let prev: u32 = match storage.get(REJECT_STREAK_KEY).await {
+            Ok(v) => v.unwrap_or(0),
+            Err(e) => {
+                console_error!("reject streak get failed for {user}: {e}");
+                0
+            }
+        };
+        let streak = prev.saturating_add(1);
+        if let Err(e) = storage.put(REJECT_STREAK_KEY, streak).await {
+            console_error!("reject streak put failed for {user}: {e}");
+        }
+        streak
+    }
+
+    /// Best-effort, bounded: a failed refund only means the slot stays used until the window ends.
+    async fn refund(&self, window: f64, cfg: &Config) {
+        let call = async {
+            let stub = self
+                .env
+                .durable_object("GLOBAL_THROTTLE")
+                .and_then(|ns| ns.id_from_name("global")?.get_stub())?;
+            let mut init = RequestInit::new();
+            init.with_method(Method::Post)
+                .with_body(Some(json!({ "window": window }).to_string().into()));
+            let req = Request::new_with_init("https://global/refund", &init)?;
+            stub.fetch_with_request(req).await.map(|_| ())
+        };
+        match rpc::with_timeout(call, cfg.rpc_timeout_ms).await {
+            Some(Ok(())) => {}
+            Some(Err(e)) => console_error!("global refund failed: {e}"),
+            None => console_error!("global refund timed out"),
+        }
+    }
+
     /// Asks the GlobalThrottle DO for capacity + balance; fail-closed on any error.
-    async fn admit(&self) -> std::result::Result<(), ApiError> {
+    /// Returns the window the request was counted in (needed to refund it).
+    async fn admit(&self) -> std::result::Result<f64, ApiError> {
         let stub = self
             .env
             .durable_object("GLOBAL_THROTTLE")
@@ -165,7 +214,14 @@ impl RelayController {
             .await
             .map_err(|e| ApiError::upstream(format!("global fetch: {e}")))?;
         if resp.status_code() == 200 {
-            return Ok(());
+            let body: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| ApiError::upstream(format!("global body: {e}")))?;
+            return body
+                .get("window")
+                .and_then(|w| w.as_f64())
+                .ok_or_else(|| ApiError::upstream("global admit: missing window"));
         }
         let status = resp.status_code();
         let body: serde_json::Value = resp

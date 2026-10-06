@@ -38,12 +38,26 @@ impl DurableObject for GlobalThrottle {
         }
     }
 
-    async fn fetch(&self, _req: Request) -> Result<Response> {
+    async fn fetch(&self, mut req: Request) -> Result<Response> {
         let now = Date::now().as_millis() as f64;
         let cfg = match Config::from_env(&self.env) {
             Ok(c) => c,
             Err(e) => return ApiError::internal(e).into_response(),
         };
+        if req.path() == "/refund" {
+            // A request the RPC rejected sent nothing on-chain: give its slot back (D17),
+            // but only within the window it was counted in.
+            let window = req
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|v| v.get("window").and_then(|w| w.as_f64()));
+            let refunded = window == Some(self.window_start.get()) && self.count.get() > 0;
+            if refunded {
+                self.count.set(self.count.get() - 1);
+            }
+            return Response::from_json(&json!({ "refunded": refunded }));
+        }
 
         // Window check + increment happen synchronously, before the first await.
         if now - self.window_start.get() >= WINDOW_MS {
@@ -65,7 +79,9 @@ impl DurableObject for GlobalThrottle {
             Ok(lamports) if lamports < cfg.min_relayer_balance_lamports => {
                 ApiError::low_balance().into_response()
             }
-            Ok(_) => Response::from_json(&json!({ "admitted": true })),
+            Ok(_) => {
+                Response::from_json(&json!({ "admitted": true, "window": self.window_start.get() }))
+            }
         }
     }
 }
