@@ -332,7 +332,7 @@ async function suiteC() {
   const gbCalls = (await stats()).getBalance - gb0;
   check('T18 getBalance failure cached (no RPC hammering)', r.status === 503 && r.json?.code === 'upstream' && gbCalls === 0, `${r.status} calls=${gbCalls}`);
   await setState({ balanceMode: 'ok', balance: 10_000_000_000 });
-  await sleep(5_100);
+  await sleep(5_500);
   r = await relayAs(u);
   check('T18 lock released after upstream failure', r.status === 200, `${r.status} ${r.json?.code}`);
   check('T14 D1 unavailable still relays', r.status === 200);
