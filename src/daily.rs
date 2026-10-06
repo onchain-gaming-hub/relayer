@@ -70,9 +70,22 @@ pub fn refund(sql: &SqlStorage, day: i64, cost: i64) -> worker::Result<()> {
     .map(|_| ())
 }
 
-/// What `day` has used so far.
+/// What `day` has used so far. Read-only: a DO that never counted anything stays empty
+/// (no CREATE TABLE), so GET /quota never writes state (spec v2 §4.2).
 pub fn used(sql: &SqlStorage, day: i64) -> worker::Result<i64> {
-    ensure_table(sql)?;
+    #[derive(serde::Deserialize)]
+    struct Count {
+        n: i64,
+    }
+    let exists: Vec<Count> = sql
+        .exec(
+            "SELECT count(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'daily_counter'",
+            None,
+        )?
+        .to_array()?;
+    if exists.first().map(|c| c.n).unwrap_or(0) == 0 {
+        return Ok(0);
+    }
     let rows: Vec<Spent> = sql
         .exec(
             "SELECT spent FROM daily_counter WHERE day = ?",

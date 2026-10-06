@@ -97,15 +97,19 @@ impl DurableObject for UserController {
             Ok(c) => c,
             Err(e) => return ApiError::config(e).into_response(),
         };
-        // Read-only: no lock (GET /quota must work while a relay is in flight).
-        if req.path() == "/quota" {
-            return match req.json::<QuotaQuery>().await {
-                Ok(q) => match self.quota(q.limit, now) {
-                    Ok(v) => Response::from_json(&v),
-                    Err(e) => e.into_response(),
-                },
-                Err(e) => ApiError::internal(format!("quota body: {e}")).into_response(),
-            };
+        match req.path().as_str() {
+            // Read-only: no lock (GET /quota must work while a relay is in flight).
+            "/quota" => {
+                return match req.json::<QuotaQuery>().await {
+                    Ok(q) => match self.quota(q.limit, now) {
+                        Ok(v) => Response::from_json(&v),
+                        Err(e) => e.into_response(),
+                    },
+                    Err(e) => ApiError::internal(format!("quota body: {e}")).into_response(),
+                };
+            }
+            "/relay" => {}
+            _ => return ApiError::not_found().into_response(),
         }
 
         // --- synchronous check-and-set: no await above this line ---
@@ -179,7 +183,8 @@ impl UserController {
         let admitted =
             match rpc::with_timeout(self.admit(&job), cfg.rpc_timeout_ms + ADMIT_MARGIN_MS).await {
                 Some(Ok(admitted)) => admitted,
-                // Definitely not counted upstream: give the user's slot back.
+                // Refused or unreachable: only our own count is known to be safe to return
+                // (an unreachable ProjectThrottle keeps whatever it counted: fail-closed).
                 Some(Err(e)) => {
                     self.refund_user(day);
                     return Err(e);
@@ -273,7 +278,8 @@ impl UserController {
             self.refund(&job, &admitted).await;
         }
         self.audit(&job, audit.0, audit.1, done);
-        let quota = self.quota(job.user_daily_quota, now).ok();
+        // `done`, not `now`: a request that crosses UTC midnight reports the new day.
+        let quota = self.quota(job.user_daily_quota, done).ok();
 
         match outcome {
             SendOutcome::Accepted(sig) => {

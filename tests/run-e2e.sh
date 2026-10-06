@@ -41,7 +41,7 @@ COMMON=(
   --var "FEE_PAYER_PC:$SK_C" --var "FEE_PAYER_PD:$SK_D"
 )
 
-# seed <rpm_a> <rpm_b> <mainnet_enabled> <quota_a> <budget_a> <budget_cd>
+# seed <rpm_a> <rpm_b> <mainnet_enabled> <quota_a> <budget_a> <budget_cd> <budget_b>
 seed() {
   local memo='{"actions":[{"type":"memo","max_bytes":128,"prefix":"gasless-poc:"}]}'
   local cols="aud, slug, name, status, cluster, web3auth_network, allowed_origins, fee_payer_pubkey, policy, user_daily_quota, project_rpm, project_daily_budget_lamports, min_balance_lamports, created_at, updated_at"
@@ -51,7 +51,7 @@ seed() {
   }
   {
     row test-client PA active devnet sapphire_devnet http://localhost:5173 "$PK_A" "$1" "$4" "$5"
-    row client-b PB active devnet sapphire_devnet http://localhost:5174 "$PK_B" "$2"
+    row client-b PB active devnet sapphire_devnet http://localhost:5174 "$PK_B" "$2" 100 "$7"
     row client-m PM active mainnet sapphire_mainnet http://localhost:5175 "$PK_M" 1000
     row client-p PP paused devnet sapphire_devnet http://localhost:5176 "$PK_P" 1000
     row client-x PX active devnet sapphire_devnet http://localhost:5177 "$PK_X" 1000
@@ -62,16 +62,16 @@ seed() {
   } > "$WORK/seed.sql"
 }
 
-# run_suite <suite> <state dir> <reseed yes|no> <rpm_a> <rpm_b> <mainnet> <quota_a> <budget_a> <budget_cd> [wrangler args]
+# run_suite <suite> <state dir> <reseed yes|no> <rpm_a> <rpm_b> <mainnet> <quota_a> <budget_a> <budget_cd> <budget_b> [wrangler args]
 run_suite() {
   local suite=$1 state=$2 reseed=$3; shift 3
   local persist="$WORK/state-$state"
   if [ "$reseed" = yes ]; then
     npx wrangler d1 migrations apply gasless-relayer-audit --local --persist-to "$persist" >/dev/null 2>&1
-    seed "$1" "$2" "$3" "$4" "$5" "$6"
+    seed "$1" "$2" "$3" "$4" "$5" "$6" "$7"
     npx wrangler d1 execute gasless-relayer-audit --local --persist-to "$persist" --file "$WORK/seed.sql" >/dev/null 2>&1
   fi
-  shift 6
+  shift 7
   local log="$WORK/wrangler-$suite.log"
   npx wrangler dev --port $PORT --ip 127.0.0.1 --persist-to "$persist" "${COMMON[@]}" "$@" \
     > "$log" 2>&1 &
@@ -94,15 +94,18 @@ BIG=1000000000
 status=0
 for s in $SUITES; do
   case $s in
-    A) run_suite A A yes 1000 1000 false 100 $BIG $BIG --var COOLDOWN_MS:2000 --var REJECT_COOLDOWN_MS:1000 || status=1 ;;
-    B) run_suite B B yes 3 3 false 100 $BIG $BIG --var COOLDOWN_MS:5000 --var CLUSTER_RPM_DEVNET:5 || status=1 ;;
-    C) run_suite C C yes 1000 1000 false 100 $BIG $BIG --var COOLDOWN_MS:2000 \
+    A) run_suite A A yes 1000 1000 false 100 $BIG $BIG $BIG --var COOLDOWN_MS:2000 --var REJECT_COOLDOWN_MS:1000 || status=1 ;;
+    B) run_suite B B yes 3 3 false 100 $BIG $BIG $BIG --var COOLDOWN_MS:5000 --var CLUSTER_RPM_DEVNET:5 || status=1 ;;
+    C) run_suite C C yes 1000 1000 false 100 $BIG $BIG $BIG --var COOLDOWN_MS:2000 \
          --var REGISTRY_CACHE_MS:1000 --var REGISTRY_MAX_STALE_MS:4000 || status=1 ;;
-    # Phase 2: user quota 2 (A), project budget 3 tx (A), cluster budget 6 tx; D2 restarts on the same state.
-    D) D_ARGS=(--var COOLDOWN_MS:300 --var REJECT_COOLDOWN_MS:300 --var CLUSTER_DAILY_BUDGET_DEVNET:60000)
-       run_suite D D yes 1000 1000 false 2 30000 $BIG "${D_ARGS[@]}" || status=1
-       run_suite D2 D no 0 0 0 0 0 0 "${D_ARGS[@]}" || status=1 ;;
-    E) run_suite E E yes 1000 1000 false 100 $BIG 30000 --var COOLDOWN_MS:300 || status=1 ;;
+    # Phase 2: user quota 2 (A), project budget 3 tx (A) / 4 tx (B), cluster budget 6 tx;
+    # D2 restarts on the same state. Daily counters reset at 00:00 UTC: don't straddle it.
+    D) left=$(( 86400 - $(date -u +%s) % 86400 ))
+       if [ $left -lt 120 ]; then echo "… waiting ${left}s for UTC midnight (daily counters reset)"; sleep $((left + 2)); fi
+       D_ARGS=(--var COOLDOWN_MS:300 --var REJECT_COOLDOWN_MS:300 --var CLUSTER_DAILY_BUDGET_DEVNET:60000)
+       run_suite D D yes 1000 1000 false 2 30000 $BIG 40000 "${D_ARGS[@]}" || status=1
+       run_suite D2 D no 0 0 0 0 0 0 0 "${D_ARGS[@]}" || status=1 ;;
+    E) run_suite E E yes 1000 1000 false 100 $BIG 30000 $BIG --var COOLDOWN_MS:300 || status=1 ;;
     *) echo "unknown suite $s"; status=1 ;;
   esac
 done

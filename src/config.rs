@@ -16,6 +16,8 @@ pub const INFLIGHT_STALE_MARGIN_MS: f64 = 5_000.0;
 pub const ADMIT_MARGIN_MS: u64 = 4_000;
 /// UserController → ProjectThrottle refund budget (covers the forwarded cluster refund).
 pub const REFUND_TIMEOUT_MS: u64 = 5_000;
+/// Largest integer a JS number holds exactly (Number.MAX_SAFE_INTEGER).
+pub const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 pub const JWKS_TTL_MS: f64 = 60.0 * 60_000.0;
 pub const JWKS_FAILURE_BACKOFF_MS: f64 = 30_000.0;
 pub const JWT_LEEWAY_SECS: f64 = 30.0;
@@ -226,6 +228,12 @@ impl Config {
                 "invalid config REJECT_COOLDOWN_MAX_MS: must be >= REJECT_COOLDOWN_MS".into(),
             );
         }
+        // Bound like registry numbers: SQLite integers cross into JS as f64 (exact to 2^53 - 1).
+        if self.cluster_daily_budget_devnet > MAX_SAFE_INTEGER
+            || self.cluster_daily_budget_mainnet > MAX_SAFE_INTEGER
+        {
+            return Err("invalid config CLUSTER_DAILY_BUDGET_*: must be <= 2^53 - 1".into());
+        }
         if self.registry_max_stale_ms < self.registry_cache_ms {
             return Err(
                 "invalid config REGISTRY_MAX_STALE_MS: must be >= REGISTRY_CACHE_MS".into(),
@@ -328,6 +336,9 @@ mod tests {
         }
         let mut c = cfg(10_000.0, 3_000.0, 60_000.0);
         c.registry_max_stale_ms = 1_000.0;
+        assert!(c.validated().is_err());
+        let mut c = cfg(10_000.0, 3_000.0, 60_000.0);
+        c.cluster_daily_budget_mainnet = u64::MAX;
         assert!(c.validated().is_err());
     }
 

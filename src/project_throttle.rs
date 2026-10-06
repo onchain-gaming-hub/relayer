@@ -167,6 +167,7 @@ impl ProjectThrottle {
                     return Err(ApiError::upstream("cluster admit: missing window"));
                 };
                 Response::from_json(&json!({
+                    "admitted": true,
                     "window": window,
                     "day": day,
                     "cluster_window": cluster_window,

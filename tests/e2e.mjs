@@ -568,6 +568,8 @@ async function suiteD() {
   for (let i = 0; i < 3; i++) bs.push(await relayAsB(freshSeed()));
   check('T-v2-6 cluster budget across projects', bs[0].status === 200 && bs[1].status === 200
     && bs[2].status === 503 && bs[2].json?.code === 'cluster_budget', bs.map((x) => `${x.status}:${x.json?.code ?? ''}`).join(','));
+  // B's budget is 4 tx and B has 3 counted: if the cluster refusal above had leaked B's slot,
+  // this request would stop at project_budget instead of reaching the cluster again.
   r = await relayAsB(freshSeed());
   check('T-v2-6 cluster refusal does not leak project B budget', r.status === 503 && r.json?.code === 'cluster_budget', `${r.status} ${r.json?.code}`);
   // Persisted for D2
