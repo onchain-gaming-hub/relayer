@@ -1,9 +1,9 @@
 //! Web3Auth idToken verification (spec §4.4 step 4). Pure functions; JWKS fetching and
 //! caching live in `lib.rs`.
 //!
-//! Wallet binding: the claim carrying the user's Solana key is confirmed in spike 0.2.
-//! Until then `token_binds_wallet` accepts `wallets[]` entries with an ed25519 curve whose
-//! `public_key` (hex or base58) or `address` (base58) equals the transaction signer.
+//! Wallet binding (Web3Auth docs, embedded-wallets/authentication/id-token): social-login
+//! tokens carry `wallets[] = { public_key: <hex>, type: "web3auth_app_key", curve: "ed25519" }`.
+//! Still to be confirmed against a real token in spike 0.2.
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
 use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
@@ -120,7 +120,8 @@ pub fn token_binds_wallet(claims: &Value, user: &Pubkey) -> bool {
     };
     wallets.iter().any(|w| {
         let curve = w.get("curve").and_then(Value::as_str).unwrap_or_default();
-        if !curve.eq_ignore_ascii_case("ed25519") {
+        let kind = w.get("type").and_then(Value::as_str).unwrap_or_default();
+        if !curve.eq_ignore_ascii_case("ed25519") || kind != "web3auth_app_key" {
             return false;
         }
         ["public_key", "address"]
@@ -132,6 +133,8 @@ pub fn token_binds_wallet(claims: &Value, user: &Pubkey) -> bool {
 
 fn key_matches(value: &str, user: &Pubkey) -> bool {
     let user_bytes = user.to_bytes();
+    // Web3Auth's own verifier strips an optional 0x prefix and compares case-insensitively.
+    let value = value.strip_prefix("0x").unwrap_or(value);
     if value.len() == 64
         && let Some(bytes) = decode_hex(value)
     {
@@ -273,20 +276,38 @@ mod tests {
     fn binds_wallet_by_hex_or_base58() {
         let user = Keypair::new().pubkey();
         let hex: String = user.to_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let w = |v: Value| json!({ "wallets": [v] });
+        let app = "web3auth_app_key";
         assert!(token_binds_wallet(
-            &json!({"wallets":[{"curve":"ed25519","public_key":hex}]}),
+            &w(json!({"type":app,"curve":"ed25519","public_key":hex})),
             &user
         ));
         assert!(token_binds_wallet(
-            &json!({"wallets":[{"curve":"ED25519","address":user.to_string()}]}),
+            &w(
+                json!({"type":app,"curve":"ed25519","public_key":format!("0x{}", hex.to_uppercase())})
+            ),
+            &user
+        ));
+        assert!(token_binds_wallet(
+            &w(json!({"type":app,"curve":"ED25519","address":user.to_string()})),
             &user
         ));
         assert!(!token_binds_wallet(
-            &json!({"wallets":[{"curve":"secp256k1","public_key":hex}]}),
+            &w(json!({"type":app,"curve":"secp256k1","public_key":hex})),
             &user
         ));
         assert!(!token_binds_wallet(
-            &json!({"wallets":[{"curve":"ed25519","public_key":Keypair::new().pubkey().to_string()}]}),
+            &w(json!({"type":"other","curve":"ed25519","public_key":hex})),
+            &user
+        ));
+        assert!(!token_binds_wallet(
+            &w(json!({"curve":"ed25519","public_key":hex})),
+            &user
+        ));
+        assert!(!token_binds_wallet(
+            &w(
+                json!({"type":app,"curve":"ed25519","public_key":Keypair::new().pubkey().to_string()})
+            ),
             &user
         ));
         assert!(!token_binds_wallet(&json!({}), &user));

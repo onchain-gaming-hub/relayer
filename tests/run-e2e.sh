@@ -39,7 +39,7 @@ run_suite() {
   kill $pid 2>/dev/null; wait $pid 2>/dev/null || true
   # Reset mock behavior between suites.
   curl -s -X POST "http://127.0.0.1:$MOCK_PORT/__state" \
-    -d '{"genesis":"EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG","balance":10000000000,"balanceMode":"ok","send":"ok","delayMs":0}' >/dev/null
+    -d '{"genesis":"EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG","balance":10000000000,"balanceMode":"ok","jwksMode":"ok","send":"ok","delayMs":0}' >/dev/null
   return $rc
 }
 

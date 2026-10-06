@@ -19,7 +19,9 @@ const freshSeed = () => (++seedN + SUITE.charCodeAt(0) * 16).toString(16).padSta
 function request(path, { method = 'POST', headers = {}, body, chunked = false } = {}) {
   return new Promise((resolve, reject) => {
     const u = new URL(RELAYER + path);
-    const req = http.request({ hostname: u.hostname, port: u.port, path: u.pathname, method, headers }, (res) => {
+    // agent:false -> fresh socket per request, so an early response that leaves an unread body
+    // on a keep-alive socket cannot poison the next test.
+    const req = http.request({ hostname: u.hostname, port: u.port, path: u.pathname, method, headers, agent: false }, (res) => {
       let data = '';
       res.on('data', (c) => (data += c));
       res.on('end', () => {
@@ -158,12 +160,15 @@ async function suiteA() {
 
   // T11: HTTP hardening
   const big = JSON.stringify({ transaction: 'A'.repeat(5000) });
+  r = await relay(t10, { body: big });
+  check('T10 missing token fails fast (before body read)', r.status === 401, `${r.status}`);
   r = await relay(t10, { token: tok, body: big });
   check('T11 body too large (Content-Length)', r.status === 413);
   r = await new Promise((resolve) => {
     const u = new URL(RELAYER + '/relay');
     const req = http.request({ hostname: u.hostname, port: u.port, path: '/relay', method: 'POST',
-      headers: { 'content-type': 'application/json', origin: ORIGIN, 'transfer-encoding': 'chunked' } }, (res) => {
+      agent: false,
+      headers: { 'content-type': 'application/json', origin: ORIGIN, authorization: `Bearer ${tok}`, 'transfer-encoding': 'chunked' } }, (res) => {
       let d = ''; res.on('data', (c) => (d += c)); res.on('end', () => resolve({ status: res.statusCode }));
     });
     for (let i = 0; i < 6; i++) req.write('A'.repeat(1000));
@@ -247,6 +252,12 @@ async function suiteC() {
   r = await relayAs(u);
   check('T18 lock released after upstream failure', r.status === 200, `${r.status} ${r.json?.code}`);
   check('T14 D1 unavailable still relays', r.status === 200);
+  // Unknown kid while the JWKS endpoint is down: still 401, never 503.
+  await setState({ jwksMode: 'http500' });
+  const tu = mk(freshSeed());
+  r = await relay(tu, { token: await tokenFor(tu.user_hex, { kid: 'rotated-kid' }) });
+  check('T10 unknown kid + JWKS refetch failure -> 401', r.status === 401 && r.json?.code === 'unauthorized', `${r.status} ${r.json?.reason}`);
+  await setState({ jwksMode: 'ok' });
 }
 
 const info = await request('/relayer', { method: 'GET' });

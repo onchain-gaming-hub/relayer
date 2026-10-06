@@ -10,7 +10,7 @@ const DEVNET = 'EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG';
 const { privateKey, publicKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
 const jwk = { ...publicKey.export({ format: 'jwk' }), kid: 'test-kid', use: 'sig', alg: 'ES256' };
 
-const state = { genesis: DEVNET, balance: 10_000_000_000, balanceMode: 'ok', send: 'ok', delayMs: 0 };
+const state = { genesis: DEVNET, balance: 10_000_000_000, balanceMode: 'ok', jwksMode: 'ok', send: 'ok', delayMs: 0 };
 const stats = { sendTransaction: 0, getBalance: 0, getGenesisHash: 0, jwks: 0 };
 
 const b64url = (b) => Buffer.from(b).toString('base64url');
@@ -31,7 +31,11 @@ const json = (res, status, obj) => { res.writeHead(status, { 'content-type': 'ap
 
 http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
-  if (req.method === 'GET' && url.pathname === '/jwks') { stats.jwks++; return json(res, 200, { keys: [jwk] }); }
+  if (req.method === 'GET' && url.pathname === '/jwks') {
+    stats.jwks++;
+    if (state.jwksMode === 'http500') return json(res, 500, {});
+    return json(res, 200, { keys: [jwk] });
+  }
   if (req.method === 'GET' && url.pathname === '/__token') return json(res, 200, { token: token(Object.fromEntries(url.searchParams)) });
   if (req.method === 'GET' && url.pathname === '/__stats') return json(res, 200, { ...stats, state });
   if (req.method === 'POST' && url.pathname === '/__state') { Object.assign(state, JSON.parse(await readBody(req) || '{}')); return json(res, 200, state); }

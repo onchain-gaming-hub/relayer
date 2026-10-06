@@ -31,7 +31,8 @@ cargo run -q --example keygen        # creates .dev.vars with a new devnet relay
 npx wrangler d1 execute gasless-relayer-audit --local --file schema.sql
 ```
 
-Set `WEB3AUTH_CLIENT_ID` and `WEB3AUTH_ISSUER` in `wrangler.toml` (or `--var`) before relaying real tokens.
+Set `WEB3AUTH_CLIENT_ID` in `wrangler.toml` (or `--var`) before relaying real tokens. `WEB3AUTH_ISSUER` defaults to
+`https://api-auth.web3auth.io` (social login, per Web3Auth docs) — confirm against a real token.
 
 Have a `solana-keygen` JSON keypair instead? Convert the 64-byte array to Base58, e.g.
 `node -e "const b=require('fs').readFileSync(process.argv[1]);console.log(require('bs58').default.encode(Buffer.from(JSON.parse(b))))" key.json`.
@@ -44,7 +45,8 @@ cargo test --lib            # policy / jwt / rpc / tx unit tests
 ./tests/run-e2e.sh          # local e2e vs wrangler dev + mock RPC/JWKS (spec §7) — no network
 ```
 
-`tests/run-e2e.sh` covers T1–T18, T20–T25. T19 (storage `put` failing after a broadcast) cannot be simulated locally.
+`tests/run-e2e.sh` covers T1–T6, T8–T18, T20, T22–T25; T7 shape cases are unit tests (`cargo test`).
+Not covered here: T19 (storage `put` failing after a broadcast — not simulable locally) and T21 (Memo Count — frontend).
 
 ## Deploy
 

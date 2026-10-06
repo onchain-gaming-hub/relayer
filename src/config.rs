@@ -4,6 +4,8 @@ use worker::Env;
 
 pub const DEVNET_GENESIS_HASH: &str = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
 pub const MAX_BODY_BYTES: usize = 4 * 1024;
+/// Oversized bodies are read (and discarded) up to this many bytes before the 413.
+pub const MAX_DRAIN_BYTES: usize = 64 * 1024;
 pub const BALANCE_CACHE_MS: f64 = 30_000.0;
 pub const INFLIGHT_STALE_MARGIN_MS: f64 = 5_000.0;
 pub const JWKS_TTL_MS: f64 = 60.0 * 60_000.0;
@@ -58,10 +60,14 @@ impl Config {
             Some("off") => WalletBinding::Off,
             Some(_) => return Err("invalid config WALLET_BINDING".into()),
         };
+        let allowed_origin = required("ALLOWED_ORIGIN")?;
+        if allowed_origin == "*" {
+            return Err("ALLOWED_ORIGIN must be an exact origin, not *".into());
+        }
         Ok(Self {
             rpc_url: var("RPC_URL").unwrap_or_else(|| "https://api.devnet.solana.com".into()),
             rpc_timeout_ms: num(var("RPC_TIMEOUT_MS"), "RPC_TIMEOUT_MS", 15_000)?,
-            allowed_origin: required("ALLOWED_ORIGIN")?,
+            allowed_origin,
             web3auth_client_id: required("WEB3AUTH_CLIENT_ID")?,
             web3auth_jwks_url: var("WEB3AUTH_JWKS_URL")
                 .unwrap_or_else(|| "https://api-auth.web3auth.io/jwks".into()),

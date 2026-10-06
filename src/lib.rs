@@ -24,7 +24,7 @@ use worker::*;
 
 use config::{
     Config, DEVNET_GENESIS_HASH, JWKS_TTL_MS, JWKS_UNKNOWN_KID_REFETCH_MS, MAX_BODY_BYTES,
-    WalletBinding,
+    MAX_DRAIN_BYTES, WalletBinding,
 };
 use error::ApiError;
 
@@ -100,11 +100,18 @@ fn now_ms() -> f64 {
 
 #[event(fetch)]
 async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
+    let origin = req.headers().get("Origin")?;
     let cfg = match Config::from_env(&env) {
         Ok(c) => c,
-        Err(e) => return ApiError::internal(e).into_response(),
+        Err(e) => {
+            // Still attach CORS so the browser shows the 500 instead of a CORS failure.
+            let allowed = env.var("ALLOWED_ORIGIN").ok().map(|v| v.to_string());
+            let cors = origin
+                .as_deref()
+                .filter(|o| allowed.as_deref() == Some(*o) && *o != "*");
+            return with_cors(ApiError::internal(e).into_response()?, cors);
+        }
     };
-    let origin = req.headers().get("Origin")?;
     let origin_ok = origin.as_deref() == Some(cfg.allowed_origin.as_str());
     let path = req.path();
 
@@ -179,6 +186,8 @@ async fn handle_relay(
     if !media_type.eq_ignore_ascii_case("application/json") {
         return Err(ApiError::content_type());
     }
+    // Cheap fail-fast; the token itself is verified after policy (step 4).
+    let token = bearer_token(req)?;
     let body = read_body_limited(req, MAX_BODY_BYTES).await?;
 
     // 2. Decode
@@ -195,7 +204,7 @@ async fn handle_relay(
         .map_err(ApiError::validation)?;
 
     // 4. Identity
-    authenticate(req, cfg, &user).await?;
+    authenticate(&token, cfg, &user).await?;
 
     // 5. Co-sign + verify every slot
     txcore::cosign_and_verify(&mut tx, &relayer).map_err(ApiError::validation)?;
@@ -255,32 +264,47 @@ async fn read_body_limited(
         .stream()
         .map_err(|_| ApiError::validation("missing body"))?;
     let mut buf = Vec::new();
+    let mut seen = 0usize;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|_| ApiError::validation("unreadable body"))?;
-        if buf.len() + chunk.len() > limit {
-            return Err(ApiError::too_large());
+        seen += chunk.len();
+        if seen > limit {
+            // Drain a bounded amount before answering: abandoning a chunked upload
+            // mid-stream makes some proxies (e.g. wrangler dev) drop the connection,
+            // turning the 413 into a 500. Past MAX_DRAIN we stop reading regardless.
+            if seen > MAX_DRAIN_BYTES {
+                return Err(ApiError::too_large());
+            }
+            continue;
         }
         buf.extend_from_slice(&chunk);
+    }
+    if seen > limit {
+        return Err(ApiError::too_large());
     }
     Ok(buf)
 }
 
-async fn authenticate(
-    req: &Request,
-    cfg: &Config,
-    user: &Pubkey,
-) -> std::result::Result<(), ApiError> {
+fn bearer_token(req: &Request) -> std::result::Result<String, ApiError> {
     let header = req
         .headers()
         .get("Authorization")
         .ok()
         .flatten()
         .unwrap_or_default();
-    let token = header
+    header
         .strip_prefix("Bearer ")
         .map(str::trim)
-        .filter(|t| !t.is_empty());
-    let token = token.ok_or_else(|| ApiError::unauthorized("missing bearer token"))?;
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| ApiError::unauthorized("missing bearer token"))
+}
+
+async fn authenticate(
+    token: &str,
+    cfg: &Config,
+    user: &Pubkey,
+) -> std::result::Result<(), ApiError> {
     let now_s = now_ms() / 1000.0;
 
     let mut jwks = load_jwks(cfg, false).await?;
@@ -295,8 +319,12 @@ async fn authenticate(
         // Key rotation: refetch at most once per window per isolate, else reject.
         let last = JWKS_LAST_FORCED_REFETCH.with(Cell::get);
         if now_ms() - last >= JWKS_UNKNOWN_KID_REFETCH_MS {
+            // Stamp before the attempt so a failing JWKS endpoint is not hammered by
+            // random-kid floods; an unknown kid stays a 401 either way (spec §4.3).
             JWKS_LAST_FORCED_REFETCH.with(|c| c.set(now_ms()));
-            jwks = load_jwks(cfg, true).await?;
+            jwks = load_jwks(cfg, true)
+                .await
+                .map_err(|_| ApiError::unauthorized("UnknownKid (JWKS refetch failed)"))?;
             result = jwt::verify(
                 token,
                 &jwks,

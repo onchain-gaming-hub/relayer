@@ -4,9 +4,7 @@
 //! on a fetch (GlobalThrottle, RPC) lets another request for the same wallet in. The
 //! in-flight check-and-set below therefore runs synchronously before the first `await`.
 
-use std::{cell::Cell, time::Duration};
-
-use futures_util::future::{Either, select};
+use std::cell::Cell;
 
 use serde::Deserialize;
 use serde_json::json;
@@ -110,11 +108,9 @@ impl RelayController {
         }
 
         // Bounded: GlobalThrottle may itself wait up to one RPC timeout on getBalance.
-        let admit_budget = Duration::from_millis(cfg.rpc_timeout_ms + ADMIT_MARGIN_MS);
-        match select(Box::pin(self.admit()), Box::pin(Delay::from(admit_budget))).await {
-            Either::Left((result, _)) => result?,
-            Either::Right(_) => return Err(ApiError::upstream("global admit timeout")),
-        }
+        rpc::with_timeout(self.admit(), cfg.rpc_timeout_ms + ADMIT_MARGIN_MS)
+            .await
+            .ok_or_else(|| ApiError::upstream("global admit timeout"))??;
 
         let outcome = rpc::send_transaction(&cfg.rpc_url, cfg.rpc_timeout_ms, &job.tx).await;
         let done = Date::now().as_millis() as f64;

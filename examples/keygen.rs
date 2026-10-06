@@ -7,11 +7,11 @@ use solana_signer::Signer;
 
 fn main() {
     let kp = Keypair::new();
-    let mut file = match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(".dev.vars")
-    {
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    let mut file = match opts.open(".dev.vars") {
         Ok(f) => f,
         Err(e) => {
             eprintln!(".dev.vars not created: {e}");

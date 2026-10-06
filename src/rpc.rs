@@ -44,11 +44,19 @@ async fn post(url: &str, timeout_ms: u64, body: &Value) -> Raw {
         let text = resp.text().await.map_err(|e| e.to_string())?;
         Ok::<_, String>((status, text))
     };
+    match with_timeout(call, timeout_ms).await {
+        Some(Ok((status, text))) => Raw::Http(status, text),
+        Some(Err(e)) => Raw::Transport(e),
+        None => Raw::Timeout,
+    }
+}
+
+/// Races `fut` against a `Delay`; `None` means the timeout won.
+pub async fn with_timeout<F: Future>(fut: F, timeout_ms: u64) -> Option<F::Output> {
     let timeout = Delay::from(Duration::from_millis(timeout_ms));
-    match select(Box::pin(call), Box::pin(timeout)).await {
-        Either::Left((Ok((status, text)), _)) => Raw::Http(status, text),
-        Either::Left((Err(e), _)) => Raw::Transport(e),
-        Either::Right(_) => Raw::Timeout,
+    match select(Box::pin(fut), Box::pin(timeout)).await {
+        Either::Left((out, _)) => Some(out),
+        Either::Right(_) => None,
     }
 }
 
@@ -152,11 +160,9 @@ pub async fn get_text(url: &str, timeout_ms: u64) -> Result<String, String> {
         }
         resp.text().await.map_err(|e| e.to_string())
     };
-    let timeout = Delay::from(Duration::from_millis(timeout_ms));
-    match select(Box::pin(call), Box::pin(timeout)).await {
-        Either::Left((r, _)) => r,
-        Either::Right(_) => Err("timeout".into()),
-    }
+    with_timeout(call, timeout_ms)
+        .await
+        .unwrap_or_else(|| Err("timeout".into()))
 }
 
 fn truncate(s: &str, max: usize) -> String {
