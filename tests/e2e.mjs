@@ -233,8 +233,13 @@ async function suiteA() {
 
   // T24: RPC HTTP 429 -> rejected
   await setState({ send: 'http429' });
-  r = await relayAs(freshSeed());
+  const u8 = freshSeed();
+  r = await relayAs(u8);
+  const c1 = r.json?.retry_after_ms;
   check('T24 rpc http 429', r.status === 502 && r.json?.code === 'rpc_rejected');
+  await sleep(c1 + 100);
+  r = await relayAs(u8);
+  check('T24 RPC overload does not grow user backoff', r.status === 502 && r.json?.retry_after_ms <= 1000, `c1=${c1} c2=${r.json?.retry_after_ms}`);
   await setState({ send: 'already' });
   r = await relayAs(freshSeed());
   check('already-processed -> 200 with signature', r.status === 200 && typeof r.json?.signature === 'string', `${r.status}`);

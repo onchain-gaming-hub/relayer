@@ -52,10 +52,7 @@ impl DurableObject for GlobalThrottle {
                 .await
                 .ok()
                 .and_then(|v| v.get("window").and_then(|w| w.as_f64()));
-            let refunded = window == Some(self.window_start.get()) && self.count.get() > 0;
-            if refunded {
-                self.count.set(self.count.get() - 1);
-            }
+            let refunded = window.is_some_and(|w| self.release(w));
             return Response::from_json(&json!({ "refunded": refunded }));
         }
 
@@ -69,24 +66,38 @@ impl DurableObject for GlobalThrottle {
                 .into_response();
         }
         self.count.set(self.count.get() + 1);
+        // Captured synchronously: the window may roll over while we await the balance below,
+        // and a later refund must target the window this request was actually counted in.
+        let window = self.window_start.get();
 
         let balance = match self.balance.get() {
             Some((lamports, at)) if now - at < BALANCE_CACHE_MS => Ok(lamports),
             _ => self.refresh_balance(&cfg).await,
         };
         match balance {
-            Err(e) => ApiError::upstream(e).into_response(),
+            Err(e) => {
+                self.release(window);
+                ApiError::upstream(e).into_response()
+            }
             Ok(lamports) if lamports < cfg.min_relayer_balance_lamports => {
+                self.release(window);
                 ApiError::low_balance().into_response()
             }
-            Ok(_) => {
-                Response::from_json(&json!({ "admitted": true, "window": self.window_start.get() }))
-            }
+            Ok(_) => Response::from_json(&json!({ "admitted": true, "window": window })),
         }
     }
 }
 
 impl GlobalThrottle {
+    /// Gives back one slot, but only in the window it was taken from and never below zero.
+    fn release(&self, window: f64) -> bool {
+        let ok = window == self.window_start.get() && self.count.get() > 0;
+        if ok {
+            self.count.set(self.count.get() - 1);
+        }
+        ok
+    }
+
     /// Single-flight: concurrent cache misses share one `getBalance` call.
     async fn refresh_balance(&self, cfg: &Config) -> std::result::Result<u64, String> {
         let fut = {

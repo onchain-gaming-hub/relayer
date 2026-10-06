@@ -19,6 +19,13 @@ use crate::{
 
 const COOLDOWN_KEY: &str = "cooldown_until";
 const REJECT_STREAK_KEY: &str = "reject_streak";
+
+/// Written atomically with `put_multiple`; field names are the storage keys.
+#[derive(serde::Serialize)]
+struct CooldownState {
+    cooldown_until: f64,
+    reject_streak: u32,
+}
 const ADMIT_MARGIN_MS: u64 = 2_000;
 
 #[derive(Deserialize)]
@@ -115,20 +122,32 @@ impl RelayController {
 
         let outcome = rpc::send_transaction(&cfg.rpc_url, cfg.rpc_timeout_ms, &job.tx).await;
         let done = Date::now().as_millis() as f64;
+
+        // D17: only a rejection caused by the transaction itself (JSON-RPC error, HTTP 400/413)
+        // returns the global slot and grows this wallet's backoff. An overloaded RPC (429, other
+        // 4xx) is not the user's fault and must not free capacity to hit it again.
+        let tx_fault = matches!(outcome, SendOutcome::Rejected { tx_fault: true, .. });
+        let streak = if tx_fault {
+            self.next_reject_streak(&job.user).await
+        } else {
+            None
+        };
         let (cooldown_ms, audit) = match &outcome {
             SendOutcome::Accepted(_) | SendOutcome::AlreadyProcessed => {
                 (cfg.cooldown_ms, ("success", None))
             }
-            SendOutcome::Rejected { reason, http_429 } => {
+            SendOutcome::Rejected {
+                reason, http_429, ..
+            } => {
                 if *http_429 {
                     console_warn!("rpc http 429 (R6) for {}", job.user);
                 }
-                // D17: nothing went on-chain, so return the global slot, and back off this
-                // wallet exponentially while it keeps sending transactions the RPC rejects.
-                self.refund(window, cfg).await;
-                let streak = self.bump_reject_streak(&job.user).await;
                 (
-                    reject_backoff_ms(cfg.reject_cooldown_ms, streak, cfg.reject_cooldown_max_ms),
+                    reject_backoff_ms(
+                        cfg.reject_cooldown_ms,
+                        streak.unwrap_or(1),
+                        cfg.reject_cooldown_max_ms,
+                    ),
                     ("rpc_error", Some(format!("rejected: {reason}"))),
                 )
             }
@@ -137,14 +156,33 @@ impl RelayController {
                 ("rpc_error", Some(format!("unknown: {reason}"))),
             ),
         };
-        if let Err(e) = storage.put(COOLDOWN_KEY, done + cooldown_ms).await {
+
+        // Persist the cooldown (and streak) first: if the DO dies before the refund below,
+        // we lose a global slot (fail-closed) rather than the wallet's cooldown.
+        let stored = match (&outcome, streak) {
+            (_, Some(reject_streak)) => {
+                storage
+                    .put_multiple(CooldownState {
+                        cooldown_until: done + cooldown_ms,
+                        reject_streak,
+                    })
+                    .await
+            }
+            (SendOutcome::Accepted(_), _) => {
+                // Only a real acceptance clears the streak (AlreadyProcessed can be replayed).
+                match storage.put(COOLDOWN_KEY, done + cooldown_ms).await {
+                    Ok(()) => storage.delete(REJECT_STREAK_KEY).await.map(|_| ()),
+                    Err(e) => Err(e),
+                }
+            }
+            _ => storage.put(COOLDOWN_KEY, done + cooldown_ms).await,
+        };
+        if let Err(e) = stored {
             // The tx may already be on its way; never turn that into an error response.
             console_error!("cooldown put failed for {}: {e}", job.user);
         }
-        if !matches!(outcome, SendOutcome::Rejected { .. })
-            && let Err(e) = storage.delete(REJECT_STREAK_KEY).await
-        {
-            console_error!("reject streak reset failed for {}: {e}", job.user);
+        if tx_fault {
+            self.refund(window, cfg).await;
         }
         self.audit(&job, audit.0, audit.1, done);
 
@@ -163,22 +201,16 @@ impl RelayController {
         }
     }
 
-    /// Returns the consecutive-reject count including this one. Storage errors fall back
-    /// to 1 (base cooldown) rather than failing a request whose outcome is already known.
-    async fn bump_reject_streak(&self, user: &str) -> u32 {
-        let storage = self.state.storage();
-        let prev: u32 = match storage.get(REJECT_STREAK_KEY).await {
-            Ok(v) => v.unwrap_or(0),
+    /// Next consecutive-reject count. `None` if storage could not be read: the caller then
+    /// uses the base cooldown and does not overwrite a (possibly higher) stored streak.
+    async fn next_reject_streak(&self, user: &str) -> Option<u32> {
+        match self.state.storage().get::<u32>(REJECT_STREAK_KEY).await {
+            Ok(v) => Some(v.unwrap_or(0).saturating_add(1)),
             Err(e) => {
                 console_error!("reject streak get failed for {user}: {e}");
-                0
+                None
             }
-        };
-        let streak = prev.saturating_add(1);
-        if let Err(e) = storage.put(REJECT_STREAK_KEY, streak).await {
-            console_error!("reject streak put failed for {user}: {e}");
         }
-        streak
     }
 
     /// Best-effort, bounded: a failed refund only means the slot stays used until the window ends.

@@ -12,7 +12,13 @@ pub enum SendOutcome {
     /// RPC returned a signature: the tx was forwarded.
     Accepted(String),
     /// JSON-RPC error or HTTP 4xx: the tx was definitely not forwarded.
-    Rejected { reason: String, http_429: bool },
+    /// `tx_fault`: the rejection is about the transaction/request itself (JSON-RPC error,
+    /// HTTP 400/413) rather than the RPC being unavailable (429, 403, 408, ...).
+    Rejected {
+        reason: String,
+        http_429: bool,
+        tx_fault: bool,
+    },
     /// Timeout, transport error, HTTP 5xx, or unparseable 200: it may have been forwarded.
     Unknown(String),
     /// The exact same signed tx already landed (resubmission).
@@ -69,6 +75,7 @@ pub fn classify_send(status: u16, text: &str) -> SendOutcome {
         return SendOutcome::Rejected {
             reason: format!("http {status}"),
             http_429: status == 429,
+            tx_fault: matches!(status, 400 | 413),
         };
     }
     if status != 200 {
@@ -88,6 +95,7 @@ pub fn classify_send(status: u16, text: &str) -> SendOutcome {
         return SendOutcome::Rejected {
             reason: truncate(msg, 200),
             http_429: false,
+            tx_fault: true,
         };
     }
     match v.get("result").and_then(Value::as_str) {
@@ -186,6 +194,7 @@ mod tests {
             ),
             SendOutcome::Rejected {
                 http_429: false,
+                tx_fault: true,
                 ..
             }
         ));
@@ -198,12 +207,28 @@ mod tests {
         );
         assert!(matches!(
             classify_send(429, "Too many requests"),
-            SendOutcome::Rejected { http_429: true, .. }
+            SendOutcome::Rejected {
+                http_429: true,
+                tx_fault: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify_send(400, ""),
+            SendOutcome::Rejected { tx_fault: true, .. }
+        ));
+        assert!(matches!(
+            classify_send(408, ""),
+            SendOutcome::Rejected {
+                tx_fault: false,
+                ..
+            }
         ));
         assert!(matches!(
             classify_send(403, ""),
             SendOutcome::Rejected {
                 http_429: false,
+                tx_fault: false,
                 ..
             }
         ));
