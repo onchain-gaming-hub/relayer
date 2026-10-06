@@ -159,8 +159,8 @@ fn relayer_info(env: &Env, cfg: &Config) -> std::result::Result<Response, ApiErr
     let pubkey = relayer_keypair_pubkey(env)?;
     Response::from_json(&json!({
         "pubkey": pubkey,
-        // Whole milliseconds (spec §4.2 shows an integer, not 10000.0).
-        "cooldown_ms": cfg.cooldown_ms.round() as u64,
+        // Whole milliseconds (spec §4.2 shows an integer, not 10000.0); ceil like retry_after_ms.
+        "cooldown_ms": cfg.cooldown_ms.ceil() as u64,
         "allowlist": [policy::MEMO_V2.to_string()],
         "max_memo_bytes": cfg.max_memo_bytes,
         "wallet_binding": match cfg.wallet_binding {
