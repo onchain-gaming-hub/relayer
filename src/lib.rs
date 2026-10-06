@@ -8,6 +8,7 @@
 
 mod cluster_throttle;
 mod config;
+mod daily;
 mod error;
 mod jwt;
 mod policy;
@@ -139,7 +140,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         Err(e) => return ApiError::config(e).into_response(),
     };
     let path = req.path();
-    if !matches!(path.as_str(), "/relayer" | "/relay") {
+    if !matches!(path.as_str(), "/relayer" | "/relay" | "/quota") {
         return ApiError::not_found().into_response();
     }
     // Like the config 500 above, this 503 carries no CORS headers: allowed origins come from
@@ -161,6 +162,10 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
             relayer_info(&req, &snap, &cfg)
         }
         (Method::Get, "/relayer") => Err(ApiError::origin()),
+        (Method::Get, "/quota") if origin.is_none() || cors_origin.is_some() => {
+            handle_quota(&req, &env, &cfg, &snap, origin.as_deref()).await
+        }
+        (Method::Get, "/quota") => Err(ApiError::origin()),
         (Method::Post, "/relay") => match origin.as_deref() {
             Some(o) if cors_origin.is_some() => handle_relay(&mut req, &env, &cfg, &snap, o).await,
             _ => Err(ApiError::origin()),
@@ -252,6 +257,73 @@ struct RelayBody {
     transaction: String,
 }
 
+/// The project named by a token (unverified `aud`, then a full verify bound to `wallet`),
+/// gated like `/relay`: status, kill switch, and the project's own origins.
+async fn token_project<'a>(
+    token: &str,
+    cfg: &Config,
+    snap: &'a Snapshot,
+    wallet: &Pubkey,
+    origin: Option<&str>,
+) -> std::result::Result<&'a Project, ApiError> {
+    jwt::precheck(token).map_err(|e| ApiError::unauthorized(format!("{e:?}")))?;
+    let aud = jwt::unverified_aud(token).map_err(|e| ApiError::unauthorized(format!("{e:?}")))?;
+    let project = match snap.project(&aud) {
+        Some(Ok(p)) => p,
+        // Logged once per registry load (registry.rs), not per request.
+        Some(Err(_)) => return Err(ApiError::misconfigured_quiet()),
+        // Same answer as any bad token: do not reveal which clientIds are registered.
+        None => return Err(ApiError::unauthorized("UnknownProject")),
+    };
+    authenticate(token, cfg, project, wallet).await?;
+    project_gate(project, snap, cfg)?;
+    if let Some(o) = origin
+        && !project.allowed_origins.iter().any(|a| a == o)
+    {
+        return Err(ApiError::origin());
+    }
+    Ok(project)
+}
+
+/// `GET /quota?wallet=<base58>` (spec v2 §4.2): today's count for the token's project and a
+/// wallet listed in the token's `wallets[]` (same DO as `/relay`). Read-only.
+async fn handle_quota(
+    req: &Request,
+    env: &Env,
+    cfg: &Config,
+    snap: &Snapshot,
+    origin: Option<&str>,
+) -> std::result::Result<Response, ApiError> {
+    let token = bearer_token(req)?;
+    let url = req.url().map_err(|e| ApiError::internal(e.to_string()))?;
+    let wallet: Pubkey = url
+        .query_pairs()
+        .find(|(k, _)| k == "wallet")
+        .and_then(|(_, v)| v.parse().ok())
+        .ok_or_else(|| ApiError::validation("wallet query parameter required"))?;
+    let project = token_project(&token, cfg, snap, &wallet, origin).await?;
+    let stub = env
+        .durable_object("USER_CONTROLLER")
+        .and_then(|ns| {
+            ns.id_from_name(&format!("{}:{wallet}", project.aud))?
+                .get_stub()
+        })
+        .map_err(|e| ApiError::upstream(format!("user stub: {e}")))?;
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post).with_body(Some(
+        json!({ "limit": project.user_daily_quota })
+            .to_string()
+            .into(),
+    ));
+    let do_req = Request::new_with_init("https://user/quota", &init)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let mut resp = stub
+        .fetch_with_request(do_req)
+        .await
+        .map_err(|e| ApiError::upstream(format!("user fetch: {e}")))?;
+    passthrough(&mut resp).await
+}
+
 async fn handle_relay(
     req: &mut Request,
     env: &Env,
@@ -283,25 +355,10 @@ async fn handle_relay(
     let mut tx = txcore::decode(&raw).map_err(ApiError::validation)?;
     let shape = policy::structural(&tx).map_err(ApiError::validation)?;
 
-    // 3. Identity (+ wallet binding): the unverified `aud` only picks the project;
-    //    verify re-checks it.
-    jwt::precheck(&token).map_err(|e| ApiError::unauthorized(format!("{e:?}")))?;
-    let aud = jwt::unverified_aud(&token).map_err(|e| ApiError::unauthorized(format!("{e:?}")))?;
-    let project = match snap.project(&aud) {
-        Some(Ok(p)) => p,
-        // Logged once per registry load (registry.rs), not per request.
-        Some(Err(_)) => return Err(ApiError::misconfigured_quiet()),
-        // Same answer as any bad token: do not reveal which clientIds are registered.
-        None => return Err(ApiError::unauthorized("UnknownProject")),
-    };
-    authenticate(&token, cfg, project, &shape.user).await?;
-
-    // 4. Project status / cluster switch
-    project_gate(project, snap, cfg)?;
-    // 5. Origin must belong to this token's project (Origin is hygiene; `aud` is the gate)
-    if !project.allowed_origins.iter().any(|o| o == origin) {
-        return Err(ApiError::origin());
-    }
+    // 3–5. Identity (+ wallet binding; the unverified `aud` only picks the project and verify
+    //      re-checks it), project status / cluster switch, and the project's own origins
+    //      (Origin is hygiene; `aud` is the gate).
+    let project = token_project(&token, cfg, snap, &shape.user, Some(origin)).await?;
     // 6. Project-dependent policy → cost (V7)
     let cost = policy::for_project(&shape, &project.fee_payer, &project.memo)
         .map_err(ApiError::validation)?;
@@ -324,6 +381,8 @@ async fn handle_relay(
         "cluster": project.cluster.as_str(),
         "cost": cost,
         "project_rpm": project.project_rpm,
+        "project_daily_budget": project.project_daily_budget_lamports,
+        "user_daily_quota": project.user_daily_quota,
         "fee_payer": project.fee_payer.to_string(),
         "min_balance": project.min_balance_lamports,
     });

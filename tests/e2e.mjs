@@ -10,7 +10,7 @@ const MOCK = process.env.MOCK_URL || 'http://127.0.0.1:8899';
 const ORIGIN = 'http://localhost:5173';
 const PERSIST = process.env.PERSIST_DIR;
 const WRANGLER_LOG = process.env.WRANGLER_LOG;
-const { PK_A, PK_B, PK_M, PK_X, PK_Y } = process.env;
+const { PK_A, PK_B, PK_M, PK_X, PK_Y, PK_C, PK_D } = process.env;
 const ORIGIN_B = 'http://localhost:5174';
 const ORIGIN_M = 'http://localhost:5175';
 const ISS_MAINNET = 'https://issuer-mainnet.test';
@@ -21,7 +21,9 @@ const results = [];
 const check = (id, ok, detail = '') => { results.push({ id, ok, detail }); console.log(`${ok ? 'PASS' : 'FAIL'} ${id} ${detail}`); };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let seedN = 0;
-const freshSeed = () => (++seedN + SUITE.charCodeAt(0) * 16).toString(16).padStart(2, '0').repeat(32);
+// Distinct wallets per suite (D2 reuses D's state, so it needs its own range).
+const SEED_BASE = SUITE === 'D2' ? 3000 : SUITE.charCodeAt(0) * 16;
+const freshSeed = () => (++seedN + SEED_BASE).toString(16).padStart(2, '0').repeat(32);
 
 function request(path, { method = 'POST', headers = {}, body, chunked = false } = {}) {
   return new Promise((resolve, reject) => {
@@ -72,6 +74,16 @@ async function relayAs(seed, opts = {}) {
 /** Same for project B (its fee payer, clientId and origin). */
 const relayAsB = (seed, opts = {}) =>
   relayAs(seed, { feePayer: PK_B, claims: { aud: 'client-b' }, origin: ORIGIN_B, ...opts });
+
+/** GET /quota for the user behind `seed` in project `aud` (default A). */
+async function quotaOf(seed, { aud = 'test-client', origin = ORIGIN, token } = {}) {
+  const t = mk(seed);
+  const tok = token ?? (await tokenFor(t.user_hex, { aud }));
+  const headers = { origin };
+  if (tok) headers.authorization = `Bearer ${tok}`;
+  return request(`/quota?wallet=${t.user}`, { method: 'GET', headers });
+}
+const nextUtcMidnight = () => (Math.floor(Date.now() / 86_400_000) + 1) * 86_400_000;
 
 function d1Exec(sql) {
   execFileSync('npx', ['wrangler', 'd1', 'execute', 'gasless-relayer-audit', '--local', '--persist-to', PERSIST,
@@ -504,10 +516,97 @@ async function suiteC() {
   d1Exec('ALTER TABLE projects_off RENAME TO projects');
 }
 
+async function suiteD() {
+  // user_daily_quota(A)=2 · project budget(A)=30000 (3 tx) · cluster budget=60000 (6 tx) · cooldown 300 ms
+  let r;
+  const pause = () => sleep(350);
+  // T-v2-7: a tx-fault reject gives back the user's count, the project and the cluster budget
+  const u0 = freshSeed();
+  await setState({ send: 'reject' });
+  r = await relayAs(u0);
+  await setState({ send: 'ok' });
+  const q0 = await quotaOf(u0);
+  check('T-v2-7 reject refunds the user count', r.status === 502 && q0.status === 200 && q0.json?.used === 0, `${r.status} used=${q0.json?.used}`);
+
+  // T-v2-4: user quota
+  const u1 = freshSeed();
+  const a1 = await relayAs(u1); await pause();
+  const a2 = await relayAs(u1); await pause();
+  const a3 = await relayAs(u1);
+  check('T-v2-4 quota counted in /relay response', a1.status === 200 && a1.json?.quota?.used === 1 && a1.json?.quota?.limit === 2
+    && a2.status === 200 && a2.json?.quota?.used === 2, `${a1.status}:${JSON.stringify(a1.json?.quota)} ${a2.status}:${JSON.stringify(a2.json?.quota)}`);
+  const left = nextUtcMidnight() - Date.now();
+  check('T-v2-4 3rd tx -> 429 user_quota until UTC midnight', a3.status === 429 && a3.json?.code === 'user_quota'
+    && Math.abs(a3.json?.retry_after_ms - left) < 5000 && Number(a3.headers['retry-after']) >= 1, `${a3.status} ${a3.json?.code} ${a3.json?.retry_after_ms} vs ${left}`);
+  const q1 = await quotaOf(u1);
+  check('T-v2-4 GET /quota', q1.status === 200 && q1.json?.used === 2 && q1.json?.limit === 2 && q1.json?.resets_at === nextUtcMidnight()
+    && q1.headers['access-control-allow-origin'] === ORIGIN, JSON.stringify(q1.json));
+  r = await relayAsB(u1);
+  check('T-v2-4 same wallet in another project has its own quota', r.status === 200 && r.json?.quota?.used === 1, `${r.status} ${JSON.stringify(r.json?.quota)}`);
+  const qb = await quotaOf(u1, { aud: 'client-b', origin: ORIGIN_B });
+  check('T-v2-4 GET /quota is per project', qb.json?.used === 1 && qb.json?.limit === 100, JSON.stringify(qb.json));
+
+  // GET /quota auth
+  const noTok = await request(`/quota?wallet=${mk(u1).user}`, { method: 'GET', headers: { origin: ORIGIN } });
+  const other = await quotaOf(u1, { token: await tokenFor(mk(freshSeed()).user_hex) });
+  const xorigin = await quotaOf(u1, { origin: ORIGIN_B });
+  check('GET /quota requires a token bound to the wallet and the project origin',
+    noTok.status === 401 && other.status === 401 && xorigin.status === 403, `${noTok.status} ${other.status} ${xorigin.status}`);
+
+  // T-v2-5: project budget (A has used 2 of 3 — the reject was refunded)
+  r = await relayAs(freshSeed());
+  check('T-v2-5 3rd tx within project budget', r.status === 200, `${r.status} ${r.json?.code}`);
+  const u3 = freshSeed();
+  r = await relayAs(u3);
+  check('T-v2-5 project budget exhausted -> 503 until UTC midnight', r.status === 503 && r.json?.code === 'project_budget'
+    && Math.abs(r.json?.retry_after_ms - (nextUtcMidnight() - Date.now())) < 5000, `${r.status} ${r.json?.code}`);
+  const q3 = await quotaOf(u3);
+  check('T-v2-5 budget refusal gives back the user count', q3.json?.used === 0, JSON.stringify(q3.json));
+
+  // T-v2-6: cluster budget = 6 tx: A 3 + B 1 so far
+  const bs = [];
+  for (let i = 0; i < 3; i++) bs.push(await relayAsB(freshSeed()));
+  check('T-v2-6 cluster budget across projects', bs[0].status === 200 && bs[1].status === 200
+    && bs[2].status === 503 && bs[2].json?.code === 'cluster_budget', bs.map((x) => `${x.status}:${x.json?.code ?? ''}`).join(','));
+  r = await relayAsB(freshSeed());
+  check('T-v2-6 cluster refusal does not leak project B budget', r.status === 503 && r.json?.code === 'cluster_budget', `${r.status} ${r.json?.code}`);
+  // Persisted for D2
+  fs.writeFileSync(`${PERSIST}/d-seeds.json`, JSON.stringify({ u1 }));
+}
+
+async function suiteD2() {
+  // Same state as D, after a full wrangler dev restart (T-v2-9).
+  const { u1 } = JSON.parse(fs.readFileSync(`${PERSIST}/d-seeds.json`, 'utf8'));
+  let r = await relayAs(u1);
+  check('T-v2-9 user quota survives restart', r.status === 429 && r.json?.code === 'user_quota', `${r.status} ${r.json?.code}`);
+  const q = await quotaOf(u1);
+  check('T-v2-9 GET /quota after restart', q.json?.used === 2, JSON.stringify(q.json));
+  r = await relayAs(freshSeed());
+  check('T-v2-9 project budget survives restart', r.status === 503 && r.json?.code === 'project_budget', `${r.status} ${r.json?.code}`);
+  r = await relayAsB(freshSeed());
+  check('T-v2-9 cluster budget survives restart', r.status === 503 && r.json?.code === 'cluster_budget', `${r.status} ${r.json?.code}`);
+}
+
+async function suiteE() {
+  // T-v2-10: projects C and D (budget 3 tx each), 5 distinct wallets each, all at once, with
+  // getBalance held open so admits overlap inside each ProjectThrottle.
+  await setState({ balanceDelayMs: 1500 });
+  const fire = (fp, aud, origin) => Promise.all([...Array(5)].map(async () => {
+    const t = mk(freshSeed(), '', fp);
+    return relay(t, { token: await tokenFor(t.user_hex, { aud }), origin });
+  }));
+  const [c, d] = await Promise.all([fire(PK_C, 'client-c', 'http://localhost:5179'), fire(PK_D, 'client-d', 'http://localhost:5180')]);
+  await setState({ balanceDelayMs: 0 });
+  const tally = (rs) => ({ ok: rs.filter((x) => x.status === 200).length, budget: rs.filter((x) => x.json?.code === 'project_budget').length });
+  const tc = tally(c), td = tally(d);
+  check('T-v2-10 concurrent admits never exceed the project budget', tc.ok === 3 && tc.budget === 2 && td.ok === 3 && td.budget === 2,
+    `C=${JSON.stringify(tc)} D=${JSON.stringify(td)} statuses=${[...c, ...d].map((x) => `${x.status}:${x.json?.code ?? ''}`)}`);
+}
+
 const info = await request('/relayer?project=test-client', { method: 'GET' });
 relayerPubkey = info.json?.pubkey;
 if (!relayerPubkey) { console.error('relayer not reachable', info); process.exit(2); }
-await { A: suiteA, B: suiteB, C: suiteC }[SUITE]();
+await { A: suiteA, B: suiteB, C: suiteC, D: suiteD, D2: suiteD2, E: suiteE }[SUITE]();
 const failed = results.filter((r) => !r.ok);
 console.log(`\nsuite ${SUITE}: ${results.length - failed.length}/${results.length} passed`);
 process.exit(failed.length ? 1 : 0);

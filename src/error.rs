@@ -83,6 +83,18 @@ impl ApiError {
         Self::new(429, "cluster_throttle", "relayer is at capacity")
             .with_retry_after(retry_after_ms)
     }
+    pub fn user_quota(retry_after_ms: f64) -> Self {
+        Self::new(429, "user_quota", "daily quota reached for this wallet")
+            .with_retry_after(retry_after_ms)
+    }
+    pub fn project_budget(retry_after_ms: f64) -> Self {
+        Self::new(503, "project_budget", "project daily budget exhausted")
+            .with_retry_after(retry_after_ms)
+    }
+    pub fn cluster_budget(retry_after_ms: f64) -> Self {
+        Self::new(503, "cluster_budget", "relayer daily budget exhausted")
+            .with_retry_after(retry_after_ms)
+    }
     pub fn project_paused() -> Self {
         Self::new(503, "project_paused", "project is not active")
     }
@@ -141,6 +153,8 @@ impl ApiError {
             (429, Some("project_throttle")) => Self::project_throttle(retry),
             (429, Some("cluster_throttle")) => Self::cluster_throttle(retry),
             (503, Some("low_balance")) => Self::low_balance(),
+            (503, Some("project_budget")) => Self::project_budget(retry),
+            (503, Some("cluster_budget")) => Self::cluster_budget(retry),
             // The other DO already logged its own detail; don't log it twice.
             (503, Some("upstream")) => Self::upstream_relayed(),
             (500, Some("internal")) => Self::config("throttle DO returned 500"),

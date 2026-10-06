@@ -3,12 +3,14 @@
 Multi-project gasless relayer for Solana — Cloudflare Worker in Rust/Wasm with Durable Objects and D1.
 One project = one Web3Auth clientId (`aud`) = one fee payer wallet = one cluster.
 Spec: `../docs/plans/2026-10-06_multi-project-relayer-v2-spec.md` (extends `2026-10-05_gasless-relayer-poc-spec.md`).
-**Phase 1** (registry, per-project fee payers, project/cluster throttles) is done; daily quotas and budgets are
-Phase 2. Devnet only until Phase 5 is approved.
+Phases 1–2 are done: registry, per-project fee payers, project/cluster throttles, and persistent daily limits
+(UTC day) — tx count per user, fee budget per project and per cluster. Devnet only until Phase 5 is approved.
 
 ```
 POST /relay                    { "transaction": "<base64 wire tx>" }   Authorization: Bearer <Web3Auth idToken>
+                             → { signature, quota: { used, limit, resets_at } }
 GET  /relayer?project=<aud>  → { pubkey, cluster, policy, cooldown_ms, user_daily_quota, wallet_binding }
+GET  /quota?wallet=<base58>  → { used, limit, resets_at }                Authorization: Bearer <Web3Auth idToken>
 ```
 
 ## Layout
@@ -19,10 +21,11 @@ GET  /relayer?project=<aud>  → { pubkey, cluster, policy, cooldown_ms, user_da
 | `src/registry.rs` | D1 `projects` + `settings` snapshot per isolate (stale-while-revalidate), project parsing |
 | `src/policy.rs` | Tx policy: structural (before auth) + per project (fee payer, memo limit/prefix, cost) |
 | `src/jwt.rs` | ES256 JWT verify (`alg`/`kid`/`aud`/`iss`/`exp`) + wallet binding |
-| `src/user_controller.rs` | DO per `<aud>:<wallet>`: sync in-flight lock → cooldown → ProjectThrottle → RPC → audit |
-| `src/project_throttle.rs` | DO per project: RPM + cached fee payer balance → ClusterThrottle |
-| `src/cluster_throttle.rs` | DO per cluster: RPM across all projects (protects the RPC plan) |
-| `src/window.rs` | Fixed one-minute window counter |
+| `src/user_controller.rs` | DO per `<aud>:<wallet>`: sync in-flight lock → cooldown → daily tx quota → ProjectThrottle → RPC → audit |
+| `src/project_throttle.rs` | DO per project: RPM + daily fee budget + cached fee payer balance → ClusterThrottle |
+| `src/cluster_throttle.rs` | DO per cluster: RPM + daily fee budget across all projects (protects the RPC plan and the wallet total) |
+| `src/window.rs` | Fixed one-minute window counter (memory) |
+| `src/daily.rs` | Per-UTC-day counter in DO SQLite: one atomic `UPDATE … WHERE spent + cost <= limit RETURNING` |
 | `src/rpc.rs` | JSON-RPC with timeout; send outcome = accepted / rejected / unknown |
 | `migrations/` | D1: `relay_log` (0001), `projects` / `fee_payer_history` / `settings` (0002) |
 
@@ -64,9 +67,10 @@ cargo test --lib            # policy / registry / jwt / rpc / window / tx unit t
 ./tests/run-e2e.sh [A B C]  # local e2e vs wrangler dev + mock RPC/JWKS — no network
 ```
 
-`tests/run-e2e.sh` seeds six projects (two devnet, one mainnet, one paused, one with a missing secret, one with a
-mismatched key) with throwaway keys, and covers v1 T1–T18, T20, T22–T28 plus v2 T-v2-1/2/3/7/8/11/12, the kill switch,
-retire, and the D1-outage path (stale snapshot, then mainnet fail-closed). Not covered here: T19 (storage `put` failing
+`tests/run-e2e.sh` seeds eight projects (four devnet, one mainnet, one paused, one with a missing secret, one with a
+mismatched key) with throwaway keys, and covers v1 T1–T18, T20, T22–T28 plus every v2 test T-v2-1…12: user quota,
+project and cluster budgets (with the refund chain), counters surviving a `wrangler dev` restart (D → D2), concurrent
+admits across projects, the kill switch, retire, and the D1-outage path (stale snapshot, then mainnet fail-closed). Not covered here: T19 (storage `put` failing
 after a broadcast — not simulable locally), T21 (Memo Count — frontend), the "throttle DO itself fails" half of T18
 (only the `getBalance` failure path is simulated), a refund that arrives after the window rolled over
 (`refunded:false`; needs > 60 s between reject and refund), and an unparseable `Content-Length` (→ 400; clients and

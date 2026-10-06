@@ -1,5 +1,6 @@
 //! `UserController` — one DO per user per project (`id_from_name("<aud>:<wallet>")`,
-//! spec v2 V2, §4.4). In-flight lock, cooldown and reject backoff as in v1.
+//! spec v2 V2, §4.4). In-flight lock, cooldown and reject backoff as in v1, plus the user's
+//! daily tx quota (SQLite, `daily.rs`) checked before any other DO is asked.
 //!
 //! Ordering matters: DO input gates only close during storage operations, so any `await`
 //! on a fetch (ProjectThrottle, RPC) lets another request for the same wallet in. The
@@ -14,6 +15,7 @@ use worker::*;
 
 use crate::{
     config::{ADMIT_MARGIN_MS, Cluster, Config, REFUND_TIMEOUT_MS, reject_backoff_ms, rpc_url},
+    daily,
     error::ApiError,
     rpc::{self, SendOutcome},
 };
@@ -39,14 +41,23 @@ pub struct RelayJob {
     /// Lamports the relayer pays for this tx (spec v2 V7).
     pub cost: u64,
     pub project_rpm: u32,
+    pub project_daily_budget: u64,
     pub fee_payer: String,
     pub min_balance: u64,
+    pub user_daily_quota: u32,
+}
+
+#[derive(Deserialize)]
+struct QuotaQuery {
+    limit: u32,
 }
 
 /// Where this request was counted, so a tx-fault reject can give the slots back (D17).
 struct Admitted {
     window: f64,
+    day: i64,
     cluster_window: f64,
+    cluster_day: i64,
 }
 
 #[durable_object]
@@ -80,12 +91,22 @@ impl DurableObject for UserController {
         }
     }
 
-    async fn fetch(&self, req: Request) -> Result<Response> {
+    async fn fetch(&self, mut req: Request) -> Result<Response> {
         let now = Date::now().as_millis() as f64;
         let cfg = match Config::from_env(&self.env) {
             Ok(c) => c,
             Err(e) => return ApiError::config(e).into_response(),
         };
+        // Read-only: no lock (GET /quota must work while a relay is in flight).
+        if req.path() == "/quota" {
+            return match req.json::<QuotaQuery>().await {
+                Ok(q) => match self.quota(q.limit, now) {
+                    Ok(v) => Response::from_json(&v),
+                    Err(e) => e.into_response(),
+                },
+                Err(e) => ApiError::internal(format!("quota body: {e}")).into_response(),
+            };
+        }
 
         // --- synchronous check-and-set: no await above this line ---
         if let Some(since) = self.inflight_since.get()
@@ -107,6 +128,19 @@ impl DurableObject for UserController {
 }
 
 impl UserController {
+    /// `{ used, limit, resets_at }` for today (UTC).
+    fn quota(&self, limit: u32, now: f64) -> std::result::Result<serde_json::Value, ApiError> {
+        let used = daily::used(&self.state.storage().sql(), daily::day_of(now))
+            .map_err(|e| ApiError::internal(format!("quota read: {e}")))?;
+        Ok(json!({ "used": used, "limit": limit, "resets_at": daily::next_day_start(now) as u64 }))
+    }
+
+    fn refund_user(&self, day: i64) {
+        if let Err(e) = daily::refund(&self.state.storage().sql(), day, 1) {
+            console_error!("user quota refund failed: {e}");
+        }
+    }
+
     async fn relay(
         &self,
         mut req: Request,
@@ -132,13 +166,28 @@ impl UserController {
             return Err(ApiError::cooldown(cooldown_until - now));
         }
 
+        // User daily quota (V6/V8): counted before asking any other DO, so a user at quota
+        // never consumes project or cluster capacity.
+        let day = daily::day_of(now);
+        match daily::try_add(&storage.sql(), day, 1, job.user_daily_quota as i64) {
+            Ok(Some(_)) => {}
+            Ok(None) => return Err(ApiError::user_quota(daily::ms_until_next_day(now))),
+            Err(e) => return Err(ApiError::internal(format!("user quota: {e}"))),
+        }
+
         // Bounded: ProjectThrottle may wait one RPC timeout on getBalance plus the cluster hop.
         let admitted =
             match rpc::with_timeout(self.admit(&job), cfg.rpc_timeout_ms + ADMIT_MARGIN_MS).await {
-                Some(admitted) => admitted?,
+                Some(Ok(admitted)) => admitted,
+                // Definitely not counted upstream: give the user's slot back.
+                Some(Err(e)) => {
+                    self.refund_user(day);
+                    return Err(e);
+                }
                 None => {
                     // The throttles may still count this request (slots held until the window
-                    // ends, R9 / R-v2-5). A short cooldown stops retries from leaking more slots.
+                    // ends, R9 / R-v2-5), so the user's count is kept too (fail-closed). A short
+                    // cooldown stops retries from leaking more slots.
                     let until = Date::now().as_millis() as f64 + cfg.reject_cooldown_ms;
                     if let Err(e) = storage.put(COOLDOWN_KEY, until).await {
                         console_error!(
@@ -219,16 +268,21 @@ impl UserController {
             console_error!("cooldown put failed for {}: {e}", job.user);
         }
         if tx_fault {
+            // Nothing was sent: the user's count, the project and the cluster budgets go back.
+            self.refund_user(day);
             self.refund(&job, &admitted).await;
         }
         self.audit(&job, audit.0, audit.1, done);
+        let quota = self.quota(job.user_daily_quota, now).ok();
 
         match outcome {
-            SendOutcome::Accepted(sig) => Response::from_json(&json!({ "signature": sig }))
-                .map_err(|e| ApiError::internal(e.to_string())),
+            SendOutcome::Accepted(sig) => {
+                Response::from_json(&json!({ "signature": sig, "quota": quota }))
+                    .map_err(|e| ApiError::internal(e.to_string()))
+            }
             // The same signed tx already landed: report it as the success it is.
             SendOutcome::AlreadyProcessed => {
-                Response::from_json(&json!({ "signature": job.signature }))
+                Response::from_json(&json!({ "signature": job.signature, "quota": quota }))
                     .map_err(|e| ApiError::internal(e.to_string()))
             }
             SendOutcome::Rejected { reason, .. } => {
@@ -254,8 +308,11 @@ impl UserController {
     async fn refund(&self, job: &RelayJob, admitted: &Admitted) {
         let body = json!({
             "cluster": job.cluster,
+            "cost": job.cost,
             "window": admitted.window,
+            "day": admitted.day,
             "cluster_window": admitted.cluster_window,
+            "cluster_day": admitted.cluster_day,
         });
         match rpc::with_timeout(
             self.project_call(&job.aud, "refund", body),
@@ -274,7 +331,9 @@ impl UserController {
     async fn admit(&self, job: &RelayJob) -> std::result::Result<Admitted, ApiError> {
         let body = json!({
             "cluster": job.cluster,
+            "cost": job.cost,
             "rpm": job.project_rpm,
+            "budget": job.project_daily_budget,
             "fee_payer": job.fee_payer,
             "min_balance": job.min_balance,
         });
@@ -286,10 +345,18 @@ impl UserController {
             return Err(ApiError::relayed(status, &body));
         }
         let get = |k: &str| body.get(k).and_then(serde_json::Value::as_f64);
-        match (get("window"), get("cluster_window")) {
-            (Some(window), Some(cluster_window)) => Ok(Admitted {
+        let get_day = |k: &str| body.get(k).and_then(serde_json::Value::as_i64);
+        match (
+            get("window"),
+            get_day("day"),
+            get("cluster_window"),
+            get_day("cluster_day"),
+        ) {
+            (Some(window), Some(day), Some(cluster_window), Some(cluster_day)) => Ok(Admitted {
                 window,
+                day,
                 cluster_window,
+                cluster_day,
             }),
             _ => Err(ApiError::upstream("project admit: missing window")),
         }

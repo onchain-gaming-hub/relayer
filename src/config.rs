@@ -95,6 +95,9 @@ pub struct Config {
     pub reject_cooldown_max_ms: f64,
     pub cluster_rpm_devnet: u32,
     pub cluster_rpm_mainnet: u32,
+    /// Lamports per UTC day across every project on the cluster (V12 catastrophic stop).
+    pub cluster_daily_budget_devnet: u64,
+    pub cluster_daily_budget_mainnet: u64,
     pub cluster_hop_timeout_ms: u64,
     pub registry_cache_ms: f64,
     pub registry_max_stale_ms: f64,
@@ -155,6 +158,17 @@ impl Config {
             )?,
             cluster_rpm_devnet: num(var("CLUSTER_RPM_DEVNET"), "CLUSTER_RPM_DEVNET", 300)?,
             cluster_rpm_mainnet: num(var("CLUSTER_RPM_MAINNET"), "CLUSTER_RPM_MAINNET", 300)?,
+            // Spec v2 §5: 10 SOL on devnet, 0.2 SOL on mainnet.
+            cluster_daily_budget_devnet: num(
+                var("CLUSTER_DAILY_BUDGET_DEVNET"),
+                "CLUSTER_DAILY_BUDGET_DEVNET",
+                10_000_000_000,
+            )?,
+            cluster_daily_budget_mainnet: num(
+                var("CLUSTER_DAILY_BUDGET_MAINNET"),
+                "CLUSTER_DAILY_BUDGET_MAINNET",
+                200_000_000,
+            )?,
             cluster_hop_timeout_ms: num(
                 var("CLUSTER_HOP_TIMEOUT_MS"),
                 "CLUSTER_HOP_TIMEOUT_MS",
@@ -227,6 +241,13 @@ impl Config {
         }
     }
 
+    pub fn cluster_daily_budget(&self, cluster: Cluster) -> u64 {
+        match cluster {
+            Cluster::Devnet => self.cluster_daily_budget_devnet,
+            Cluster::Mainnet => self.cluster_daily_budget_mainnet,
+        }
+    }
+
     pub fn web3auth(&self, network: Web3AuthNetwork) -> Result<&Web3AuthEndpoints, String> {
         match network {
             Web3AuthNetwork::SapphireDevnet => Ok(&self.web3auth_devnet),
@@ -272,6 +293,8 @@ mod tests {
             reject_cooldown_max_ms: reject_max,
             cluster_rpm_devnet: 300,
             cluster_rpm_mainnet: 300,
+            cluster_daily_budget_devnet: 10_000_000_000,
+            cluster_daily_budget_mainnet: 200_000_000,
             cluster_hop_timeout_ms: 2_000,
             registry_cache_ms: 60_000.0,
             registry_max_stale_ms: 600_000.0,

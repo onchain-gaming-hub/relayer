@@ -1,6 +1,6 @@
 //! `ProjectThrottle` — one DO per project (`id_from_name(aud)`, spec v2 §4.4).
-//! Project requests per minute + a 30 s cached balance of the project's fee payer (circuit
-//! breaker), then the cluster-wide admit. Phase 2 adds the persistent daily budget.
+//! Project requests per minute (memory) + daily fee budget (SQLite, `daily.rs`) + a 30 s cached
+//! balance of the project's fee payer (circuit breaker), then the cluster-wide admit.
 //! Limits arrive with each admit (from the registry snapshot, ≤ REGISTRY_CACHE_MS old).
 
 use std::cell::RefCell;
@@ -12,6 +12,7 @@ use worker::*;
 
 use crate::{
     config::{BALANCE_CACHE_MS, BALANCE_FAILURE_BACKOFF_MS, Cluster, Config, rpc_url},
+    daily,
     error::ApiError,
     rpc,
     window::FixedWindow,
@@ -22,7 +23,11 @@ type BalanceFuture = Shared<LocalBoxFuture<'static, std::result::Result<u64, Str
 #[derive(Deserialize)]
 struct Admit {
     cluster: String,
+    /// Lamports this tx costs the fee payer (V7).
+    cost: u64,
     rpm: u32,
+    /// project_daily_budget_lamports (V12).
+    budget: u64,
     fee_payer: String,
     min_balance: u64,
 }
@@ -30,12 +35,21 @@ struct Admit {
 #[derive(Deserialize)]
 struct Refund {
     cluster: String,
+    cost: u64,
     window: f64,
+    day: i64,
     cluster_window: f64,
+    cluster_day: i64,
+}
+
+/// Lamports as SQLite integers (budgets far below i64::MAX in practice; clamp, never wrap).
+fn lamports(v: u64) -> i64 {
+    i64::try_from(v).unwrap_or(i64::MAX)
 }
 
 #[durable_object]
 pub struct ProjectThrottle {
+    state: State,
     env: Env,
     rpm: FixedWindow,
     /// (fee payer, lamports, fetched_at): keyed by pubkey so a key rotation never reuses it.
@@ -47,8 +61,9 @@ pub struct ProjectThrottle {
 }
 
 impl DurableObject for ProjectThrottle {
-    fn new(_state: State, env: Env) -> Self {
+    fn new(state: State, env: Env) -> Self {
         Self {
+            state,
             env,
             rpm: FixedWindow::default(),
             balance: RefCell::new(None),
@@ -101,40 +116,70 @@ impl ProjectThrottle {
             return Err(ApiError::internal("project rpm 0"));
         }
         let url = rpc_url(&self.env, cluster).map_err(ApiError::config)?;
-        // Capacity check + increment happen synchronously, before the first await.
+        // Capacity check + increment happen synchronously, before the first await:
+        // RPM (memory), then the daily budget (one SQLite statement, V8).
         let window = self
             .rpm
             .take(a.rpm, now)
             .map_err(ApiError::project_throttle)?;
+        let day = daily::day_of(now);
+        let cost = lamports(a.cost);
+        match daily::try_add(&self.state.storage().sql(), day, cost, lamports(a.budget)) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                self.rpm.release(window);
+                return Err(ApiError::project_budget(daily::ms_until_next_day(now)));
+            }
+            Err(e) => {
+                self.rpm.release(window);
+                return Err(ApiError::internal(format!("project budget: {e}")));
+            }
+        }
+        let undo = || {
+            self.rpm.release(window);
+            self.refund_budget(day, cost);
+        };
 
         match self.balance(&a.fee_payer, &url, cfg, now).await {
             Err(e) => {
-                self.rpm.release(window);
+                undo();
                 return Err(ApiError::upstream(e));
             }
-            Ok(lamports) if lamports < a.min_balance => {
-                self.rpm.release(window);
+            Ok(balance) if balance < a.min_balance => {
+                undo();
                 return Err(ApiError::low_balance());
             }
             Ok(_) => {}
         }
 
-        let call = cluster_call(&self.env, "admit", json!({ "cluster": cluster.as_str() }));
+        let call = cluster_call(
+            &self.env,
+            "admit",
+            json!({ "cluster": cluster.as_str(), "cost": a.cost }),
+        );
         match rpc::with_timeout(call, cfg.cluster_hop_timeout_ms).await {
             Some(Ok((200, body))) => {
-                let cluster_window = body
-                    .get("window")
-                    .and_then(Value::as_f64)
-                    .ok_or_else(|| ApiError::upstream("cluster admit: missing window"))?;
-                Response::from_json(&json!({ "window": window, "cluster_window": cluster_window }))
-                    .map_err(|e| ApiError::internal(e.to_string()))
+                let cluster_window = body.get("window").and_then(Value::as_f64);
+                let cluster_day = body.get("day").and_then(Value::as_i64);
+                let (Some(cluster_window), Some(cluster_day)) = (cluster_window, cluster_day)
+                else {
+                    // Counted by the cluster but unusable: keep ours too (fail-closed).
+                    return Err(ApiError::upstream("cluster admit: missing window"));
+                };
+                Response::from_json(&json!({
+                    "window": window,
+                    "day": day,
+                    "cluster_window": cluster_window,
+                    "cluster_day": cluster_day,
+                }))
+                .map_err(|e| ApiError::internal(e.to_string()))
             }
             Some(Ok((status, body))) => {
-                self.rpm.release(window);
+                undo();
                 Err(ApiError::relayed(status, &body))
             }
             Some(Err(e)) => {
-                self.rpm.release(window);
+                undo();
                 Err(ApiError::upstream(format!("cluster admit: {e}")))
             }
             // The cluster may have counted it: keep our slot too (fail-closed, R-v2-5).
@@ -142,13 +187,26 @@ impl ProjectThrottle {
         }
     }
 
-    /// Best-effort: gives back this project's slot and forwards the refund to the cluster.
+    fn refund_budget(&self, day: i64, cost: i64) {
+        if let Err(e) = daily::refund(&self.state.storage().sql(), day, cost) {
+            console_error!("project budget refund failed: {e}");
+        }
+    }
+
+    /// Best-effort: gives back this project's slot and budget (same window / day only) and
+    /// forwards the refund to the cluster.
     async fn refund(&self, r: Refund, cfg: &Config) -> std::result::Result<Response, ApiError> {
         let refunded = self.rpm.release(r.window);
+        self.refund_budget(r.day, lamports(r.cost));
         let call = cluster_call(
             &self.env,
             "refund",
-            json!({ "cluster": r.cluster, "window": r.cluster_window }),
+            json!({
+                "cluster": r.cluster,
+                "cost": r.cost,
+                "window": r.cluster_window,
+                "day": r.cluster_day,
+            }),
         );
         let cluster_refunded = match rpc::with_timeout(call, cfg.cluster_hop_timeout_ms).await {
             Some(Ok((200, body))) => body.get("refunded").and_then(Value::as_bool) == Some(true),

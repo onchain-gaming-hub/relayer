@@ -44,8 +44,6 @@ pub struct Project {
     pub memo: MemoRule,
     pub user_daily_quota: u32,
     pub project_rpm: u32,
-    /// Enforced in Phase 2 (ProjectThrottle daily budget).
-    #[allow(dead_code)]
     pub project_daily_budget_lamports: u64,
     pub min_balance_lamports: u64,
 }
