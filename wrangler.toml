@@ -7,11 +7,11 @@ command = "worker-build --release"
 
 # Non-secret config (spec §4.1). RELAYER_PRIVATE_KEY lives in .dev.vars / `wrangler secret put`.
 [vars]
-RPC_URL = "https://api.devnet.solana.com"
+RPC_URL = "https://api.devnet.solana.com"   # blocks Workers (HTTP 403 on CF-Worker) — set a keyed devnet RPC in .dev.vars
 ALLOWED_ORIGIN = "http://localhost:5173"
-WEB3AUTH_JWKS_URL = "https://api-auth.web3auth.io/jwks"
+WEB3AUTH_JWKS_URL = "https://api.web3auth.io/citadel-service/.well-known/jwks.json"
 WEB3AUTH_CLIENT_ID = "set-me"   # Web3Auth dashboard (Sapphire Devnet)
-WEB3AUTH_ISSUER = "https://api-auth.web3auth.io" # social login (Web3Auth docs); confirm with a real token in spike 0.2
+WEB3AUTH_ISSUER = "web3auth.io"   # iss of real Sapphire Devnet social-login tokens (spike 0.2)
 WALLET_BINDING = "wallets"
 RPC_TIMEOUT_MS = "15000"
 COOLDOWN_MS = "10000"

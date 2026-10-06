@@ -31,8 +31,15 @@ cargo run -q --example keygen        # creates .dev.vars with a new devnet relay
 npx wrangler d1 execute gasless-relayer-audit --local --file schema.sql
 ```
 
-Set `WEB3AUTH_CLIENT_ID` in `wrangler.toml` (or `--var`) before relaying real tokens. `WEB3AUTH_ISSUER` defaults to
-`https://api-auth.web3auth.io` (social login, per Web3Auth docs) — confirm against a real token.
+Set `WEB3AUTH_CLIENT_ID` in `wrangler.toml` (or `--var`) before relaying real tokens. `WEB3AUTH_ISSUER` (`web3auth.io`)
+and `WEB3AUTH_JWKS_URL` (`https://api.web3auth.io/citadel-service/.well-known/jwks.json`) default to what real
+Sapphire Devnet social-login tokens use — not the `api-auth.web3auth.io` values in Web3Auth's docs.
+
+**RPC: the public `https://api.devnet.solana.com` rejects Workers** (HTTP 403 "Your IP or provider is blocked" for any
+request carrying the `CF-Worker` header, which Cloudflare — and `wrangler dev` — adds to every subrequest). Use a keyed
+devnet RPC (Alchemy, Helius, QuickNode, …) and keep it out of git: add `RPC_URL=https://…` to `.dev.vars` locally,
+`npx wrangler secret put RPC_URL` when deployed. The devnet guard still checks the genesis hash. If the provider reports
+rate limits as JSON-RPC errors, add its code to `NODE_SIDE_ERROR_CODES` (spec R6).
 
 Have a `solana-keygen` JSON keypair instead? Convert the 64-byte array to Base58, e.g.
 `node -e "const b=require('fs').readFileSync(process.argv[1]);console.log(require('bs58').default.encode(Buffer.from(JSON.parse(b))))" key.json`.
@@ -40,7 +47,7 @@ Have a `solana-keygen` JSON keypair instead? Convert the 64-byte array to Base58
 ## Run & test
 
 ```bash
-npm run dev                 # wrangler dev on :8787 (devnet RPC)
+npm run dev                 # wrangler dev on :8787 (RPC_URL from .dev.vars)
 cargo test --lib            # policy / jwt / rpc / tx unit tests
 ./tests/run-e2e.sh          # local e2e vs wrangler dev + mock RPC/JWKS (spec §7) — no network
 ```

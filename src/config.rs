@@ -72,11 +72,12 @@ impl Config {
             rpc_timeout_ms: num(var("RPC_TIMEOUT_MS"), "RPC_TIMEOUT_MS", 15_000)?,
             allowed_origin,
             web3auth_client_id: required("WEB3AUTH_CLIENT_ID")?,
-            web3auth_jwks_url: var("WEB3AUTH_JWKS_URL")
-                .unwrap_or_else(|| "https://api-auth.web3auth.io/jwks".into()),
-            // Social-login issuer per Web3Auth docs; override if spike 0.2 shows otherwise.
-            web3auth_issuer: var("WEB3AUTH_ISSUER")
-                .unwrap_or_else(|| "https://api-auth.web3auth.io".into()),
+            // Values seen on real Sapphire Devnet social-login tokens (spike 0.2, 2026-10-06);
+            // the documented api-auth.web3auth.io issuer/JWKS do not match them.
+            web3auth_jwks_url: var("WEB3AUTH_JWKS_URL").unwrap_or_else(|| {
+                "https://api.web3auth.io/citadel-service/.well-known/jwks.json".into()
+            }),
+            web3auth_issuer: var("WEB3AUTH_ISSUER").unwrap_or_else(|| "web3auth.io".into()),
             wallet_binding,
             cooldown_ms: num(var("COOLDOWN_MS"), "COOLDOWN_MS", 10_000.0)?,
             reject_cooldown_ms: num(var("REJECT_COOLDOWN_MS"), "REJECT_COOLDOWN_MS", 3_000.0)?,
