@@ -1,4 +1,4 @@
--- Generic relay audit log (spec §4.6, D13): success / rpc_error only, best-effort writes.
+-- Generic relay audit log (v1 spec §4.6, D13): success / rpc_error only, best-effort writes.
 CREATE TABLE IF NOT EXISTS relay_log (
   id             INTEGER PRIMARY KEY AUTOINCREMENT,
   wallet_address TEXT    NOT NULL,

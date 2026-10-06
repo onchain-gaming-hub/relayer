@@ -10,12 +10,28 @@ use solana_transaction::versioned::VersionedTransaction;
 
 pub const MEMO_V2: Pubkey = Pubkey::from_str_const("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
 
-/// Returns the user (signer index 1) when the transaction matches the policy.
-pub fn validate(
-    tx: &VersionedTransaction,
-    relayer: &Pubkey,
-    max_memo_bytes: usize,
-) -> Result<Pubkey, &'static str> {
+/// Hard upper bound for any project's memo limit (v1 `MAX_MEMO_BYTES`).
+pub const MAX_MEMO_BYTES_CAP: usize = 128;
+/// Base fee per signature (lamports); the policy forbids priority fees (spec v2 V7).
+pub const LAMPORTS_PER_SIGNATURE: u64 = 5_000;
+
+/// The parts of a structurally valid transaction that the per-project check needs.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Shape {
+    pub fee_payer: Pubkey,
+    pub user: Pubkey,
+    pub memo: Vec<u8>,
+}
+
+/// Per-project memo rule (spec v2 V11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoRule {
+    pub max_bytes: usize,
+    pub prefix: Option<String>,
+}
+
+/// Project-independent checks (spec v2 §4.4 step 2): run before the idToken is verified.
+pub fn structural(tx: &VersionedTransaction) -> Result<Shape, &'static str> {
     match &tx.message {
         VersionedMessage::Legacy(_) => {}
         // V0 is allowed only without address lookup tables.
@@ -43,13 +59,10 @@ pub fn validate(
     let [fee_payer, user, program] = keys else {
         return Err("exactly 3 account keys required");
     };
-    if fee_payer != relayer {
-        return Err("fee payer is not the relayer");
-    }
     if *program != MEMO_V2 {
         return Err("program not allowed");
     }
-    if user == relayer || *user == MEMO_V2 {
+    if user == fee_payer || *user == MEMO_V2 {
         return Err("invalid user key");
     }
 
@@ -62,13 +75,54 @@ pub fn validate(
     if ix.accounts.as_slice() != [1] {
         return Err("memo accounts must be [user]");
     }
-    if ix.data.len() > max_memo_bytes {
+    if ix.data.len() > MAX_MEMO_BYTES_CAP {
         return Err("memo too long");
     }
     if std::str::from_utf8(&ix.data).is_err() {
         return Err("memo is not utf-8");
     }
-    Ok(*user)
+    Ok(Shape {
+        fee_payer: *fee_payer,
+        user: *user,
+        memo: ix.data.clone(),
+    })
+}
+
+/// Project-dependent checks (spec v2 §4.4 step 6). Returns the fee the relayer pays (V7).
+pub fn for_project(
+    shape: &Shape,
+    fee_payer: &Pubkey,
+    rule: &MemoRule,
+) -> Result<u64, &'static str> {
+    if shape.fee_payer != *fee_payer {
+        return Err("fee payer is not the relayer");
+    }
+    if shape.memo.len() > rule.max_bytes {
+        return Err("memo too long");
+    }
+    if let Some(prefix) = &rule.prefix
+        && !shape.memo.starts_with(prefix.as_bytes())
+    {
+        return Err("memo prefix not allowed");
+    }
+    // 2 signatures (structural), no priority fee, no account creation.
+    Ok(2 * LAMPORTS_PER_SIGNATURE)
+}
+
+/// Both stages with a plain memo limit; returns the user. Used by the unit tests.
+#[cfg(test)]
+pub fn validate(
+    tx: &VersionedTransaction,
+    relayer: &Pubkey,
+    max_memo_bytes: usize,
+) -> Result<Pubkey, &'static str> {
+    let shape = structural(tx)?;
+    let rule = MemoRule {
+        max_bytes: max_memo_bytes,
+        prefix: None,
+    };
+    for_project(&shape, relayer, &rule)?;
+    Ok(shape.user)
 }
 
 #[cfg(test)]
@@ -340,5 +394,45 @@ pub(crate) mod tests {
             validate(&tx, &relayer, 128),
             Err("memo accounts must be [user]")
         );
+    }
+
+    #[test]
+    fn project_rule_prefix_limit_and_cost() {
+        let (relayer, user) = setup();
+        let shape = structural(&good_tx(&relayer, &user)).unwrap();
+        let rule = |max_bytes, prefix: Option<&str>| MemoRule {
+            max_bytes,
+            prefix: prefix.map(str::to_string),
+        };
+        assert_eq!(for_project(&shape, &relayer, &rule(128, None)), Ok(10_000));
+        assert_eq!(
+            for_project(&shape, &relayer, &rule(128, Some("gasless-poc:"))),
+            Ok(10_000)
+        );
+        assert_eq!(
+            for_project(&shape, &relayer, &rule(128, Some("other:"))),
+            Err("memo prefix not allowed")
+        );
+        assert_eq!(
+            for_project(&shape, &relayer, &rule(4, None)),
+            Err("memo too long")
+        );
+        let other = Keypair::new().pubkey();
+        assert_eq!(
+            for_project(&shape, &other, &rule(128, None)),
+            Err("fee payer is not the relayer")
+        );
+    }
+
+    #[test]
+    fn structural_rejects_memo_over_cap_before_any_project() {
+        let (relayer, user) = setup();
+        let msg = Message::new_with_blockhash(
+            &[memo_ix(&user.pubkey(), &[b'a'; MAX_MEMO_BYTES_CAP + 1])],
+            Some(&relayer),
+            &Hash::new_from_array([7; 32]),
+        );
+        let tx = signed(VersionedMessage::Legacy(msg), &user);
+        assert_eq!(structural(&tx), Err("memo too long"));
     }
 }

@@ -1,0 +1,420 @@
+//! Project registry (spec v2 V4, §4.5): the whole `projects` + `settings` tables are loaded
+//! as one snapshot per isolate and looked up in memory, so D1 load never depends on the
+//! `aud` / `?project=` values a client sends.
+//!
+//! Refresh is stale-while-revalidate. Workers forbid awaiting I/O started by another request,
+//! so there is no shared promise: the first request that sees an expired snapshot stamps
+//! `REFRESHING_SINCE` and queries; the others keep serving the old snapshot. A failed refresh
+//! keeps the stamp, which doubles as a retry backoff. A cold isolate queries once per
+//! concurrent request (bounded by concurrency, like JWKS).
+
+use std::{
+    cell::{Cell, RefCell},
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
+
+use serde::Deserialize;
+use serde_json::Value;
+use solana_pubkey::Pubkey;
+use worker::{Env, console_log, console_warn};
+
+use crate::{
+    config::{Cluster, Config, Web3AuthNetwork},
+    error::ApiError,
+    policy::{MAX_MEMO_BYTES_CAP, MemoRule},
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Status {
+    Active,
+    Paused,
+    Retired,
+}
+
+#[derive(Clone, Debug)]
+pub struct Project {
+    pub aud: String,
+    pub slug: String,
+    pub status: Status,
+    pub cluster: Cluster,
+    pub network: Web3AuthNetwork,
+    pub allowed_origins: Vec<String>,
+    pub fee_payer: Pubkey,
+    pub memo: MemoRule,
+    pub user_daily_quota: u32,
+    pub project_rpm: u32,
+    /// Enforced in Phase 2 (ProjectThrottle daily budget).
+    #[allow(dead_code)]
+    pub project_daily_budget_lamports: u64,
+    pub min_balance_lamports: u64,
+}
+
+/// One `projects` row as D1 returns it (numbers arrive as JS numbers).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProjectRow {
+    pub aud: String,
+    pub slug: String,
+    pub status: String,
+    pub cluster: String,
+    pub web3auth_network: String,
+    pub allowed_origins: String,
+    pub fee_payer_pubkey: String,
+    pub policy: String,
+    pub user_daily_quota: f64,
+    pub project_rpm: f64,
+    pub project_daily_budget_lamports: f64,
+    pub min_balance_lamports: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct SettingRow {
+    key: String,
+    value: String,
+}
+
+pub fn valid_slug(slug: &str) -> bool {
+    (1..=32).contains(&slug.len())
+        && slug
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// An exact `scheme://host[:port]` origin: no wildcard, path, or trailing slash.
+fn valid_origin(o: &str) -> bool {
+    let Some((scheme, rest)) = o.split_once("://") else {
+        return false;
+    };
+    matches!(scheme, "http" | "https")
+        && !rest.is_empty()
+        && !rest.contains(['/', '*', '?', '#', ' '])
+}
+
+fn whole<T: TryFrom<u64>>(v: f64, name: &str, min: u64) -> Result<T, String> {
+    if !v.is_finite() || v.fract() != 0.0 || v < min as f64 || v > 9_007_199_254_740_991.0 {
+        return Err(format!("{name}: must be an integer >= {min}"));
+    }
+    T::try_from(v as u64).map_err(|_| format!("{name}: out of range"))
+}
+
+/// Parses the memo action of `projects.policy` (spec v2 V11). Unknown action types fail closed.
+fn parse_policy(json: &str) -> Result<MemoRule, String> {
+    let v: Value = serde_json::from_str(json).map_err(|_| "policy: invalid JSON".to_string())?;
+    let actions = v
+        .get("actions")
+        .and_then(Value::as_array)
+        .ok_or("policy: missing actions")?;
+    let mut memo = None;
+    for a in actions {
+        match a.get("type").and_then(Value::as_str) {
+            Some("memo") if memo.is_none() => {
+                let max_bytes =
+                    a.get("max_bytes")
+                        .and_then(Value::as_u64)
+                        .ok_or("policy: memo.max_bytes required")? as usize;
+                if !(1..=MAX_MEMO_BYTES_CAP).contains(&max_bytes) {
+                    return Err(format!(
+                        "policy: memo.max_bytes must be 1..={MAX_MEMO_BYTES_CAP}"
+                    ));
+                }
+                let prefix = match a.get("prefix") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(p)) if !p.is_empty() && p.len() <= max_bytes => {
+                        Some(p.clone())
+                    }
+                    Some(_) => {
+                        return Err("policy: memo.prefix must be a short non-empty string".into());
+                    }
+                };
+                memo = Some(MemoRule { max_bytes, prefix });
+            }
+            Some("memo") => return Err("policy: duplicate memo action".into()),
+            other => return Err(format!("policy: unknown action type {other:?}")),
+        }
+    }
+    memo.ok_or_else(|| "policy: no memo action".into())
+}
+
+pub fn parse_project(row: &ProjectRow) -> Result<Project, String> {
+    if !valid_slug(&row.slug) {
+        return Err("slug must match [A-Z0-9_]{1,32}".into());
+    }
+    let status = match row.status.as_str() {
+        "active" => Status::Active,
+        "paused" => Status::Paused,
+        "retired" => Status::Retired,
+        _ => return Err("invalid status".into()),
+    };
+    let cluster = Cluster::parse(&row.cluster).ok_or("invalid cluster")?;
+    let network =
+        Web3AuthNetwork::parse(&row.web3auth_network).ok_or("invalid web3auth_network")?;
+    // A mismatched pair would verify devnet logins for a mainnet wallet (or vice versa).
+    let expected = match cluster {
+        Cluster::Devnet => Web3AuthNetwork::SapphireDevnet,
+        Cluster::Mainnet => Web3AuthNetwork::SapphireMainnet,
+    };
+    if network != expected {
+        return Err("web3auth_network does not match cluster".into());
+    }
+    let allowed_origins: Vec<String> = serde_json::from_str(&row.allowed_origins)
+        .map_err(|_| "allowed_origins: must be a JSON array of strings")?;
+    if allowed_origins.is_empty() || !allowed_origins.iter().all(|o| valid_origin(o)) {
+        return Err("allowed_origins: exact http(s) origins only, no '*'".into());
+    }
+    let fee_payer: Pubkey = row
+        .fee_payer_pubkey
+        .parse()
+        .map_err(|_| "fee_payer_pubkey: invalid")?;
+    Ok(Project {
+        aud: row.aud.clone(),
+        slug: row.slug.clone(),
+        status,
+        cluster,
+        network,
+        allowed_origins,
+        fee_payer,
+        memo: parse_policy(&row.policy)?,
+        user_daily_quota: whole(row.user_daily_quota, "user_daily_quota", 1)?,
+        project_rpm: whole(row.project_rpm, "project_rpm", 1)?,
+        project_daily_budget_lamports: whole(
+            row.project_daily_budget_lamports,
+            "project_daily_budget_lamports",
+            0,
+        )?,
+        min_balance_lamports: whole(row.min_balance_lamports, "min_balance_lamports", 0)?,
+    })
+}
+
+pub struct Snapshot {
+    /// A row that fails to parse stays as `Err` so only that project answers 500.
+    projects: HashMap<String, Result<Project, String>>,
+    /// Union of `allowed_origins` of active projects (CORS preflight, V9).
+    pub origins: HashSet<String>,
+    pub mainnet_enabled: bool,
+    pub loaded_at: f64,
+}
+
+impl Snapshot {
+    pub fn build(rows: Vec<ProjectRow>, settings: &[(String, String)], loaded_at: f64) -> Self {
+        let mut projects = HashMap::new();
+        let mut origins = HashSet::new();
+        for row in rows {
+            let parsed = parse_project(&row);
+            if let Ok(p) = &parsed
+                && p.status == Status::Active
+            {
+                origins.extend(p.allowed_origins.iter().cloned());
+            }
+            projects.insert(row.aud.clone(), parsed);
+        }
+        let mainnet_enabled = settings
+            .iter()
+            .any(|(k, v)| k == "mainnet_enabled" && v == "true");
+        Self {
+            projects,
+            origins,
+            mainnet_enabled,
+            loaded_at,
+        }
+    }
+
+    pub fn project(&self, aud: &str) -> Option<&Result<Project, String>> {
+        self.projects.get(aud)
+    }
+
+    pub fn age(&self, now: f64) -> f64 {
+        now - self.loaded_at
+    }
+}
+
+thread_local! {
+    static SNAPSHOT: RefCell<Option<Rc<Snapshot>>> = const { RefCell::new(None) };
+    static REFRESHING_SINCE: Cell<f64> = const { Cell::new(f64::NEG_INFINITY) };
+}
+
+/// The registry snapshot for this request (V4).
+pub async fn snapshot(env: &Env, cfg: &Config, now: f64) -> Result<Rc<Snapshot>, ApiError> {
+    let cached = SNAPSHOT.with(|s| s.borrow().clone());
+    if let Some(s) = &cached {
+        if s.age(now) < cfg.registry_cache_ms {
+            return Ok(s.clone());
+        }
+        // Someone else is refreshing (or a recent refresh failed): serve stale meanwhile.
+        if now - REFRESHING_SINCE.with(Cell::get) < cfg.cluster_hop_timeout_ms as f64 * 5.0 {
+            return Ok(s.clone());
+        }
+        REFRESHING_SINCE.with(|r| r.set(now));
+    }
+    match load(env, now).await {
+        Ok(fresh) => {
+            let fresh = Rc::new(fresh);
+            SNAPSHOT.with(|s| *s.borrow_mut() = Some(fresh.clone()));
+            REFRESHING_SINCE.with(|r| r.set(f64::NEG_INFINITY));
+            Ok(fresh)
+        }
+        Err(e) => match cached {
+            // Mainnet projects refuse a snapshot older than REGISTRY_MAX_STALE_MS (lib.rs).
+            Some(s) => {
+                console_warn!("registry refresh failed, serving stale snapshot: {e}");
+                Ok(s)
+            }
+            None => Err(ApiError::upstream(format!("registry: {e}"))),
+        },
+    }
+}
+
+async fn load(env: &Env, now: f64) -> Result<Snapshot, String> {
+    let db = env.d1("DB").map_err(|e| e.to_string())?;
+    let rows: Vec<ProjectRow> = db
+        .prepare(
+            "SELECT aud, slug, status, cluster, web3auth_network, allowed_origins, fee_payer_pubkey, \
+             policy, user_daily_quota, project_rpm, project_daily_budget_lamports, min_balance_lamports \
+             FROM projects",
+        )
+        .all()
+        .await
+        .map_err(|e| format!("projects: {e}"))?
+        .results()
+        .map_err(|e| format!("projects rows: {e}"))?;
+    let settings: Vec<SettingRow> = db
+        .prepare("SELECT key, value FROM settings")
+        .all()
+        .await
+        .map_err(|e| format!("settings: {e}"))?
+        .results()
+        .map_err(|e| format!("settings rows: {e}"))?;
+    let settings: Vec<(String, String)> = settings.into_iter().map(|r| (r.key, r.value)).collect();
+    let snap = Snapshot::build(rows, &settings, now);
+    // One line per D1 load: e2e counts these to prove client input cannot trigger queries.
+    console_log!("registry: loaded {} projects", snap.projects.len());
+    for (aud, p) in &snap.projects {
+        if let Err(e) = p {
+            console_warn!("registry: project {aud} is misconfigured: {e}");
+        }
+    }
+    Ok(snap)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    pub fn row() -> ProjectRow {
+        ProjectRow {
+            aud: "client-a".into(),
+            slug: "POC_1".into(),
+            status: "active".into(),
+            cluster: "devnet".into(),
+            web3auth_network: "sapphire_devnet".into(),
+            allowed_origins: r#"["http://localhost:5173"]"#.into(),
+            fee_payer_pubkey: "7uA1QxYTnzXzNBoVaE4gbLvXzxtPLjzvWAQqvmcMU5Cc".into(),
+            policy: r#"{"actions":[{"type":"memo","max_bytes":128}]}"#.into(),
+            user_daily_quota: 20.0,
+            project_rpm: 60.0,
+            project_daily_budget_lamports: 20_000_000.0,
+            min_balance_lamports: 5_000_000.0,
+        }
+    }
+
+    #[test]
+    fn parses_a_good_row() {
+        let p = parse_project(&row()).unwrap();
+        assert_eq!(p.cluster, Cluster::Devnet);
+        assert_eq!(p.memo.max_bytes, 128);
+        assert_eq!(p.project_daily_budget_lamports, 20_000_000);
+    }
+
+    #[test]
+    fn rejects_bad_slugs_like_the_db_check() {
+        for bad in ["", "poc", "A-bad", "A B", "ÀBC", &"A".repeat(33)] {
+            assert!(!valid_slug(bad), "{bad}");
+            let mut r = row();
+            r.slug = bad.to_string();
+            assert!(parse_project(&r).is_err(), "{bad}");
+        }
+        for good in ["POC_1", "1ABC", &"A".repeat(32)] {
+            assert!(valid_slug(good), "{good}");
+        }
+    }
+
+    #[test]
+    fn rejects_wildcard_or_malformed_origins() {
+        for bad in [
+            r#"["*"]"#,
+            r#"[]"#,
+            r#"["http://localhost:5173/"]"#,
+            r#"["localhost:5173"]"#,
+            r#"["https://*.example.com"]"#,
+            r#""http://localhost:5173""#,
+            "not json",
+        ] {
+            let mut r = row();
+            r.allowed_origins = bad.into();
+            assert!(parse_project(&r).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn policy_unknown_type_or_bad_limits_fail_closed() {
+        for bad in [
+            r#"{"actions":[{"type":"spl_transfer"}]}"#,
+            r#"{"actions":[{"type":"memo","max_bytes":0}]}"#,
+            r#"{"actions":[{"type":"memo","max_bytes":129}]}"#,
+            r#"{"actions":[{"type":"memo"}]}"#,
+            r#"{"actions":[]}"#,
+            r#"{"actions":[{"type":"memo","max_bytes":10},{"type":"memo","max_bytes":10}]}"#,
+            r#"{"actions":[{"type":"memo","max_bytes":4,"prefix":"toolong"}]}"#,
+            r#"{}"#,
+        ] {
+            assert!(parse_policy(bad).is_err(), "{bad}");
+        }
+        let rule = parse_policy(r#"{"actions":[{"type":"memo","max_bytes":64,"prefix":"app:"}]}"#)
+            .unwrap();
+        assert_eq!(rule.prefix.as_deref(), Some("app:"));
+    }
+
+    #[test]
+    fn rejects_cluster_network_mismatch_and_bad_numbers() {
+        let mut r = row();
+        r.web3auth_network = "sapphire_mainnet".into();
+        assert!(parse_project(&r).is_err());
+        let mut r = row();
+        r.user_daily_quota = 0.0;
+        assert!(parse_project(&r).is_err());
+        let mut r = row();
+        r.project_rpm = 1.5;
+        assert!(parse_project(&r).is_err());
+        let mut r = row();
+        r.min_balance_lamports = -1.0;
+        assert!(parse_project(&r).is_err());
+        let mut r = row();
+        r.fee_payer_pubkey = "nope".into();
+        assert!(parse_project(&r).is_err());
+    }
+
+    #[test]
+    fn snapshot_unions_only_active_origins_and_reads_kill_switch() {
+        let mut paused = row();
+        paused.aud = "client-p".into();
+        paused.slug = "PAUSED".into();
+        paused.status = "paused".into();
+        paused.allowed_origins = r#"["https://paused.test"]"#.into();
+        let mut broken = row();
+        broken.aud = "client-x".into();
+        broken.policy = "{}".into();
+        broken.allowed_origins = r#"["https://broken.test"]"#.into();
+        let s = Snapshot::build(
+            vec![row(), paused, broken],
+            &[("mainnet_enabled".into(), "true".into())],
+            0.0,
+        );
+        assert!(s.origins.contains("http://localhost:5173"));
+        assert!(!s.origins.contains("https://paused.test"));
+        assert!(!s.origins.contains("https://broken.test"));
+        assert!(s.project("client-x").unwrap().is_err());
+        assert!(s.project("missing").is_none());
+        assert!(s.mainnet_enabled);
+        let off = Snapshot::build(vec![], &[("mainnet_enabled".into(), "TRUE".into())], 0.0);
+        assert!(!off.mainnet_enabled);
+    }
+}

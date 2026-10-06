@@ -1,17 +1,26 @@
-//! Gasless relayer — Cloudflare Worker (Rust/Wasm). Spec: docs/plans/2026-10-05_gasless-relayer-poc-spec.md
+//! Gasless relayer — Cloudflare Worker (Rust/Wasm), multi-project.
+//! Spec: docs/plans/2026-10-06_multi-project-relayer-v2-spec.md (extends the v1 POC spec).
 //!
-//! Worker (stateless): HTTP hardening → decode → policy → idToken → co-sign + verify → DO.
-//! RelayController DO (stateful, per wallet): in-flight lock → cooldown → GlobalThrottle → RPC → audit.
+//! Worker (stateless): HTTP hardening → decode + structural policy → idToken (project = `aud`)
+//! → project status / origin / policy → co-sign with the project's fee payer → UserController.
+//! UserController DO ("<aud>:<wallet>"): lock → cooldown → ProjectThrottle → ClusterThrottle
+//! → RPC → audit.
 
+mod cluster_throttle;
 mod config;
 mod error;
-mod global_throttle;
 mod jwt;
 mod policy;
-mod relay_controller;
+mod project_throttle;
+mod registry;
 mod rpc;
+mod user_controller;
+mod window;
 
-use std::cell::{Cell, RefCell};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+};
 
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use futures_util::StreamExt;
@@ -23,13 +32,15 @@ use solana_signer::Signer;
 use worker::*;
 
 use config::{
-    Config, DEVNET_GENESIS_HASH, JWKS_FAILURE_BACKOFF_MS, JWKS_TTL_MS, JWKS_UNKNOWN_KID_REFETCH_MS,
-    MAX_BODY_BYTES, MAX_DRAIN_BYTES, WalletBinding,
+    Cluster, Config, JWKS_FAILURE_BACKOFF_MS, JWKS_TTL_MS, JWKS_UNKNOWN_KID_REFETCH_MS,
+    MAX_BODY_BYTES, MAX_DRAIN_BYTES, WalletBinding, Web3AuthEndpoints,
 };
 use error::ApiError;
+use registry::{Project, Snapshot, Status};
 
-pub use global_throttle::GlobalThrottle;
-pub use relay_controller::RelayController;
+pub use cluster_throttle::ClusterThrottle;
+pub use project_throttle::ProjectThrottle;
+pub use user_controller::UserController;
 
 pub mod txcore {
     use solana_keypair::Keypair;
@@ -69,30 +80,50 @@ pub mod txcore {
 
 thread_local! {
     /// Per-isolate caches. Wasm workers are single-threaded.
-    static JWKS: RefCell<Option<(Vec<jwt::Jwk>, f64)>> = const { RefCell::new(None) };
-    static RELAYER_KEYPAIR: RefCell<Option<Keypair>> = const { RefCell::new(None) };
-    static JWKS_LAST_FORCED_REFETCH: Cell<f64> = const { Cell::new(f64::NEG_INFINITY) };
-    static JWKS_LAST_FAILURE: Cell<f64> = const { Cell::new(f64::NEG_INFINITY) };
-    static DEVNET_CONFIRMED: Cell<bool> = const { Cell::new(false) };
+    /// JWKS per URL: (keys, fetched_at).
+    static JWKS: RefCell<HashMap<String, (Vec<jwt::Jwk>, f64)>> = RefCell::new(HashMap::new());
+    static JWKS_LAST_FORCED_REFETCH: RefCell<HashMap<String, f64>> = RefCell::new(HashMap::new());
+    static JWKS_LAST_FAILURE: RefCell<HashMap<String, f64>> = RefCell::new(HashMap::new());
+    /// Fee payer keypairs by project slug (secrets do not change within an isolate).
+    static FEE_PAYERS: RefCell<HashMap<String, Keypair>> = RefCell::new(HashMap::new());
+    static CLUSTERS_CONFIRMED: RefCell<HashSet<Cluster>> = RefCell::new(HashSet::new());
 }
 
-/// Decoded once per isolate (secrets do not change within an isolate's lifetime).
-fn relayer_keypair(env: &Env) -> std::result::Result<Keypair, ApiError> {
-    if let Some(kp) = RELAYER_KEYPAIR.with(|c| c.borrow().as_ref().map(Keypair::insecure_clone)) {
-        return Ok(kp);
+/// The project's fee payer from `FEE_PAYER_<SLUG>`; must match `fee_payer_pubkey` in D1 (V3).
+fn fee_payer(env: &Env, project: &Project) -> std::result::Result<Keypair, ApiError> {
+    let cached = FEE_PAYERS.with(|c| c.borrow().get(&project.slug).map(Keypair::insecure_clone));
+    let kp = match cached {
+        Some(kp) => kp,
+        None => {
+            // Re-validate before building a binding name from registry data (V3).
+            if !registry::valid_slug(&project.slug) {
+                return Err(ApiError::config(format!(
+                    "project {}: bad slug",
+                    project.aud
+                )));
+            }
+            let name = format!("FEE_PAYER_{}", project.slug);
+            let secret = env
+                .secret(&name)
+                .map(|s| s.to_string())
+                .or_else(|_| env.var(&name).map(|v| v.to_string()))
+                .map_err(|_| ApiError::config(format!("missing {name}")))?;
+            let kp = Keypair::try_from_base58_string(secret.trim())
+                .map_err(|_| ApiError::config(format!("{name} is not a valid base58 keypair")))?;
+            FEE_PAYERS.with(|c| {
+                c.borrow_mut()
+                    .insert(project.slug.clone(), kp.insecure_clone())
+            });
+            kp
+        }
+    };
+    if kp.pubkey() != project.fee_payer {
+        return Err(ApiError::config(format!(
+            "project {}: FEE_PAYER_{} does not match fee_payer_pubkey",
+            project.aud, project.slug
+        )));
     }
-    let secret = env
-        .secret("RELAYER_PRIVATE_KEY")
-        .map_err(|_| ApiError::config("missing RELAYER_PRIVATE_KEY"))?
-        .to_string();
-    let kp = Keypair::try_from_base58_string(secret.trim())
-        .map_err(|_| ApiError::config("RELAYER_PRIVATE_KEY is not a valid base58 keypair"))?;
-    RELAYER_KEYPAIR.with(|c| *c.borrow_mut() = Some(kp.insecure_clone()));
     Ok(kp)
-}
-
-pub(crate) fn relayer_keypair_pubkey(env: &Env) -> std::result::Result<String, ApiError> {
-    relayer_keypair(env).map(|kp| kp.pubkey().to_string())
 }
 
 fn now_ms() -> f64 {
@@ -104,45 +135,45 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let origin = req.headers().get("Origin")?;
     let cfg = match Config::from_env(&env) {
         Ok(c) => c,
-        Err(e) => {
-            // Keep CORS working so the browser surfaces the 500: preflights must get a 2xx,
-            // otherwise POST /relay would only ever show a CORS failure.
-            let allowed = env.var("ALLOWED_ORIGIN").ok().map(|v| v.to_string());
-            let cors = origin
-                .as_deref()
-                .filter(|o| allowed.as_deref() == Some(*o) && *o != "*");
-            if cors.is_some() && req.method() == Method::Options {
-                return with_cors(Response::empty()?.with_status(204), cors);
-            }
-            return with_cors(ApiError::config(e).into_response()?, cors);
-        }
+        Err(e) => return ApiError::config(e).into_response(),
     };
-    let origin_ok = origin.as_deref() == Some(cfg.allowed_origin.as_str());
     let path = req.path();
+    if !matches!(path.as_str(), "/relayer" | "/relay") {
+        return ApiError::not_found().into_response();
+    }
+    let snap = match registry::snapshot(&env, &cfg, now_ms()).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    // CORS: echo the Origin when it belongs to any active project (V9). The project-specific
+    // check for POST /relay happens after the token names the project.
+    let cors_origin = origin.as_deref().filter(|o| snap.origins.contains(*o));
 
     let result = match (req.method(), path.as_str()) {
-        (Method::Options, "/relayer" | "/relay") if origin_ok => {
-            Ok(Response::empty()?.with_status(204))
-        }
-        (Method::Options, "/relayer" | "/relay") => Err(ApiError::origin()),
+        (Method::Options, _) if cors_origin.is_some() => Ok(Response::empty()?.with_status(204)),
+        (Method::Options, _) => Err(ApiError::origin()),
         // Browsers send Origin on cross-origin GETs; non-browser clients may omit it.
-        (Method::Get, "/relayer") if origin.is_none() || origin_ok => relayer_info(&env, &cfg),
+        (Method::Get, "/relayer") if origin.is_none() || cors_origin.is_some() => {
+            relayer_info(&req, &snap, &cfg)
+        }
         (Method::Get, "/relayer") => Err(ApiError::origin()),
-        (Method::Post, "/relay") if origin_ok => handle_relay(&mut req, &env, &cfg).await,
-        (Method::Post, "/relay") => Err(ApiError::origin()),
-        (_, "/relayer" | "/relay") => Err(ApiError::method()),
-        _ => Err(ApiError::not_found()),
+        (Method::Post, "/relay") => match origin.as_deref() {
+            Some(o) if cors_origin.is_some() => handle_relay(&mut req, &env, &cfg, &snap, o).await,
+            _ => Err(ApiError::origin()),
+        },
+        _ => Err(ApiError::method()),
     };
     let resp = match result {
         Ok(r) => r,
         Err(e) => e.into_response()?,
     };
-    with_cors(resp, origin_ok.then_some(cfg.allowed_origin.as_str()))
+    with_cors(resp, cors_origin)
 }
 
 fn with_cors(mut resp: Response, origin: Option<&str>) -> Result<Response> {
+    let h = resp.headers_mut();
+    h.set("Vary", "Origin")?;
     if let Some(origin) = origin {
-        let h = resp.headers_mut();
         h.set("Access-Control-Allow-Origin", origin)?;
         h.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")?;
         h.set(
@@ -150,19 +181,60 @@ fn with_cors(mut resp: Response, origin: Option<&str>) -> Result<Response> {
             "Authorization, Content-Type",
         )?;
         h.set("Access-Control-Expose-Headers", "Retry-After")?;
-        h.set("Vary", "Origin")?;
     }
     Ok(resp)
 }
 
-fn relayer_info(env: &Env, cfg: &Config) -> std::result::Result<Response, ApiError> {
-    let pubkey = relayer_keypair_pubkey(env)?;
+/// Whether a project may serve traffic right now (V5, V13, V4 max stale).
+fn project_gate(
+    project: &Project,
+    snap: &Snapshot,
+    cfg: &Config,
+) -> std::result::Result<(), ApiError> {
+    if project.status != Status::Active {
+        return Err(ApiError::project_paused());
+    }
+    if project.cluster == Cluster::Mainnet {
+        if !snap.mainnet_enabled {
+            return Err(ApiError::cluster_disabled());
+        }
+        // A stale snapshot could hold an old `mainnet_enabled = true`: fail closed.
+        if snap.age(now_ms()) > cfg.registry_max_stale_ms {
+            return Err(ApiError::upstream(
+                "registry snapshot too stale for mainnet",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `GET /relayer?project=<clientId>` (spec v2 §4.2). Unknown, inactive, or disabled → 404.
+fn relayer_info(
+    req: &Request,
+    snap: &Snapshot,
+    cfg: &Config,
+) -> std::result::Result<Response, ApiError> {
+    let url = req.url().map_err(|e| ApiError::internal(e.to_string()))?;
+    let aud = url
+        .query_pairs()
+        .find(|(k, _)| k == "project")
+        .map(|(_, v)| v.into_owned())
+        .ok_or_else(ApiError::not_found)?;
+    let project = match snap.project(&aud) {
+        Some(Ok(p)) if project_gate(p, snap, cfg).is_ok() => p,
+        _ => return Err(ApiError::not_found()),
+    };
+    let mut memo = json!({ "type": "memo", "max_bytes": project.memo.max_bytes });
+    if let Some(prefix) = &project.memo.prefix {
+        memo["prefix"] = json!(prefix);
+    }
     Response::from_json(&json!({
-        "pubkey": pubkey,
-        // Whole milliseconds (spec §4.2 shows an integer, not 10000.0); ceil like retry_after_ms.
+        "pubkey": project.fee_payer.to_string(),
+        "cluster": project.cluster.as_str(),
+        "policy": { "actions": [memo] },
+        // Whole milliseconds; ceil like retry_after_ms.
         "cooldown_ms": cfg.cooldown_ms.ceil() as u64,
-        "allowlist": [policy::MEMO_V2.to_string()],
-        "max_memo_bytes": cfg.max_memo_bytes,
+        "user_daily_quota": project.user_daily_quota,
         "wallet_binding": match cfg.wallet_binding {
             WalletBinding::Wallets => "wallets",
             WalletBinding::Off => "off",
@@ -180,6 +252,8 @@ async fn handle_relay(
     req: &mut Request,
     env: &Env,
     cfg: &Config,
+    snap: &Snapshot,
+    origin: &str,
 ) -> std::result::Result<Response, ApiError> {
     // 1. HTTP hardening
     let content_type = req
@@ -192,48 +266,78 @@ async fn handle_relay(
     if !media_type.eq_ignore_ascii_case("application/json") {
         return Err(ApiError::content_type());
     }
-    // Cheap fail-fast; the token itself is verified after policy (step 4).
+    // Cheap fail-fast; the token itself is verified in step 3.
     let token = bearer_token(req)?;
     let body = read_body_limited(req, MAX_BODY_BYTES).await?;
 
-    // 2. Decode
+    // 2. Decode + project-independent policy (before spending an ES256 verify)
     let body: RelayBody =
         serde_json::from_slice(&body).map_err(|_| ApiError::validation("invalid JSON body"))?;
     let raw = B64
         .decode(body.transaction.as_bytes())
         .map_err(|_| ApiError::validation("transaction is not base64"))?;
     let mut tx = txcore::decode(&raw).map_err(ApiError::validation)?;
+    let shape = policy::structural(&tx).map_err(ApiError::validation)?;
 
-    // 3. Policy
-    let relayer = relayer_keypair(env)?;
-    let user = policy::validate(&tx, &relayer.pubkey(), cfg.max_memo_bytes)
+    // 3. Identity (+ wallet binding): the unverified `aud` only picks the project;
+    //    verify re-checks it.
+    jwt::precheck(&token).map_err(|e| ApiError::unauthorized(format!("{e:?}")))?;
+    let aud = jwt::unverified_aud(&token).map_err(|e| ApiError::unauthorized(format!("{e:?}")))?;
+    let project = match snap.project(&aud) {
+        Some(Ok(p)) => p,
+        Some(Err(e)) => return Err(ApiError::config(format!("project {aud}: {e}"))),
+        // Same answer as any bad token: do not reveal which clientIds are registered.
+        None => return Err(ApiError::unauthorized("UnknownProject")),
+    };
+    authenticate(&token, cfg, project, &shape.user).await?;
+
+    // 4. Project status / cluster switch
+    project_gate(project, snap, cfg)?;
+    // 5. Origin must belong to this token's project (Origin is hygiene; `aud` is the gate)
+    if !project.allowed_origins.iter().any(|o| o == origin) {
+        return Err(ApiError::origin());
+    }
+    // 6. Project-dependent policy → cost (V7)
+    let cost = policy::for_project(&shape, &project.fee_payer, &project.memo)
         .map_err(ApiError::validation)?;
 
-    // 4. Identity
-    authenticate(&token, cfg, &user).await?;
-
-    // 5. Co-sign + verify every slot
+    // 7. Co-sign with the project's fee payer + verify every slot
+    let relayer = fee_payer(env, project)?;
     txcore::cosign_and_verify(&mut tx, &relayer).map_err(ApiError::validation)?;
     let signature = tx.signatures[0].to_string();
     let signed = txcore::encode(&tx).map_err(ApiError::internal)?;
 
-    ensure_devnet(cfg).await?;
+    ensure_cluster(env, cfg, project.cluster).await?;
 
-    // 6. Hand off to the wallet's RelayController
-    let job = json!({ "tx": B64.encode(signed), "user": user.to_string(), "signature": signature });
+    // 8. Hand off to the user's controller for this project
+    let user = shape.user.to_string();
+    let job = json!({
+        "tx": B64.encode(signed),
+        "user": user,
+        "signature": signature,
+        "aud": project.aud,
+        "cluster": project.cluster.as_str(),
+        "cost": cost,
+        "project_rpm": project.project_rpm,
+        "fee_payer": project.fee_payer.to_string(),
+        "min_balance": project.min_balance_lamports,
+    });
     let stub = env
-        .durable_object("RELAY_CONTROLLER")
-        .and_then(|ns| ns.id_from_name(&user.to_string())?.get_stub())
-        .map_err(|e| ApiError::upstream(format!("relay stub: {e}")))?;
+        .durable_object("USER_CONTROLLER")
+        .and_then(|ns| {
+            ns.id_from_name(&format!("{}:{user}", project.aud))?
+                .get_stub()
+        })
+        .map_err(|e| ApiError::upstream(format!("user stub: {e}")))?;
     let mut init = RequestInit::new();
     init.with_method(Method::Post)
         .with_body(Some(job.to_string().into()));
-    let do_req = Request::new_with_init("https://relay/relay", &init)
+    let do_req = Request::new_with_init("https://user/relay", &init)
         .map_err(|e| ApiError::internal(e.to_string()))?;
     let mut resp = stub
         .fetch_with_request(do_req)
         .await
-        .map_err(|e| ApiError::upstream(format!("relay fetch: {e}")))?;
+        .map_err(|e| ApiError::upstream(format!("user fetch: {e}")))?;
     passthrough(&mut resp).await
 }
 
@@ -318,37 +422,28 @@ fn parse_bearer(header: &str) -> Option<String> {
 async fn authenticate(
     token: &str,
     cfg: &Config,
+    project: &Project,
     user: &Pubkey,
 ) -> std::result::Result<(), ApiError> {
     let now_s = now_ms() / 1000.0;
-    // Reject malformed / non-ES256 / kid-less tokens before touching the network.
-    jwt::precheck(token).map_err(|e| ApiError::unauthorized(format!("{e:?}")))?;
+    let endpoints = cfg.web3auth(project.network).map_err(ApiError::config)?;
 
-    let mut jwks = load_jwks(cfg, false).await?;
-    let mut result = jwt::verify(
-        token,
-        &jwks,
-        now_s,
-        &cfg.web3auth_client_id,
-        &cfg.web3auth_issuer,
-    );
+    let mut jwks = load_jwks(endpoints, cfg, false).await?;
+    let mut result = jwt::verify(token, &jwks, now_s, &project.aud, &endpoints.issuer);
     if matches!(result, Err(jwt::AuthError::UnknownKid(_))) {
-        // Key rotation: refetch at most once per window per isolate, else reject.
-        let last = JWKS_LAST_FORCED_REFETCH.with(Cell::get);
+        // Key rotation: refetch at most once per window per isolate and JWKS URL, else reject.
+        let url = &endpoints.jwks_url;
+        let last = JWKS_LAST_FORCED_REFETCH
+            .with(|m| m.borrow().get(url).copied())
+            .unwrap_or(f64::NEG_INFINITY);
         if now_ms() - last >= JWKS_UNKNOWN_KID_REFETCH_MS {
             // Stamp before the attempt so a failing JWKS endpoint is not hammered by
-            // random-kid floods; an unknown kid stays a 401 either way (spec §4.3).
-            JWKS_LAST_FORCED_REFETCH.with(|c| c.set(now_ms()));
-            jwks = load_jwks(cfg, true)
+            // random-kid floods; an unknown kid stays a 401 either way.
+            JWKS_LAST_FORCED_REFETCH.with(|m| m.borrow_mut().insert(url.clone(), now_ms()));
+            jwks = load_jwks(endpoints, cfg, true)
                 .await
                 .map_err(|_| ApiError::unauthorized("UnknownKid (JWKS refetch failed)"))?;
-            result = jwt::verify(
-                token,
-                &jwks,
-                now_s,
-                &cfg.web3auth_client_id,
-                &cfg.web3auth_issuer,
-            );
+            result = jwt::verify(token, &jwks, now_s, &project.aud, &endpoints.issuer);
         }
     }
     let claims = result.map_err(|e| ApiError::unauthorized(format!("{e:?}")))?;
@@ -366,8 +461,13 @@ async fn authenticate(
     }
 }
 
-async fn load_jwks(cfg: &Config, force: bool) -> std::result::Result<Vec<jwt::Jwk>, ApiError> {
-    let cached = JWKS.with(|c| c.borrow().clone());
+async fn load_jwks(
+    endpoints: &Web3AuthEndpoints,
+    cfg: &Config,
+    force: bool,
+) -> std::result::Result<Vec<jwt::Jwk>, ApiError> {
+    let url = &endpoints.jwks_url;
+    let cached = JWKS.with(|c| c.borrow().get(url).cloned());
     if !force
         && let Some((keys, fetched_at)) = &cached
         && now_ms() - fetched_at < JWKS_TTL_MS
@@ -380,24 +480,26 @@ async fn load_jwks(cfg: &Config, force: bool) -> std::result::Result<Vec<jwt::Jw
     // request; accepted (Web3Auth JWKS is a static, cacheable document).
     // Negative cache: after a failed fetch, don't retry for JWKS_FAILURE_BACKOFF_MS.
     // A forced refetch is already rate-limited by its own window, so it always hits the network.
-    let recently_failed =
-        !force && now_ms() - JWKS_LAST_FAILURE.with(Cell::get) < JWKS_FAILURE_BACKOFF_MS;
+    let last_failure = JWKS_LAST_FAILURE
+        .with(|m| m.borrow().get(url).copied())
+        .unwrap_or(f64::NEG_INFINITY);
+    let recently_failed = !force && now_ms() - last_failure < JWKS_FAILURE_BACKOFF_MS;
     let fetched = if recently_failed {
         Err("jwks: recently failed".to_string())
     } else {
-        match rpc::get_text(&cfg.web3auth_jwks_url, cfg.rpc_timeout_ms).await {
+        match rpc::get_text(url, cfg.rpc_timeout_ms).await {
             Ok(text) => jwt::parse_jwks(&text),
             Err(e) => Err(format!("jwks: {e}")),
         }
     };
     match fetched {
         Ok(keys) => {
-            JWKS.with(|c| *c.borrow_mut() = Some((keys.clone(), now_ms())));
+            JWKS.with(|c| c.borrow_mut().insert(url.clone(), (keys.clone(), now_ms())));
             Ok(keys)
         }
         Err(e) => {
             if !recently_failed {
-                JWKS_LAST_FAILURE.with(|c| c.set(now_ms()));
+                JWKS_LAST_FAILURE.with(|m| m.borrow_mut().insert(url.clone(), now_ms()));
             }
             // Prefer stale keys over an outage: Web3Auth keys rotate rarely.
             match cached {
@@ -411,18 +513,28 @@ async fn load_jwks(cfg: &Config, force: bool) -> std::result::Result<Vec<jwt::Jw
     }
 }
 
-/// Lazy per-isolate devnet guard: only a confirmed match is cached; fetch failures retry.
-async fn ensure_devnet(cfg: &Config) -> std::result::Result<(), ApiError> {
-    if DEVNET_CONFIRMED.with(Cell::get) {
+/// Lazy per-isolate cluster guard (V5): the RPC of each cluster must report that cluster's
+/// genesis hash. Only a confirmed match is cached; fetch failures retry.
+async fn ensure_cluster(
+    env: &Env,
+    cfg: &Config,
+    cluster: Cluster,
+) -> std::result::Result<(), ApiError> {
+    if CLUSTERS_CONFIRMED.with(|c| c.borrow().contains(&cluster)) {
         return Ok(());
     }
-    let hash = rpc::get_genesis_hash(&cfg.rpc_url, cfg.rpc_timeout_ms)
+    let url = config::rpc_url(env, cluster).map_err(ApiError::config)?;
+    let hash = rpc::get_genesis_hash(&url, cfg.rpc_timeout_ms)
         .await
         .map_err(ApiError::upstream)?;
-    if hash != DEVNET_GENESIS_HASH {
-        return Err(ApiError::upstream("RPC_URL is not Solana devnet"));
+    if hash != cluster.genesis_hash() {
+        return Err(ApiError::upstream(format!(
+            "RPC_URL_{} is not Solana {}",
+            cluster.as_str().to_uppercase(),
+            cluster.as_str()
+        )));
     }
-    DEVNET_CONFIRMED.with(|c| c.set(true));
+    CLUSTERS_CONFIRMED.with(|c| c.borrow_mut().insert(cluster));
     Ok(())
 }
 

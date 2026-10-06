@@ -1,24 +1,26 @@
 // Mock Solana RPC + Web3Auth JWKS for local e2e (no deps). Port: MOCK_PORT (default 8899).
-//   POST /            JSON-RPC: getGenesisHash, getBalance, sendTransaction (behavior from state)
+//   POST / | /mainnet JSON-RPC (devnet | mainnet): getGenesisHash, getBalance, sendTransaction
 //   GET  /jwks        JWKS for a generated ES256 key (kid "test-kid")
-//   GET  /__token     ?user_hex=&exp=&aud=&iss=&kid=&curve= -> signed JWT
+//   GET  /__token     ?user_hex=&exp=&aud=&aud_array=&iss=&kid=&curve= -> signed JWT
+//   state.balances    { <pubkey>: lamports } overrides state.balance per fee payer
 //   POST /__state     merge JSON into state · GET /__stats -> call counters
 import http from 'node:http';
 import crypto from 'node:crypto';
 
 const DEVNET = 'EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG';
+const MAINNET = '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d';
 const { privateKey, publicKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
 const jwk = { ...publicKey.export({ format: 'jwk' }), kid: 'test-kid', use: 'sig', alg: 'ES256' };
 const rsaJwk = { ...crypto.generateKeyPairSync('rsa', { modulusLength: 2048 }).publicKey.export({ format: 'jwk' }), kid: 'rsa-kid', use: 'sig', alg: 'RS256' };
 
-const state = { genesis: DEVNET, balance: 10_000_000_000, balanceMode: 'ok', balanceDelayMs: 0, jwksMode: 'ok', send: 'ok', delayMs: 0 };
-const stats = { sendTransaction: 0, getBalance: 0, getGenesisHash: 0, jwks: 0 };
+const state = { genesis: DEVNET, genesisMainnet: MAINNET, balances: {}, balance: 10_000_000_000, balanceMode: 'ok', balanceDelayMs: 0, jwksMode: 'ok', send: 'ok', delayMs: 0 };
+const stats = { sendTransaction: 0, getBalance: 0, getGenesisHash: 0, jwks: 0, sendMainnet: 0 };
 
 const b64url = (b) => Buffer.from(b).toString('base64url');
-function token({ user_hex, exp, aud = 'test-client', iss = 'https://issuer.test', kid = 'test-kid', curve = 'ed25519' }) {
+function token({ user_hex, exp, aud = 'test-client', aud_array, iss = 'https://issuer.test', kid = 'test-kid', curve = 'ed25519' }) {
   const header = b64url(JSON.stringify({ alg: 'ES256', kid, typ: 'JWT' }));
   const claims = {
-    aud, iss, sub: 'test-user', iat: Math.floor(Date.now() / 1000),
+    aud: aud_array ? [aud] : aud, iss, sub: 'test-user', iat: Math.floor(Date.now() / 1000),
     exp: exp ? Number(exp) : Math.floor(Date.now() / 1000) + 3600,
     wallets: [{ public_key: user_hex, type: 'web3auth_app_key', curve }],
   };
@@ -41,18 +43,20 @@ http.createServer(async (req, res) => {
   if (req.method === 'GET' && url.pathname === '/__token') return json(res, 200, { token: token(Object.fromEntries(url.searchParams)) });
   if (req.method === 'GET' && url.pathname === '/__stats') return json(res, 200, { ...stats, state });
   if (req.method === 'POST' && url.pathname === '/__state') { Object.assign(state, JSON.parse(await readBody(req) || '{}')); return json(res, 200, state); }
-  if (req.method !== 'POST' || url.pathname !== '/') return json(res, 404, {});
+  if (req.method !== 'POST' || !['/', '/mainnet'].includes(url.pathname)) return json(res, 404, {});
+  const mainnet = url.pathname === '/mainnet';
 
   const rpc = JSON.parse(await readBody(req));
   stats[rpc.method] = (stats[rpc.method] || 0) + 1;
   const ok = (result) => json(res, 200, { jsonrpc: '2.0', id: rpc.id, result });
   switch (rpc.method) {
-    case 'getGenesisHash': return ok(state.genesis);
+    case 'getGenesisHash': return ok(mainnet ? state.genesisMainnet : state.genesis);
     case 'getBalance':
       if (state.balanceDelayMs) await new Promise((r) => setTimeout(r, state.balanceDelayMs));
       if (state.balanceMode === 'http500') return json(res, 500, {});
-      return ok({ context: { slot: 1 }, value: state.balance });
+      return ok({ context: { slot: 1 }, value: state.balances[rpc.params?.[0]] ?? state.balance });
     case 'sendTransaction': {
+      if (mainnet) stats.sendMainnet++;
       if (state.delayMs) await new Promise((r) => setTimeout(r, state.delayMs));
       switch (state.send) {
         case 'ok': return ok(crypto.randomBytes(32).toString('hex'));

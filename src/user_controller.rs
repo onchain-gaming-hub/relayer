@@ -1,7 +1,8 @@
-//! `RelayController` — one DO per user wallet (spec §4.4, stateful part).
+//! `UserController` — one DO per user per project (`id_from_name("<aud>:<wallet>")`,
+//! spec v2 V2, §4.4). In-flight lock, cooldown and reject backoff as in v1.
 //!
 //! Ordering matters: DO input gates only close during storage operations, so any `await`
-//! on a fetch (GlobalThrottle, RPC) lets another request for the same wallet in. The
+//! on a fetch (ProjectThrottle, RPC) lets another request for the same wallet in. The
 //! in-flight check-and-set below therefore runs synchronously before the first `await`.
 
 use std::cell::Cell;
@@ -12,7 +13,7 @@ use wasm_bindgen::JsValue;
 use worker::*;
 
 use crate::{
-    config::{Config, reject_backoff_ms},
+    config::{ADMIT_MARGIN_MS, Cluster, Config, REFUND_TIMEOUT_MS, reject_backoff_ms, rpc_url},
     error::ApiError,
     rpc::{self, SendOutcome},
 };
@@ -26,7 +27,6 @@ struct CooldownState {
     cooldown_until: f64,
     reject_streak: u32,
 }
-const ADMIT_MARGIN_MS: u64 = 2_000;
 
 #[derive(Deserialize)]
 pub struct RelayJob {
@@ -34,10 +34,23 @@ pub struct RelayJob {
     pub tx: String,
     pub user: String,
     pub signature: String,
+    pub aud: String,
+    pub cluster: String,
+    /// Lamports the relayer pays for this tx (spec v2 V7).
+    pub cost: u64,
+    pub project_rpm: u32,
+    pub fee_payer: String,
+    pub min_balance: u64,
+}
+
+/// Where this request was counted, so a tx-fault reject can give the slots back (D17).
+struct Admitted {
+    window: f64,
+    cluster_window: f64,
 }
 
 #[durable_object]
-pub struct RelayController {
+pub struct UserController {
     state: State,
     env: Env,
     inflight_since: Cell<Option<f64>>,
@@ -58,7 +71,7 @@ impl Drop for InflightGuard<'_> {
     }
 }
 
-impl DurableObject for RelayController {
+impl DurableObject for UserController {
     fn new(state: State, env: Env) -> Self {
         Self {
             state,
@@ -93,7 +106,7 @@ impl DurableObject for RelayController {
     }
 }
 
-impl RelayController {
+impl UserController {
     async fn relay(
         &self,
         mut req: Request,
@@ -105,6 +118,10 @@ impl RelayController {
             .await
             .map_err(|e| ApiError::internal(format!("job: {e}")))?;
         let storage = self.state.storage();
+        let cluster =
+            Cluster::parse(&job.cluster).ok_or_else(|| ApiError::internal("job: bad cluster"))?;
+        // Before admit: a missing RPC URL must not consume any slot.
+        let url = rpc_url(&self.env, cluster).map_err(ApiError::config)?;
 
         let cooldown_until: f64 = storage
             .get(COOLDOWN_KEY)
@@ -115,13 +132,13 @@ impl RelayController {
             return Err(ApiError::cooldown(cooldown_until - now));
         }
 
-        // Bounded: GlobalThrottle may itself wait up to one RPC timeout on getBalance.
-        let window =
-            match rpc::with_timeout(self.admit(), cfg.rpc_timeout_ms + ADMIT_MARGIN_MS).await {
+        // Bounded: ProjectThrottle may wait one RPC timeout on getBalance plus the cluster hop.
+        let admitted =
+            match rpc::with_timeout(self.admit(&job), cfg.rpc_timeout_ms + ADMIT_MARGIN_MS).await {
                 Some(admitted) => admitted?,
                 None => {
-                    // GlobalThrottle may still count this request (slot held until the window ends,
-                    // R9). A short cooldown stops immediate retries from leaking more slots.
+                    // The throttles may still count this request (slots held until the window
+                    // ends, R9 / R-v2-5). A short cooldown stops retries from leaking more slots.
                     let until = Date::now().as_millis() as f64 + cfg.reject_cooldown_ms;
                     if let Err(e) = storage.put(COOLDOWN_KEY, until).await {
                         console_error!(
@@ -129,11 +146,11 @@ impl RelayController {
                             job.user
                         );
                     }
-                    return Err(ApiError::upstream("global admit timeout"));
+                    return Err(ApiError::upstream("project admit timeout"));
                 }
             };
 
-        let outcome = rpc::send_transaction(&cfg.rpc_url, cfg.rpc_timeout_ms, &job.tx).await;
+        let outcome = rpc::send_transaction(&url, cfg.rpc_timeout_ms, &job.tx).await;
         let done = Date::now().as_millis() as f64;
 
         // D17: only a rejection caused by the transaction itself (JSON-RPC error except node-side
@@ -202,7 +219,7 @@ impl RelayController {
             console_error!("cooldown put failed for {}: {e}", job.user);
         }
         if tx_fault {
-            self.refund(window, cfg).await;
+            self.refund(&job, &admitted).await;
         }
         self.audit(&job, audit.0, audit.1, done);
 
@@ -233,73 +250,73 @@ impl RelayController {
         }
     }
 
-    /// Best-effort, bounded: a failed refund only means the slot stays used until the window ends.
-    async fn refund(&self, window: f64, cfg: &Config) {
-        let call = async {
-            let stub = self
-                .env
-                .durable_object("GLOBAL_THROTTLE")
-                .and_then(|ns| ns.id_from_name("global")?.get_stub())?;
-            let mut init = RequestInit::new();
-            init.with_method(Method::Post)
-                .with_body(Some(json!({ "window": window }).to_string().into()));
-            let req = Request::new_with_init("https://global/refund", &init)?;
-            let resp = stub.fetch_with_request(req).await?;
-            if resp.status_code() != 200 {
-                console_error!(
-                    "global refund: GlobalThrottle returned {}",
-                    resp.status_code()
-                );
-            }
-            Ok::<(), worker::Error>(())
-        };
-        match rpc::with_timeout(call, cfg.rpc_timeout_ms).await {
-            Some(Ok(())) => {}
-            Some(Err(e)) => console_error!("global refund failed: {e}"),
-            None => console_error!("global refund timed out"),
+    /// Best-effort, bounded: a failed refund only means the slots stay used until the window ends.
+    async fn refund(&self, job: &RelayJob, admitted: &Admitted) {
+        let body = json!({
+            "cluster": job.cluster,
+            "window": admitted.window,
+            "cluster_window": admitted.cluster_window,
+        });
+        match rpc::with_timeout(
+            self.project_call(&job.aud, "refund", body),
+            REFUND_TIMEOUT_MS,
+        )
+        .await
+        {
+            Some(Ok((200, _))) => {}
+            Some(Ok((status, _))) => console_error!("project refund: status {status}"),
+            Some(Err(e)) => console_error!("project refund failed: {e}"),
+            None => console_error!("project refund timed out"),
         }
     }
 
-    /// Asks the GlobalThrottle DO for capacity + balance; fail-closed on any error.
-    /// Returns the window the request was counted in (needed to refund it).
-    async fn admit(&self) -> std::result::Result<f64, ApiError> {
+    /// Asks the project's ProjectThrottle (which asks ClusterThrottle) for capacity; fail-closed.
+    async fn admit(&self, job: &RelayJob) -> std::result::Result<Admitted, ApiError> {
+        let body = json!({
+            "cluster": job.cluster,
+            "rpm": job.project_rpm,
+            "fee_payer": job.fee_payer,
+            "min_balance": job.min_balance,
+        });
+        let (status, body) = self
+            .project_call(&job.aud, "admit", body)
+            .await
+            .map_err(|e| ApiError::upstream(format!("project admit: {e}")))?;
+        if status != 200 {
+            return Err(ApiError::relayed(status, &body));
+        }
+        let get = |k: &str| body.get(k).and_then(serde_json::Value::as_f64);
+        match (get("window"), get("cluster_window")) {
+            (Some(window), Some(cluster_window)) => Ok(Admitted {
+                window,
+                cluster_window,
+            }),
+            _ => Err(ApiError::upstream("project admit: missing window")),
+        }
+    }
+
+    async fn project_call(
+        &self,
+        aud: &str,
+        action: &str,
+        body: serde_json::Value,
+    ) -> std::result::Result<(u16, serde_json::Value), worker::Error> {
         let stub = self
             .env
-            .durable_object("GLOBAL_THROTTLE")
-            .and_then(|ns| ns.id_from_name("global")?.get_stub())
-            .map_err(|e| ApiError::upstream(format!("global stub: {e}")))?;
-        let mut resp = stub
-            .fetch_with_str("https://global/admit")
-            .await
-            .map_err(|e| ApiError::upstream(format!("global fetch: {e}")))?;
-        if resp.status_code() == 200 {
-            let body: serde_json::Value = resp
-                .json()
-                .await
-                .map_err(|e| ApiError::upstream(format!("global body: {e}")))?;
-            return body
-                .get("window")
-                .and_then(|w| w.as_f64())
-                .ok_or_else(|| ApiError::upstream("global admit: missing window"));
-        }
+            .durable_object("PROJECT_THROTTLE")?
+            .id_from_name(aud)?
+            .get_stub()?;
+        let mut init = RequestInit::new();
+        init.with_method(Method::Post)
+            .with_body(Some(body.to_string().into()));
+        let req = Request::new_with_init(&format!("https://project/{action}"), &init)?;
+        let mut resp = stub.fetch_with_request(req).await?;
         let status = resp.status_code();
-        let body: serde_json::Value = resp
-            .json()
+        let json = resp
+            .json::<serde_json::Value>()
             .await
-            .map_err(|e| ApiError::upstream(format!("global body: {e}")))?;
-        let retry = body
-            .get("retry_after_ms")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
-        Err(match (status, body.get("code").and_then(|v| v.as_str())) {
-            (429, _) => ApiError::global_throttle(retry),
-            (_, Some("low_balance")) => ApiError::low_balance(),
-            // Today GlobalThrottle only returns 500 for config errors; keep the log generic.
-            (500, Some("internal")) => ApiError::config("global throttle returned 500"),
-            // GlobalThrottle already logged its own upstream failure; don't log it twice.
-            (503, Some("upstream")) => ApiError::upstream_relayed(),
-            _ => ApiError::upstream(format!("global status {status}")),
-        })
+            .unwrap_or(serde_json::Value::Null);
+        Ok((status, json))
     }
 
     /// Best-effort D1 write (spec D13): never affects the response.
@@ -311,13 +328,28 @@ impl RelayController {
                 return;
             }
         };
-        let (wallet, sig) = (job.user.clone(), job.signature.clone());
+        let (wallet, sig, aud, cluster, cost) = (
+            job.user.clone(),
+            job.signature.clone(),
+            job.aud.clone(),
+            job.cluster.clone(),
+            job.cost as f64,
+        );
         self.state.wait_until(async move {
             let reason = reason.map(JsValue::from).unwrap_or(JsValue::NULL);
             let stmt = db.prepare(
-                "INSERT INTO relay_log (wallet_address, tx_signature, status, reason, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO relay_log (wallet_address, tx_signature, status, reason, created_at, aud, cluster, cost_lamports) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             );
-            let result = match stmt.bind(&[wallet.into(), sig.into(), status.into(), reason, JsValue::from_f64(at)]) {
+            let result = match stmt.bind(&[
+                wallet.into(),
+                sig.into(),
+                status.into(),
+                reason,
+                JsValue::from_f64(at),
+                aud.into(),
+                cluster.into(),
+                JsValue::from_f64(cost),
+            ]) {
                 Ok(bound) => bound.run().await.map(|_| ()),
                 Err(e) => Err(e),
             };

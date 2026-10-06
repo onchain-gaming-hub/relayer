@@ -3,7 +3,7 @@
 //!
 //! Wallet binding (Web3Auth docs, embedded-wallets/authentication/id-token): social-login
 //! tokens carry `wallets[] = { public_key: <hex>, type: "web3auth_app_key", curve: "ed25519" }`.
-//! Still to be confirmed against a real token in spike 0.2.
+//! Confirmed against real Sapphire Devnet tokens (spike 0.2, 2026-10-06).
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
 use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
@@ -90,6 +90,18 @@ pub fn precheck(token: &str) -> Result<(), AuthError> {
     header.kid.map(|_| ()).ok_or(AuthError::Malformed)
 }
 
+/// The `aud` of a token whose signature is NOT verified yet. Only for choosing the project
+/// (and so its JWKS); `verify` checks `aud` again after the signature (spec v2 §4.4 step 3).
+/// Must be a single string: an array cannot name one project.
+pub fn unverified_aud(token: &str) -> Result<String, AuthError> {
+    let payload = token.split('.').nth(1).ok_or(AuthError::Malformed)?;
+    let claims: Value = decode_json(payload)?;
+    match claims.get("aud") {
+        Some(Value::String(a)) if !a.is_empty() => Ok(a.clone()),
+        _ => Err(AuthError::BadAudience),
+    }
+}
+
 /// Verifies an ES256 JWT against `jwks` and checks `exp`, `aud`, `iss`. Returns the claims.
 pub fn verify(
     token: &str,
@@ -134,12 +146,8 @@ pub fn verify(
     {
         return Err(AuthError::NotYetValid);
     }
-    let aud_ok = match claims.get("aud") {
-        Some(Value::String(a)) => a == aud,
-        Some(Value::Array(list)) => list.iter().any(|a| a.as_str() == Some(aud)),
-        _ => false,
-    };
-    if !aud_ok {
+    // String only, matching `unverified_aud` (one token = one project).
+    if claims.get("aud").and_then(Value::as_str) != Some(aud) {
         return Err(AuthError::BadAudience);
     }
     if claims.get("iss").and_then(Value::as_str) != Some(iss) {
@@ -278,11 +286,20 @@ mod tests {
         let t = token(
             &sk,
             json!({"alg":"ES256","kid":"k1"}),
-            json!({"aud":[AUD],"iss":"evil","exp":2000.0}),
+            json!({"aud":AUD,"iss":"evil","exp":2000.0}),
         );
         assert_eq!(
             verify(&t, &jwks, 1000.0, AUD, ISS),
             Err(AuthError::BadIssuer)
+        );
+        let t = token(
+            &sk,
+            json!({"alg":"ES256","kid":"k1"}),
+            json!({"aud":[AUD],"iss":ISS,"exp":2000.0}),
+        );
+        assert_eq!(
+            verify(&t, &jwks, 1000.0, AUD, ISS),
+            Err(AuthError::BadAudience)
         );
     }
 
@@ -369,6 +386,21 @@ mod tests {
         assert_eq!(precheck(&no_kid), Err(AuthError::Malformed));
         let ok = token(&sk, json!({"alg":"ES256","kid":"k1"}), claims(2000.0));
         assert!(precheck(&ok).is_ok());
+    }
+
+    #[test]
+    fn unverified_aud_is_a_single_string() {
+        let (sk, _) = key();
+        let h = json!({"alg":"ES256","kid":"k1"});
+        let t = token(&sk, h.clone(), json!({"aud":"client-a","exp":1}));
+        assert_eq!(unverified_aud(&t), Ok("client-a".into()));
+        for bad in [json!({"aud":["client-a"]}), json!({"aud":""}), json!({})] {
+            assert_eq!(
+                unverified_aud(&token(&sk, h.clone(), bad)),
+                Err(AuthError::BadAudience)
+            );
+        }
+        assert_eq!(unverified_aud("x"), Err(AuthError::Malformed));
     }
 
     #[test]

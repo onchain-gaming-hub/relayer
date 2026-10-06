@@ -5,33 +5,45 @@ compatibility_date = "2026-10-01"
 [build]
 command = "worker-build --release"
 
-# Non-secret config (spec §4.1). RELAYER_PRIVATE_KEY lives in .dev.vars / `wrangler secret put`.
+# Worker-level config (spec v2 §4.1). Per-project settings live in the D1 `projects` table.
+# Secrets (.dev.vars locally, `wrangler secret put` when deployed — never here):
+#   FEE_PAYER_<SLUG>   one Base58 keypair per project
+#   RPC_URL_DEVNET / RPC_URL_MAINNET   keyed RPC (public RPCs return 403 to Workers)
 [vars]
-RPC_URL = "https://api.devnet.solana.com"   # blocks Workers (HTTP 403 on CF-Worker) — set a keyed devnet RPC in .dev.vars
-ALLOWED_ORIGIN = "http://localhost:5173"
-WEB3AUTH_JWKS_URL = "https://api.web3auth.io/citadel-service/.well-known/jwks.json"
-WEB3AUTH_CLIENT_ID = "set-me"   # Web3Auth dashboard (Sapphire Devnet)
-WEB3AUTH_ISSUER = "web3auth.io"   # iss of real Sapphire Devnet social-login tokens (spike 0.2)
 WALLET_BINDING = "wallets"
 RPC_TIMEOUT_MS = "15000"
 COOLDOWN_MS = "10000"
 REJECT_COOLDOWN_MS = "3000"
 REJECT_COOLDOWN_MAX_MS = "60000"
-GLOBAL_RPM = "60"
-MIN_RELAYER_BALANCE_LAMPORTS = "50000000"
-MAX_MEMO_BYTES = "128"
+CLUSTER_RPM_DEVNET = "300"
+CLUSTER_RPM_MAINNET = "300"
+CLUSTER_HOP_TIMEOUT_MS = "2000"
+REGISTRY_CACHE_MS = "60000"
+REGISTRY_MAX_STALE_MS = "600000"
+# Sapphire Devnet defaults are built in (iss "web3auth.io", citadel JWKS). Sapphire Mainnet has
+# no default until verified (spec v2 spike 0.2): set both or mainnet projects answer 500.
+# WEB3AUTH_MAINNET_ISSUER = ""
+# WEB3AUTH_MAINNET_JWKS_URL = ""
 
 [durable_objects]
 bindings = [
-  { name = "RELAY_CONTROLLER", class_name = "RelayController" },
-  { name = "GLOBAL_THROTTLE", class_name = "GlobalThrottle" },
+  { name = "USER_CONTROLLER", class_name = "UserController" },
+  { name = "PROJECT_THROTTLE", class_name = "ProjectThrottle" },
+  { name = "CLUSTER_THROTTLE", class_name = "ClusterThrottle" },
 ]
 
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["RelayController", "GlobalThrottle"]
 
+# v2 (spec V15): new SQLite-backed classes; v1 state (devnet only) is dropped.
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["UserController", "ProjectThrottle", "ClusterThrottle"]
+deleted_classes = ["RelayController", "GlobalThrottle"]
+
 [[d1_databases]]
 binding = "DB"
 database_name = "gasless-relayer-audit"
 database_id = "00000000-0000-0000-0000-000000000000" # local only — replace via runbook (`wrangler d1 create`)
+migrations_dir = "migrations"

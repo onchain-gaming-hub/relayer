@@ -1,5 +1,6 @@
 // E2E against `wrangler dev` + mock-upstream. Usage: node tests/e2e.mjs <A|B|C>
-// Test ids (T#) match spec §7. Policy-shape cases are covered by Rust unit tests (src/policy.rs).
+// Test ids: T# = v1 spec §7, T-v2-# = v2 spec §8. Policy-shape and registry-parsing cases are
+// covered by Rust unit tests (src/policy.rs, src/registry.rs). Projects are seeded by run-e2e.sh.
 import http from 'node:http';
 import { execFileSync } from 'node:child_process';
 
@@ -8,6 +9,12 @@ const RELAYER = process.env.RELAYER_URL || 'http://127.0.0.1:8788';
 const MOCK = process.env.MOCK_URL || 'http://127.0.0.1:8899';
 const ORIGIN = 'http://localhost:5173';
 const PERSIST = process.env.PERSIST_DIR;
+const WRANGLER_LOG = process.env.WRANGLER_LOG;
+const { PK_A, PK_B, PK_M, PK_X, PK_Y } = process.env;
+const ORIGIN_B = 'http://localhost:5174';
+const ORIGIN_M = 'http://localhost:5175';
+const ISS_MAINNET = 'https://issuer-mainnet.test';
+import fs from 'node:fs';
 const BLOCKHASH = '11111111111111111111111111111111';
 
 const results = [];
@@ -21,7 +28,7 @@ function request(path, { method = 'POST', headers = {}, body, chunked = false } 
     const u = new URL(RELAYER + path);
     // agent:false -> fresh socket per request, so an early response that leaves an unread body
     // on a keep-alive socket cannot poison the next test.
-    const req = http.request({ hostname: u.hostname, port: u.port, path: u.pathname, method, headers, agent: false }, (res) => {
+    const req = http.request({ hostname: u.hostname, port: u.port, path: u.pathname + u.search, method, headers, agent: false }, (res) => {
       let data = '';
       res.on('data', (c) => (data += c));
       res.on('end', () => {
@@ -45,8 +52,8 @@ const stats = () => mock('/__stats');
 const tokenFor = async (user_hex, extra = {}) => (await mock('/__token?' + new URLSearchParams({ user_hex, ...extra }))).token;
 
 let relayerPubkey;
-function mk(seed, mode = '') {
-  const out = execFileSync('./target/debug/examples/mktx', [relayerPubkey, BLOCKHASH, seed ?? '-', mode]);
+function mk(seed, mode = '', feePayer = relayerPubkey) {
+  const out = execFileSync('./target/debug/examples/mktx', [feePayer, BLOCKHASH, seed ?? '-', mode]);
   return JSON.parse(out.toString());
 }
 
@@ -59,9 +66,19 @@ async function relay(t, { token, origin = ORIGIN, contentType = 'application/jso
 
 /** Builds a fresh tx for `seed` and relays it with a valid token for that user. */
 async function relayAs(seed, opts = {}) {
-  const t = mk(seed, opts.mode);
-  return relay(t, { token: opts.token ?? (await tokenFor(t.user_hex)), ...opts });
+  const t = mk(seed, opts.mode, opts.feePayer);
+  return relay(t, { token: opts.token ?? (await tokenFor(t.user_hex, opts.claims ?? {})), ...opts });
 }
+/** Same for project B (its fee payer, clientId and origin). */
+const relayAsB = (seed, opts = {}) =>
+  relayAs(seed, { feePayer: PK_B, claims: { aud: 'client-b' }, origin: ORIGIN_B, ...opts });
+
+function d1Exec(sql) {
+  execFileSync('npx', ['wrangler', 'd1', 'execute', 'gasless-relayer-audit', '--local', '--persist-to', PERSIST,
+    '--command', sql], { stdio: 'ignore' });
+}
+/** Number of registry snapshot loads (D1 queries) so far, from the wrangler log. */
+const registryLoads = () => (fs.readFileSync(WRANGLER_LOG, 'utf8').match(/registry: loaded/g) || []).length;
 
 function d1Query(sql) {
   const out = execFileSync('npx', ['wrangler', 'd1', 'execute', 'gasless-relayer-audit', '--local', '--persist-to', PERSIST,
@@ -74,15 +91,72 @@ function d1Counts() {
 }
 
 async function suiteA() {
-  const info = await request('/relayer', { method: 'GET' });
-  check('relayer-info', info.status === 200 && info.json?.pubkey === relayerPubkey && info.json?.allowlist?.[0] === 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr');
+  // Baseline for T15 (audit rows == RPC sends over the whole suite).
+  const s0 = await stats();
+  const info = await request('/relayer?project=test-client', { method: 'GET' });
+  check('relayer-info', info.status === 200 && info.json?.pubkey === PK_A && info.json?.cluster === 'devnet'
+    && info.json?.policy?.actions?.[0]?.type === 'memo' && info.json?.policy?.actions?.[0]?.prefix === 'gasless-poc:', info.text);
   check('relayer-info cooldown_ms is an integer in the raw JSON', /"cooldown_ms":2000[,}]/.test(info.text) && info.json?.cooldown_ms === 2000, info.text);
-  check('relayer-info-bad-origin', (await request('/relayer', { method: 'GET', headers: { origin: 'https://evil.test' } })).status === 403);
+  check('relayer-info-bad-origin', (await request('/relayer?project=test-client', { method: 'GET', headers: { origin: 'https://evil.test' } })).status === 403);
   const pre = await request('/relay', { method: 'OPTIONS', headers: { origin: ORIGIN } });
   check('cors-preflight', pre.status === 204 && pre.headers['access-control-allow-origin'] === ORIGIN && /authorization/i.test(pre.headers['access-control-allow-headers'] || ''));
-  check('cors-preflight-bad-origin', (await request('/relay', { method: 'OPTIONS', headers: { origin: 'https://evil.test' } })).status === 403);
+  const badPre = await request('/relay', { method: 'OPTIONS', headers: { origin: 'https://evil.test' } });
+  check('cors-preflight-bad-origin', badPre.status === 403 && !badPre.headers['access-control-allow-origin']);
 
-  const s0 = await stats();
+  // ---- v2: multi-project (spec v2 §8) ----
+  // T-v2-2: random clientIds never trigger D1 queries (whole-table snapshot, V4)
+  {
+    const loads0 = registryLoads();
+    const t = mk(freshSeed());
+    const rand = [];
+    for (let i = 0; i < 50; i++) rand.push((await relay(t, { token: await tokenFor(t.user_hex, { aud: `random-${i}` }) })).status);
+    for (let i = 0; i < 20; i++) rand.push((await request(`/relayer?project=random-${i}`, { method: 'GET' })).status);
+    check('T-v2-2 unknown aud -> 401, unknown project -> 404, no extra D1 loads',
+      rand.slice(0, 50).every((x) => x === 401) && rand.slice(50).every((x) => x === 404) && registryLoads() === loads0,
+      `loads ${loads0}->${registryLoads()} statuses=${[...new Set(rand)]}`);
+    const arr = await relay(t, { token: await tokenFor(t.user_hex, { aud_array: '1' }) });
+    check('T-v2-2 aud array -> 401', arr.status === 401 && arr.json?.code === 'unauthorized', `${arr.status}`);
+  }
+  // T-v2-12: GET /relayer for unknown / paused / mainnet-while-disabled / missing param -> 404
+  {
+    const codes = [];
+    for (const q of ['?project=nope', '?project=client-p', '?project=client-m', '']) codes.push((await request(`/relayer${q}`, { method: 'GET' })).status);
+    const b = await request('/relayer?project=client-b', { method: 'GET', headers: { origin: ORIGIN_B } });
+    check('T-v2-12 relayer info 404s', codes.every((c) => c === 404), `${codes}`);
+    check('T-v2-12 project B info + CORS echo', b.status === 200 && b.json?.pubkey === PK_B && b.headers['access-control-allow-origin'] === ORIGIN_B);
+  }
+  // T-v2-1: each project pays with its own fee payer
+  {
+    let x = await relayAsB(freshSeed());
+    check('T-v2-1 project B relays with its own fee payer', x.status === 200 && x.headers['access-control-allow-origin'] === ORIGIN_B, `${x.status} ${x.json?.code}`);
+    x = await relayAsB(freshSeed(), { feePayer: PK_A });
+    check('T-v2-1 B token cannot spend A fee payer', x.status === 400 && x.json?.reason === 'fee payer is not the relayer', `${x.status} ${x.json?.reason}`);
+  }
+  // T-v2-3: Origin must belong to the token's project
+  {
+    let x = await relayAs(freshSeed(), { origin: ORIGIN_B });
+    check('T-v2-3 A token from B origin -> 403', x.status === 403 && x.json?.code === 'origin', `${x.status}`);
+    const preB = await request('/relay', { method: 'OPTIONS', headers: { origin: ORIGIN_B } });
+    const preP = await request('/relay', { method: 'OPTIONS', headers: { origin: 'http://localhost:5176' } });
+    check('T-v2-3 preflight: union of active origins only', preB.status === 204 && preB.headers['access-control-allow-origin'] === ORIGIN_B
+      && preP.status === 403 && !preP.headers['access-control-allow-origin'], `${preB.status} ${preP.status}`);
+  }
+  // T-v2-2: paused project and mainnet behind the kill switch
+  {
+    let x = await relayAs(freshSeed(), { claims: { aud: 'client-p' } });
+    check('T-v2-2 paused project -> 503 project_paused', x.status === 503 && x.json?.code === 'project_paused', `${x.status} ${x.json?.code}`);
+    x = await relayAs(freshSeed(), { feePayer: PK_M, claims: { aud: 'client-m', iss: ISS_MAINNET } });
+    check('T-v2-2 mainnet while disabled -> 503 cluster_disabled', x.status === 503 && x.json?.code === 'cluster_disabled', `${x.status} ${x.json?.code}`);
+  }
+  // T-v2-11: a broken project answers 500; the others keep working
+  {
+    const xs = await relayAs(freshSeed(), { feePayer: PK_X, claims: { aud: 'client-x' }, origin: 'http://localhost:5177' });
+    const ys = await relayAs(freshSeed(), { feePayer: PK_Y, claims: { aud: 'client-y' }, origin: 'http://localhost:5178' });
+    const ok = await relayAs(freshSeed());
+    check('T-v2-11 missing secret / key mismatch -> 500 only for that project',
+      xs.status === 500 && ys.status === 500 && xs.json?.code === 'internal' && ys.json?.reason === undefined && ok.status === 200,
+      `x=${xs.status} y=${ys.status} a=${ok.status}`);
+  }
 
   // T1 / T2 / T3
   const u1 = freshSeed();
@@ -274,11 +348,13 @@ async function suiteA() {
   check('T15 audit rows == RPC sends (no 4xx rows)', rows === sends, `rows=${JSON.stringify(counts)} sends=${sends}`);
   const replayRows = d1Query("SELECT count(*) AS c FROM relay_log WHERE status = 'success' AND reason = 'already processed'")[0].c;
   check('audit marks already-processed replays', replayRows === 1, `rows=${replayRows}`);
+  const bRows = d1Query("SELECT aud, cluster, cost_lamports FROM relay_log WHERE aud = 'client-b'");
+  check('V14 audit carries aud / cluster / cost', bRows.length === 1 && bRows[0].cluster === 'devnet' && bRows[0].cost_lamports === 10000, JSON.stringify(bRows));
 }
 
 async function suiteB() {
   let r;
-  // GLOBAL_RPM=3, COOLDOWN_MS=5000
+  // project A/B rpm=3, CLUSTER_RPM_DEVNET=5, COOLDOWN_MS=5000
   // T4 (global part): 5 concurrent same-wallet requests consume ONE global slot,
   // so two other users still fit before the window is full.
   await setState({ delayMs: 800 });
@@ -288,9 +364,9 @@ async function suiteB() {
   const others = [];
   for (let i = 0; i < 2; i++) others.push((await relayAs(freshSeed())).status);
   r = await relayAs(freshSeed());
-  check('T4 concurrent same wallet uses one global slot',
+  check('T4 concurrent same wallet uses one project slot',
     burst.filter((x) => x.status === 200).length === 1 && burst.filter((x) => x.json?.code === 'in_progress').length === 4
-      && others.every((s) => s === 200) && r.json?.code === 'global_throttle',
+      && others.every((s) => s === 200) && r.json?.code === 'project_throttle',
     `burst=${burst.map((x) => x.status)} others=${others} next=${r.status} ${r.json?.code}`);
   console.log('… waiting 61 s for the global window to roll over');
   await sleep(61_000);
@@ -305,9 +381,15 @@ async function suiteB() {
   await setState({ send: 'ok' });
   const ok = [];
   for (let i = 0; i < 3; i++) ok.push((await relayAs(freshSeed())).status);
-  check('T26 rejected requests refund global quota', rej.every((s) => s === 502) && ok.every((s) => s === 200), `rej=${rej} ok=${ok}`);
+  check('T26 rejected requests refund project quota', rej.every((s) => s === 502) && ok.every((s) => s === 200), `rej=${rej} ok=${ok}`);
   r = await relayAs(freshSeed());
-  check('T26 quota still enforced for real sends', r.status === 429 && r.json?.code === 'global_throttle', `${r.status} ${r.json?.code}`);
+  check('T26 quota still enforced for real sends', r.status === 429 && r.json?.code === 'project_throttle', `${r.status} ${r.json?.code}`);
+  // Refunds reached the cluster too: it holds 3 (A's real sends), so B fits 2 more of 5.
+  const bs = [];
+  for (let i = 0; i < 3; i++) bs.push(await relayAsB(freshSeed()));
+  check('T-v2-7 refund chain reaches the cluster; cluster cap across projects',
+    bs[0].status === 200 && bs[1].status === 200 && bs[2].status === 429 && bs[2].json?.code === 'cluster_throttle' && Number(bs[2].headers['retry-after']) >= 1,
+    `B=${bs.map((x) => `${x.status}:${x.json?.code ?? ''}`)}`);
   console.log('… waiting 61 s for the global window to roll over');
   await sleep(61_000);
   const a = freshSeed();
@@ -315,13 +397,15 @@ async function suiteB() {
   check('T16 setup user A', r.status === 200);
   const spam = [];
   for (let i = 0; i < 5; i++) spam.push((await relayAs(a)).json?.code);
-  check('T16 repeats hit wallet cooldown, not global', spam.every((c) => c === 'cooldown'), spam.join(','));
+  check('T16 repeats hit wallet cooldown, not project quota', spam.every((c) => c === 'cooldown'), spam.join(','));
   r = await relayAs(freshSeed());
   check('T16 other user still served', r.status === 200, `${r.status} ${r.json?.code}`);
   r = await relayAs(freshSeed());
   check('T12 3rd admit ok', r.status === 200, `${r.status}`);
   r = await relayAs(freshSeed());
-  check('T12 global throttle', r.status === 429 && r.json?.code === 'global_throttle' && Number(r.headers['retry-after']) >= 1, `${r.status} ${r.json?.code}`);
+  check('T12 project throttle', r.status === 429 && r.json?.code === 'project_throttle' && Number(r.headers['retry-after']) >= 1 && r.json?.retry_after_ms > 0, `${r.status} ${r.json?.code}`);
+  r = await relayAsB(freshSeed());
+  check('T-v2 project A at capacity does not block project B', r.status === 200, `${r.status} ${r.json?.code}`);
 
   // T24/T28: RPC overload (HTTP 429, node-side -32005) does NOT refund: 3 such failures use up rpm=3
   console.log('… waiting 61 s for the global window to roll over');
@@ -333,11 +417,11 @@ async function suiteB() {
   }
   await setState({ send: 'ok' });
   r = await relayAs(freshSeed());
-  check('T24/T28 overload rejects keep their global slot', over.every((s) => s === 502) && r.status === 429 && r.json?.code === 'global_throttle', `over=${over} next=${r.status} ${r.json?.code}`);
+  check('T24/T28 overload rejects keep their project slot', over.every((s) => s === 502) && r.status === 429 && r.json?.code === 'project_throttle', `over=${over} next=${r.status} ${r.json?.code}`);
 }
 
 async function suiteC() {
-  // Fresh state, no D1 schema applied (T14).
+  // REGISTRY_CACHE_MS=1000, REGISTRY_MAX_STALE_MS=4000.
   await setState({ genesis: 'NotDevnetGenesisHash1111111111111111111111111' });
   // Cold isolate, concurrent requests: each may fetch JWKS (no cross-request I/O sharing in
   // Workers), but none may fail with 500.
@@ -347,7 +431,7 @@ async function suiteC() {
   check('JWKS cold start under concurrency', cold.every((x) => x.status === 503 && x.json?.code === 'upstream'), `statuses=${cold.map((x) => x.status)} jwks fetches=${jwksFetches}`);
   let r = await relayAs(freshSeed());
   check('T20 non-devnet RPC', r.status === 503 && r.json?.code === 'upstream' && r.json?.reason === undefined, JSON.stringify(r.json));
-  await setState({ genesis: 'EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG', balance: 0 });
+  await setState({ genesis: 'EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG', balances: { [PK_A]: 0 } });
   // Cold balance cache + concurrent wallets, with getBalance held open for 1.5 s so all five
   // admits overlap inside GlobalThrottle: single-flight must share ONE call across requests
   // in the Durable Object (no 500s).
@@ -361,6 +445,8 @@ async function suiteC() {
     `statuses=${lows.map((x) => `${x.status}:${x.json?.code}`)} getBalance=${gbCold}`);
   r = await relayAs(freshSeed());
   check('T13 low balance', r.status === 503 && r.json?.code === 'low_balance', `${r.status} ${r.json?.code}`);
+  r = await relayAsB(freshSeed());
+  check('T-v2-8 low balance of A does not affect B', r.status === 200, `${r.status} ${r.json?.code}`);
   console.log('… waiting 31 s for balance cache to expire');
   await sleep(31_000);
   await setState({ balanceMode: 'http500' });
@@ -372,20 +458,53 @@ async function suiteC() {
   r = await relayAs(u);
   const gbCalls = (await stats()).getBalance - gb0;
   check('T18 getBalance failure cached (no RPC hammering)', r.status === 503 && r.json?.code === 'upstream' && gbCalls === 0, `${r.status} calls=${gbCalls}`);
-  await setState({ balanceMode: 'ok', balance: 10_000_000_000 });
+  await setState({ balanceMode: 'ok', balances: {} });
   await sleep(5_500);
   r = await relayAs(u);
   check('T18 lock released after upstream failure', r.status === 200, `${r.status} ${r.json?.code}`);
-  check('T14 D1 unavailable still relays', r.status === 200);
+  // T14: the audit table is gone -> the relay still succeeds (best-effort audit)
+  d1Exec('ALTER TABLE relay_log RENAME TO relay_log_off');
+  r = await relayAs(freshSeed());
+  check('T14 audit failure still relays', r.status === 200, `${r.status}`);
+  d1Exec('ALTER TABLE relay_log_off RENAME TO relay_log');
   // Unknown kid while the JWKS endpoint is down: still 401, never 503.
   await setState({ jwksMode: 'http500' });
   const tu = mk(freshSeed());
   r = await relay(tu, { token: await tokenFor(tu.user_hex, { kid: 'rotated-kid' }) });
   check('T10 unknown kid + JWKS refetch failure -> 401', r.status === 401 && r.json?.code === 'unauthorized', `${r.status} ${r.json?.reason}`);
   await setState({ jwksMode: 'ok' });
+
+  // ---- v2: registry changes at runtime (snapshot ≤ REGISTRY_CACHE_MS old) ----
+  const mainnetRelay = () => relayAs(freshSeed(), { feePayer: PK_M, claims: { aud: 'client-m', iss: ISS_MAINNET }, origin: ORIGIN_M });
+  r = await relayAs(freshSeed(), { feePayer: PK_M, claims: { aud: 'client-m', iss: ISS_MAINNET } });
+  check('T-v2-2 mainnet disabled', r.status === 503 && r.json?.code === 'cluster_disabled', `${r.status} ${r.json?.code}`);
+  d1Exec("UPDATE settings SET value = 'true' WHERE key = 'mainnet_enabled'");
+  await sleep(1500);
+  await relayAs(freshSeed()); // first request after expiry refreshes the snapshot
+  const m0 = (await stats()).sendMainnet;
+  r = await mainnetRelay();
+  check('V5 kill switch on (no deploy) -> mainnet project relays to the mainnet RPC',
+    r.status === 200 && (await stats()).sendMainnet === m0 + 1, `${r.status} ${r.json?.code}`);
+  // Retire project B: takes effect within the snapshot age
+  d1Exec("UPDATE projects SET status = 'retired' WHERE aud = 'client-b'");
+  await sleep(1500);
+  await relayAs(freshSeed());
+  r = await relayAsB(freshSeed(), { origin: ORIGIN });
+  check('V13 retired project -> 503 project_paused', r.status === 503 && r.json?.code === 'project_paused', `${r.status} ${r.json?.code}`);
+  // D1 outage: stale snapshot is served, but mainnet fails closed after REGISTRY_MAX_STALE_MS
+  d1Exec('ALTER TABLE projects RENAME TO projects_off');
+  await sleep(1500);
+  r = await mainnetRelay();
+  check('V4 D1 down: stale snapshot still serves (within max stale)', r.status === 200, `${r.status} ${r.json?.code}`);
+  await sleep(4500);
+  r = await mainnetRelay();
+  const dev = await relayAs(freshSeed());
+  check('V4 D1 down past max stale: mainnet fails closed, devnet continues',
+    r.status === 503 && r.json?.code === 'upstream' && dev.status === 200, `mainnet=${r.status} ${r.json?.code} devnet=${dev.status}`);
+  d1Exec('ALTER TABLE projects_off RENAME TO projects');
 }
 
-const info = await request('/relayer', { method: 'GET' });
+const info = await request('/relayer?project=test-client', { method: 'GET' });
 relayerPubkey = info.json?.pubkey;
 if (!relayerPubkey) { console.error('relayer not reachable', info); process.exit(2); }
 await { A: suiteA, B: suiteB, C: suiteC }[SUITE]();

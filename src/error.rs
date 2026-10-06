@@ -1,4 +1,4 @@
-//! Error contract (spec §4.3). Every non-2xx response goes through `ApiError`.
+//! Error contract (spec v1 §4.3 + v2 §4.3). Every non-2xx response goes through `ApiError`.
 
 use serde::Serialize;
 use worker::{Response, Result};
@@ -54,7 +54,7 @@ impl ApiError {
         Self::new(403, "origin", "origin not allowed")
     }
     pub fn not_found() -> Self {
-        Self::new(404, "not_found", "no such route")
+        Self::new(404, "not_found", "not found")
     }
     pub fn method() -> Self {
         Self::new(405, "method", "method not allowed")
@@ -75,8 +75,19 @@ impl ApiError {
     pub fn cooldown(retry_after_ms: f64) -> Self {
         Self::new(429, "cooldown", "wallet is cooling down").with_retry_after(retry_after_ms)
     }
-    pub fn global_throttle(retry_after_ms: f64) -> Self {
-        Self::new(429, "global_throttle", "relayer is at capacity").with_retry_after(retry_after_ms)
+    pub fn project_throttle(retry_after_ms: f64) -> Self {
+        Self::new(429, "project_throttle", "project is at capacity")
+            .with_retry_after(retry_after_ms)
+    }
+    pub fn cluster_throttle(retry_after_ms: f64) -> Self {
+        Self::new(429, "cluster_throttle", "relayer is at capacity")
+            .with_retry_after(retry_after_ms)
+    }
+    pub fn project_paused() -> Self {
+        Self::new(503, "project_paused", "project is not active")
+    }
+    pub fn cluster_disabled() -> Self {
+        Self::new(503, "cluster_disabled", "cluster is disabled")
     }
     /// Misconfiguration: the detail (e.g. which env var is missing) goes to the log only.
     pub fn config(reason: impl Into<String>) -> Self {
@@ -94,7 +105,7 @@ impl ApiError {
             .with_retry_after(retry_after_ms)
     }
     pub fn low_balance() -> Self {
-        Self::new(503, "low_balance", "relayer balance below floor")
+        Self::new(503, "low_balance", "fee payer balance below floor")
     }
     /// Detail (may contain raw transport errors / upstream URLs) is logged, never returned.
     pub fn upstream(reason: impl Into<String>) -> Self {
@@ -112,6 +123,24 @@ impl ApiError {
         )
         .with_signature(signature)
         .logged(reason)
+    }
+
+    /// Rebuilds an error answered by another Durable Object (ProjectThrottle / ClusterThrottle)
+    /// so it reaches the client unchanged. Unknown shapes become a logged 503 `upstream`.
+    pub fn relayed(status: u16, body: &serde_json::Value) -> Self {
+        let retry = body
+            .get("retry_after_ms")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0);
+        match (status, body.get("code").and_then(serde_json::Value::as_str)) {
+            (429, Some("project_throttle")) => Self::project_throttle(retry),
+            (429, Some("cluster_throttle")) => Self::cluster_throttle(retry),
+            (503, Some("low_balance")) => Self::low_balance(),
+            // The other DO already logged its own detail; don't log it twice.
+            (503, Some("upstream")) => Self::upstream_relayed(),
+            (500, Some("internal")) => Self::config("throttle DO returned 500"),
+            _ => Self::upstream(format!("throttle DO status {status}")),
+        }
     }
 
     /// Logs a detail that must not reach the client (transport errors can contain URLs).
