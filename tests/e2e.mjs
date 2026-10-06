@@ -281,7 +281,8 @@ async function suiteB() {
   for (let i = 0; i < 2; i++) others.push((await relayAs(freshSeed())).status);
   r = await relayAs(freshSeed());
   check('T4 concurrent same wallet uses one global slot',
-    burst.filter((x) => x.status === 200).length === 1 && others.every((s) => s === 200) && r.json?.code === 'global_throttle',
+    burst.filter((x) => x.status === 200).length === 1 && burst.filter((x) => x.json?.code === 'in_progress').length === 4
+      && others.every((s) => s === 200) && r.json?.code === 'global_throttle',
     `burst=${burst.map((x) => x.status)} others=${others} next=${r.status} ${r.json?.code}`);
   console.log('… waiting 61 s for the global window to roll over');
   await sleep(61_000);
@@ -332,16 +333,22 @@ async function suiteC() {
   await setState({ genesis: 'NotDevnetGenesisHash1111111111111111111111111' });
   // Cold isolate, concurrent requests: each may fetch JWKS (no cross-request I/O sharing in
   // Workers), but none may fail with 500.
+  const jc0 = (await stats()).jwks;
   const cold = await Promise.all([...Array(5)].map(() => relayAs(freshSeed())));
-  check('JWKS cold start under concurrency', cold.every((x) => x.status === 503 && x.json?.code === 'upstream'), `statuses=${cold.map((x) => x.status)}`);
+  const jwksFetches = (await stats()).jwks - jc0;
+  check('JWKS cold start under concurrency', cold.every((x) => x.status === 503 && x.json?.code === 'upstream'), `statuses=${cold.map((x) => x.status)} jwks fetches=${jwksFetches}`);
   let r = await relayAs(freshSeed());
   check('T20 non-devnet RPC', r.status === 503 && r.json?.code === 'upstream', r.json?.reason);
   await setState({ genesis: 'EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG', balance: 0 });
-  // Cold balance cache + concurrent wallets: GlobalThrottle's single-flight getBalance must
-  // work across requests inside the Durable Object (one RPC call, no 500s).
+  // Cold balance cache + concurrent wallets, with getBalance held open for 1.5 s so all five
+  // admits overlap inside GlobalThrottle: single-flight must share ONE call across requests
+  // in the Durable Object (no 500s).
+  await setState({ balanceDelayMs: 1500 });
   const gbCold0 = (await stats()).getBalance;
-  const lows = await Promise.all([...Array(5)].map(() => relayAs(freshSeed())));
+  const coldTxs = await Promise.all([...Array(5)].map(async () => { const t = mk(freshSeed()); return { t, token: await tokenFor(t.user_hex) }; }));
+  const lows = await Promise.all(coldTxs.map(({ t, token }) => relay(t, { token })));
   const gbCold = (await stats()).getBalance - gbCold0;
+  await setState({ balanceDelayMs: 0 });
   check('T13 low balance (concurrent, single getBalance)', lows.every((x) => x.status === 503 && x.json?.code === 'low_balance') && gbCold === 1,
     `statuses=${lows.map((x) => `${x.status}:${x.json?.code}`)} getBalance=${gbCold}`);
   r = await relayAs(freshSeed());

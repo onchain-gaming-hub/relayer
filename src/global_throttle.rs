@@ -48,6 +48,11 @@ impl DurableObject for GlobalThrottle {
             Ok(c) => c,
             Err(e) => return ApiError::config(e).into_response(),
         };
+        // Misconfigured keypair is a 500 config error, never a cached "balance failure".
+        let pubkey = match relayer_keypair_pubkey(&self.env) {
+            Ok(p) => p,
+            Err(e) => return e.into_response(),
+        };
 
         // Roll the window first so a refund for an expired window reports refunded:false.
         // (Synchronous, before the first await.)
@@ -87,7 +92,7 @@ impl DurableObject for GlobalThrottle {
         let balance = match (self.balance.get(), recent_failure) {
             (Some((lamports, at)), _) if now - at < BALANCE_CACHE_MS => Ok(lamports),
             (_, Some(msg)) => Err(format!("{msg} (cached)")),
-            _ => self.refresh_balance(&cfg).await,
+            _ => self.refresh_balance(&cfg, pubkey).await,
         };
         match balance {
             Err(e) => {
@@ -114,14 +119,16 @@ impl GlobalThrottle {
     }
 
     /// Single-flight: concurrent cache misses share one `getBalance` call.
-    async fn refresh_balance(&self, cfg: &Config) -> std::result::Result<u64, String> {
+    async fn refresh_balance(
+        &self,
+        cfg: &Config,
+        pubkey: String,
+    ) -> std::result::Result<u64, String> {
         let fut = {
             let mut slot = self.balance_inflight.borrow_mut();
             match slot.as_ref() {
                 Some(f) => f.clone(),
                 None => {
-                    let pubkey = relayer_keypair_pubkey(&self.env)
-                        .map_err(|e| e.reason.unwrap_or(e.message))?;
                     let (url, timeout) = (cfg.rpc_url.clone(), cfg.rpc_timeout_ms);
                     let f = async move { rpc::get_balance(&url, timeout, &pubkey).await }
                         .boxed_local()

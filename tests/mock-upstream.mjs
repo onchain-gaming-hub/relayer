@@ -10,7 +10,7 @@ const DEVNET = 'EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG';
 const { privateKey, publicKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
 const jwk = { ...publicKey.export({ format: 'jwk' }), kid: 'test-kid', use: 'sig', alg: 'ES256' };
 
-const state = { genesis: DEVNET, balance: 10_000_000_000, balanceMode: 'ok', jwksMode: 'ok', send: 'ok', delayMs: 0 };
+const state = { genesis: DEVNET, balance: 10_000_000_000, balanceMode: 'ok', balanceDelayMs: 0, jwksMode: 'ok', send: 'ok', delayMs: 0 };
 const stats = { sendTransaction: 0, getBalance: 0, getGenesisHash: 0, jwks: 0 };
 
 const b64url = (b) => Buffer.from(b).toString('base64url');
@@ -47,6 +47,7 @@ http.createServer(async (req, res) => {
   switch (rpc.method) {
     case 'getGenesisHash': return ok(state.genesis);
     case 'getBalance':
+      if (state.balanceDelayMs) await new Promise((r) => setTimeout(r, state.balanceDelayMs));
       if (state.balanceMode === 'http500') return json(res, 500, {});
       return ok({ context: { slot: 1 }, value: state.balance });
     case 'sendTransaction': {
