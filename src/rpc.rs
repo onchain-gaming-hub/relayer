@@ -101,7 +101,8 @@ pub fn classify_send(status: u16, text: &str) -> SendOutcome {
             reason: truncate(msg, 200),
             http_429: false,
             // Node-side failures say nothing about the transaction (D17: treat like 429).
-            tx_fault: !code.is_some_and(|c| NODE_SIDE_ERROR_CODES.contains(&c)),
+            // An error without a code cannot be attributed to the tx either -> not tx-fault.
+            tx_fault: code.is_some_and(|c| !NODE_SIDE_ERROR_CODES.contains(&c)),
         };
     }
     match v.get("result").and_then(Value::as_str) {
@@ -230,6 +231,13 @@ mod tests {
                 }
             ));
         }
+        assert!(matches!(
+            classify_send(200, r#"{"error":{"message":"overloaded"}}"#),
+            SendOutcome::Rejected {
+                tx_fault: false,
+                ..
+            }
+        ));
         assert!(matches!(
             classify_send(400, ""),
             SendOutcome::Rejected { tx_fault: true, .. }

@@ -67,7 +67,7 @@ impl Config {
         if allowed_origin == "*" {
             return Err("ALLOWED_ORIGIN must be an exact origin, not *".into());
         }
-        Ok(Self {
+        Self {
             rpc_url: var("RPC_URL").unwrap_or_else(|| "https://api.devnet.solana.com".into()),
             rpc_timeout_ms: num(var("RPC_TIMEOUT_MS"), "RPC_TIMEOUT_MS", 15_000)?,
             allowed_origin,
@@ -92,7 +92,29 @@ impl Config {
                 50_000_000,
             )?,
             max_memo_bytes: num(var("MAX_MEMO_BYTES"), "MAX_MEMO_BYTES", 128)?,
-        })
+        }
+        .validated()
+    }
+
+    /// Rejects settings that silently disable or invert the cooldowns.
+    fn validated(self) -> Result<Self, String> {
+        for (name, v) in [
+            ("COOLDOWN_MS", self.cooldown_ms),
+            ("REJECT_COOLDOWN_MS", self.reject_cooldown_ms),
+            ("REJECT_COOLDOWN_MAX_MS", self.reject_cooldown_max_ms),
+        ] {
+            if !v.is_finite() || v < 0.0 {
+                return Err(format!(
+                    "invalid config {name}: must be a non-negative number"
+                ));
+            }
+        }
+        if self.reject_cooldown_max_ms < self.reject_cooldown_ms {
+            return Err(
+                "invalid config REJECT_COOLDOWN_MAX_MS: must be >= REJECT_COOLDOWN_MS".into(),
+            );
+        }
+        Ok(self)
     }
 
     /// Longest a healthy request can hold the lock: bounded admit (getBalance timeout +
@@ -111,7 +133,36 @@ pub fn reject_backoff_ms(base_ms: f64, streak: u32, max_ms: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::reject_backoff_ms;
+    use super::{Config, WalletBinding, reject_backoff_ms};
+
+    fn cfg(cooldown: f64, reject: f64, reject_max: f64) -> Config {
+        Config {
+            rpc_url: String::new(),
+            rpc_timeout_ms: 15_000,
+            allowed_origin: "http://localhost:5173".into(),
+            web3auth_client_id: "c".into(),
+            web3auth_jwks_url: String::new(),
+            web3auth_issuer: String::new(),
+            wallet_binding: WalletBinding::Wallets,
+            cooldown_ms: cooldown,
+            reject_cooldown_ms: reject,
+            reject_cooldown_max_ms: reject_max,
+            global_rpm: 60,
+            min_relayer_balance_lamports: 0,
+            max_memo_bytes: 128,
+        }
+    }
+
+    #[test]
+    fn validates_cooldown_settings() {
+        assert!(cfg(10_000.0, 3_000.0, 60_000.0).validated().is_ok());
+        assert!(cfg(0.0, 0.0, 0.0).validated().is_ok());
+        assert!(cfg(-1.0, 3_000.0, 60_000.0).validated().is_err());
+        assert!(cfg(10_000.0, -5.0, 60_000.0).validated().is_err());
+        assert!(cfg(10_000.0, 3_000.0, 1_000.0).validated().is_err());
+        assert!(cfg(f64::NAN, 3_000.0, 60_000.0).validated().is_err());
+        assert!(cfg(f64::INFINITY, 3_000.0, 60_000.0).validated().is_err());
+    }
 
     #[test]
     fn reject_backoff_doubles_and_caps() {

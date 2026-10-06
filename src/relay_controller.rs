@@ -116,9 +116,22 @@ impl RelayController {
         }
 
         // Bounded: GlobalThrottle may itself wait up to one RPC timeout on getBalance.
-        let window = rpc::with_timeout(self.admit(), cfg.rpc_timeout_ms + ADMIT_MARGIN_MS)
-            .await
-            .ok_or_else(|| ApiError::upstream("global admit timeout"))??;
+        let window =
+            match rpc::with_timeout(self.admit(), cfg.rpc_timeout_ms + ADMIT_MARGIN_MS).await {
+                Some(admitted) => admitted?,
+                None => {
+                    // GlobalThrottle may still count this request (slot held until the window ends,
+                    // R9). A short cooldown stops immediate retries from leaking more slots.
+                    let until = Date::now().as_millis() as f64 + cfg.reject_cooldown_ms;
+                    if let Err(e) = storage.put(COOLDOWN_KEY, until).await {
+                        console_error!(
+                            "cooldown put after admit timeout failed for {}: {e}",
+                            job.user
+                        );
+                    }
+                    return Err(ApiError::upstream("global admit timeout"));
+                }
+            };
 
         let outcome = rpc::send_transaction(&cfg.rpc_url, cfg.rpc_timeout_ms, &job.tx).await;
         let done = Date::now().as_millis() as f64;
