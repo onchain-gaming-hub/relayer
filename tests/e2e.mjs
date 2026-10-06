@@ -63,10 +63,13 @@ async function relayAs(seed, opts = {}) {
   return relay(t, { token: opts.token ?? (await tokenFor(t.user_hex)), ...opts });
 }
 
-function d1Counts() {
+function d1Query(sql) {
   const out = execFileSync('npx', ['wrangler', 'd1', 'execute', 'gasless-relayer-audit', '--local', '--persist-to', PERSIST,
-    '--command', 'SELECT status, count(*) AS c FROM relay_log GROUP BY status', '--json'], { stdio: ['ignore', 'pipe', 'ignore'] });
-  const rows = JSON.parse(out.toString())[0].results;
+    '--command', sql, '--json'], { stdio: ['ignore', 'pipe', 'ignore'] });
+  return JSON.parse(out.toString())[0].results;
+}
+function d1Counts() {
+  const rows = d1Query('SELECT status, count(*) AS c FROM relay_log GROUP BY status');
   return Object.fromEntries(rows.map((r) => [r.status, r.c]));
 }
 
@@ -261,6 +264,8 @@ async function suiteA() {
   const counts = d1Counts();
   const rows = (counts.success || 0) + (counts.rpc_error || 0);
   check('T15 audit rows == RPC sends (no 4xx rows)', rows === sends, `rows=${JSON.stringify(counts)} sends=${sends}`);
+  const replayRows = d1Query("SELECT count(*) AS c FROM relay_log WHERE status = 'success' AND reason = 'already processed'")[0].c;
+  check('audit marks already-processed replays', replayRows === 1, `rows=${replayRows}`);
 }
 
 async function suiteB() {
@@ -321,7 +326,13 @@ async function suiteC() {
   const u = freshSeed();
   r = await relayAs(u);
   check('T18 getBalance failure fail-closed', r.status === 503 && r.json?.code === 'upstream', `${r.status} ${r.json?.reason}`);
+  // Failure is cached ~5 s: an immediate retry must not hit getBalance again (R6).
+  const gb0 = (await stats()).getBalance;
+  r = await relayAs(u);
+  const gbCalls = (await stats()).getBalance - gb0;
+  check('T18 getBalance failure cached (no RPC hammering)', r.status === 503 && r.json?.code === 'upstream' && gbCalls === 0, `${r.status} calls=${gbCalls}`);
   await setState({ balanceMode: 'ok', balance: 10_000_000_000 });
+  await sleep(5_100);
   r = await relayAs(u);
   check('T18 lock released after upstream failure', r.status === 200, `${r.status} ${r.json?.code}`);
   check('T14 D1 unavailable still relays', r.status === 200);

@@ -9,7 +9,7 @@ use serde_json::json;
 use worker::*;
 
 use crate::{
-    config::{BALANCE_CACHE_MS, Config},
+    config::{BALANCE_CACHE_MS, BALANCE_FAILURE_BACKOFF_MS, Config},
     error::ApiError,
     relayer_keypair_pubkey, rpc,
 };
@@ -25,6 +25,9 @@ pub struct GlobalThrottle {
     count: Cell<u32>,
     balance: Cell<Option<(u64, f64)>>,
     balance_inflight: RefCell<Option<BalanceFuture>>,
+    /// Last getBalance failure (message, at): answered from here for BALANCE_FAILURE_BACKOFF_MS
+    /// so a degraded RPC is not hit again by every request (R6).
+    balance_failure: RefCell<Option<(String, f64)>>,
 }
 
 impl DurableObject for GlobalThrottle {
@@ -35,6 +38,7 @@ impl DurableObject for GlobalThrottle {
             count: Cell::new(0),
             balance: Cell::new(None),
             balance_inflight: RefCell::new(None),
+            balance_failure: RefCell::new(None),
         }
     }
 
@@ -74,8 +78,15 @@ impl DurableObject for GlobalThrottle {
         // and a later refund must target the window this request was actually counted in.
         let window = self.window_start.get();
 
-        let balance = match self.balance.get() {
-            Some((lamports, at)) if now - at < BALANCE_CACHE_MS => Ok(lamports),
+        let recent_failure = self
+            .balance_failure
+            .borrow()
+            .as_ref()
+            .filter(|(_, at)| now - at < BALANCE_FAILURE_BACKOFF_MS)
+            .map(|(msg, _)| msg.clone());
+        let balance = match (self.balance.get(), recent_failure) {
+            (Some((lamports, at)), _) if now - at < BALANCE_CACHE_MS => Ok(lamports),
+            (_, Some(msg)) => Err(format!("{msg} (cached)")),
             _ => self.refresh_balance(&cfg).await,
         };
         match balance {
@@ -127,9 +138,13 @@ impl GlobalThrottle {
             slot.take();
         }
         drop(slot);
-        if let Ok(lamports) = result {
-            self.balance
-                .set(Some((lamports, Date::now().as_millis() as f64)));
+        let at = Date::now().as_millis() as f64;
+        match &result {
+            Ok(lamports) => {
+                self.balance.set(Some((*lamports, at)));
+                self.balance_failure.borrow_mut().take();
+            }
+            Err(e) => *self.balance_failure.borrow_mut() = Some((e.clone(), at)),
         }
         result
     }

@@ -7,6 +7,7 @@ pub const MAX_BODY_BYTES: usize = 4 * 1024;
 /// Oversized bodies are read (and discarded) up to this many bytes before the 413.
 pub const MAX_DRAIN_BYTES: usize = 64 * 1024;
 pub const BALANCE_CACHE_MS: f64 = 30_000.0;
+pub const BALANCE_FAILURE_BACKOFF_MS: f64 = 5_000.0;
 pub const INFLIGHT_STALE_MARGIN_MS: f64 = 5_000.0;
 pub const JWKS_TTL_MS: f64 = 60.0 * 60_000.0;
 pub const JWKS_FAILURE_BACKOFF_MS: f64 = 30_000.0;

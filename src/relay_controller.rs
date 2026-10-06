@@ -134,9 +134,12 @@ impl RelayController {
             None
         };
         let (cooldown_ms, audit) = match &outcome {
-            SendOutcome::Accepted(_) | SendOutcome::AlreadyProcessed => {
-                (cfg.cooldown_ms, ("success", None))
-            }
+            SendOutcome::Accepted(_) => (cfg.cooldown_ms, ("success", None)),
+            // Replays of a landed tx: keep them distinguishable from real sends in the audit log.
+            SendOutcome::AlreadyProcessed => (
+                cfg.cooldown_ms,
+                ("success", Some("already processed".to_string())),
+            ),
             SendOutcome::Rejected {
                 reason, http_429, ..
             } => {
