@@ -46,7 +46,8 @@ cargo test --lib            # policy / jwt / rpc / tx unit tests
 ```
 
 `tests/run-e2e.sh` covers T1–T18, T20, T22–T28 (T7: HTTP spot-checks here, shape cases as unit tests in `cargo test`).
-Not covered here: T19 (storage `put` failing after a broadcast — not simulable locally) and T21 (Memo Count — frontend).
+Not covered here: T19 (storage `put` failing after a broadcast — not simulable locally), T21 (Memo Count — frontend),
+and the "GlobalThrottle DO itself fails" half of T18 (only the `getBalance` failure path is simulated).
 
 ## Deploy
 

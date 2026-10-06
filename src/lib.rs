@@ -364,6 +364,10 @@ async fn load_jwks(cfg: &Config, force: bool) -> std::result::Result<Vec<jwt::Jw
     {
         return Ok(keys.clone());
     }
+    // No cross-request single-flight here: the Workers runtime forbids awaiting I/O created by
+    // another request in the same isolate ("Cannot perform I/O on behalf of a different
+    // request" — verified on wrangler dev). A cold isolate may fetch JWKS once per concurrent
+    // request; accepted (Web3Auth JWKS is a static, cacheable document).
     // Negative cache: after a failed fetch, don't retry for JWKS_FAILURE_BACKOFF_MS.
     // A forced refetch is already rate-limited by its own window, so it always hits the network.
     let recently_failed =

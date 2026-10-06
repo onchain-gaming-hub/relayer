@@ -83,8 +83,10 @@ impl ApiError {
         worker::console_error!("config error: {}", reason.into());
         Self::new(500, "internal", "relayer misconfigured")
     }
+    /// Unexpected failure: the detail goes to the log only, never to the client.
     pub fn internal(reason: impl Into<String>) -> Self {
-        Self::new(500, "internal", "internal error").with_reason(reason)
+        worker::console_error!("internal error: {}", reason.into());
+        Self::new(500, "internal", "internal error")
     }
     pub fn rpc_rejected(reason: impl Into<String>, retry_after_ms: f64) -> Self {
         Self::new(502, "rpc_rejected", "RPC rejected the transaction")

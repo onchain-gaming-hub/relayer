@@ -271,6 +271,21 @@ async function suiteA() {
 async function suiteB() {
   let r;
   // GLOBAL_RPM=3, COOLDOWN_MS=5000
+  // T4 (global part): 5 concurrent same-wallet requests consume ONE global slot,
+  // so two other users still fit before the window is full.
+  await setState({ delayMs: 800 });
+  const w4 = freshSeed();
+  const burst = await Promise.all([...Array(5)].map(async () => { const t = mk(w4); return relay(t, { token: await tokenFor(t.user_hex) }); }));
+  await setState({ delayMs: 0 });
+  const others = [];
+  for (let i = 0; i < 2; i++) others.push((await relayAs(freshSeed())).status);
+  r = await relayAs(freshSeed());
+  check('T4 concurrent same wallet uses one global slot',
+    burst.filter((x) => x.status === 200).length === 1 && others.every((s) => s === 200) && r.json?.code === 'global_throttle',
+    `burst=${burst.map((x) => x.status)} others=${others} next=${r.status} ${r.json?.code}`);
+  console.log('… waiting 61 s for the global window to roll over');
+  await sleep(61_000);
+
   // T26 (R8): tx-fault rejects (JSON-RPC error, HTTP 400) return their global slot,
   // so 3 rejects + 3 successes fit in rpm=3
   const rej = [];
@@ -315,9 +330,20 @@ async function suiteB() {
 async function suiteC() {
   // Fresh state, no D1 schema applied (T14).
   await setState({ genesis: 'NotDevnetGenesisHash1111111111111111111111111' });
+  // Cold isolate, concurrent requests: each may fetch JWKS (no cross-request I/O sharing in
+  // Workers), but none may fail with 500.
+  const cold = await Promise.all([...Array(5)].map(() => relayAs(freshSeed())));
+  check('JWKS cold start under concurrency', cold.every((x) => x.status === 503 && x.json?.code === 'upstream'), `statuses=${cold.map((x) => x.status)}`);
   let r = await relayAs(freshSeed());
   check('T20 non-devnet RPC', r.status === 503 && r.json?.code === 'upstream', r.json?.reason);
   await setState({ genesis: 'EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG', balance: 0 });
+  // Cold balance cache + concurrent wallets: GlobalThrottle's single-flight getBalance must
+  // work across requests inside the Durable Object (one RPC call, no 500s).
+  const gbCold0 = (await stats()).getBalance;
+  const lows = await Promise.all([...Array(5)].map(() => relayAs(freshSeed())));
+  const gbCold = (await stats()).getBalance - gbCold0;
+  check('T13 low balance (concurrent, single getBalance)', lows.every((x) => x.status === 503 && x.json?.code === 'low_balance') && gbCold === 1,
+    `statuses=${lows.map((x) => `${x.status}:${x.json?.code}`)} getBalance=${gbCold}`);
   r = await relayAs(freshSeed());
   check('T13 low balance', r.status === 503 && r.json?.code === 'low_balance', `${r.status} ${r.json?.code}`);
   console.log('… waiting 31 s for balance cache to expire');
