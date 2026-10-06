@@ -14,9 +14,13 @@ NOW=$(($(date +%s) * 1000))
 POLICY='{"actions":[{"type":"memo","max_bytes":128,"prefix":"gasless-poc:"}]}'
 npx wrangler d1 migrations apply gasless-relayer-audit --local
 npx wrangler d1 execute gasless-relayer-audit --local --command "
-INSERT OR IGNORE INTO fee_payer_history (pubkey, aud, cluster, created_at) VALUES ('$PK', '$AUD', 'devnet', $NOW);
+-- Fails loudly (PRIMARY KEY) if this key was ever registered for another project (V3).
+INSERT INTO fee_payer_history (pubkey, aud, cluster, created_at)
+  SELECT '$PK', '$AUD', 'devnet', $NOW
+  WHERE NOT EXISTS (SELECT 1 FROM fee_payer_history WHERE pubkey = '$PK' AND aud = '$AUD');
 INSERT INTO projects (aud, slug, name, status, cluster, web3auth_network, allowed_origins, fee_payer_pubkey, policy,
   user_daily_quota, project_rpm, project_daily_budget_lamports, min_balance_lamports, created_at, updated_at)
 VALUES ('$AUD', '$SLUG', '$SLUG', 'active', 'devnet', 'sapphire_devnet', '[\"$ORIGIN\"]', '$PK', '$POLICY',
   $QUOTA, 60, 1000000000, 50000000, $NOW, $NOW)
-ON CONFLICT(aud) DO UPDATE SET status = 'active', allowed_origins = excluded.allowed_origins, updated_at = excluded.updated_at;"
+ON CONFLICT(aud) DO UPDATE SET status = 'active', slug = excluded.slug, fee_payer_pubkey = excluded.fee_payer_pubkey,
+  allowed_origins = excluded.allowed_origins, updated_at = excluded.updated_at;"

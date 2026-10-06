@@ -104,12 +104,11 @@ pub struct Config {
     pub web3auth_mainnet: Option<Web3AuthEndpoints>,
 }
 
-/// A plain var or a secret (both are strings to the Worker).
+/// A plain var or a secret: both are the same string binding at runtime (worker `env.rs`).
 fn string_binding(env: &Env, name: &str) -> Option<String> {
     env.var(name)
         .ok()
         .map(|v| v.to_string())
-        .or_else(|| env.secret(name).ok().map(|v| v.to_string()))
         .filter(|v| !v.is_empty())
 }
 

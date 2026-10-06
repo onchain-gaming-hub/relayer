@@ -195,17 +195,26 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    pub fn build(rows: Vec<ProjectRow>, settings: &[(String, String)], loaded_at: f64) -> Self {
+    /// Builds from raw rows. A row that does not even deserialize (e.g. text typed into a
+    /// number column, which SQLite accepts) becomes an `Err` for its `aud` only, so one bad
+    /// row never takes the whole registry down.
+    pub fn build(rows: Vec<Value>, settings: &[(String, String)], loaded_at: f64) -> Self {
         let mut projects = HashMap::new();
         let mut origins = HashSet::new();
-        for row in rows {
-            let parsed = parse_project(&row);
+        for raw in rows {
+            let Some(aud) = raw.get("aud").and_then(Value::as_str).map(str::to_string) else {
+                console_warn_native("registry: skipping a projects row without a text aud");
+                continue;
+            };
+            let parsed = serde_json::from_value::<ProjectRow>(raw)
+                .map_err(|e| format!("row does not match the schema: {e}"))
+                .and_then(|row| parse_project(&row));
             if let Ok(p) = &parsed
                 && p.status == Status::Active
             {
                 origins.extend(p.allowed_origins.iter().cloned());
             }
-            projects.insert(row.aud.clone(), parsed);
+            projects.insert(aud, parsed);
         }
         let mainnet_enabled = settings
             .iter()
@@ -227,6 +236,14 @@ impl Snapshot {
     }
 }
 
+/// `console_warn!` only exists on wasm; unit tests run natively.
+fn console_warn_native(msg: &str) {
+    #[cfg(target_arch = "wasm32")]
+    console_warn!("{msg}");
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = msg;
+}
+
 thread_local! {
     static SNAPSHOT: RefCell<Option<Rc<Snapshot>>> = const { RefCell::new(None) };
     static REFRESHING_SINCE: Cell<f64> = const { Cell::new(f64::NEG_INFINITY) };
@@ -235,16 +252,22 @@ thread_local! {
 /// The registry snapshot for this request (V4).
 pub async fn snapshot(env: &Env, cfg: &Config, now: f64) -> Result<Rc<Snapshot>, ApiError> {
     let cached = SNAPSHOT.with(|s| s.borrow().clone());
+    let backoff = cfg.cluster_hop_timeout_ms as f64 * 5.0;
+    // Cold isolate whose last load failed: answer 503 without hitting D1 again for a while.
+    if cached.is_none() && now - REFRESHING_SINCE.with(Cell::get) < backoff {
+        return Err(ApiError::upstream_relayed());
+    }
     if let Some(s) = &cached {
         if s.age(now) < cfg.registry_cache_ms {
             return Ok(s.clone());
         }
         // Someone else is refreshing (or a recent refresh failed): serve stale meanwhile.
-        if now - REFRESHING_SINCE.with(Cell::get) < cfg.cluster_hop_timeout_ms as f64 * 5.0 {
+        if now - REFRESHING_SINCE.with(Cell::get) < backoff {
             return Ok(s.clone());
         }
-        REFRESHING_SINCE.with(|r| r.set(now));
     }
+    // Stamped for cold loads too: a failure then backs off instead of querying per request.
+    REFRESHING_SINCE.with(|r| r.set(now));
     match load(env, now).await {
         Ok(fresh) => {
             let fresh = Rc::new(fresh);
@@ -265,7 +288,8 @@ pub async fn snapshot(env: &Env, cfg: &Config, now: f64) -> Result<Rc<Snapshot>,
 
 async fn load(env: &Env, now: f64) -> Result<Snapshot, String> {
     let db = env.d1("DB").map_err(|e| e.to_string())?;
-    let rows: Vec<ProjectRow> = db
+    // Raw values, not `results::<ProjectRow>()`: that fails the whole query on one bad row.
+    let rows: Vec<Value> = db
         .prepare(
             "SELECT aud, slug, status, cluster, web3auth_network, allowed_origins, fee_payer_pubkey, \
              policy, user_daily_quota, project_rpm, project_daily_budget_lamports, min_balance_lamports \
@@ -298,6 +322,36 @@ async fn load(env: &Env, now: f64) -> Result<Snapshot, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn to_value(r: ProjectRow) -> Value {
+        serde_json::json!({
+            "aud": r.aud, "slug": r.slug, "status": r.status, "cluster": r.cluster,
+            "web3auth_network": r.web3auth_network, "allowed_origins": r.allowed_origins,
+            "fee_payer_pubkey": r.fee_payer_pubkey, "policy": r.policy,
+            "user_daily_quota": r.user_daily_quota, "project_rpm": r.project_rpm,
+            "project_daily_budget_lamports": r.project_daily_budget_lamports,
+            "min_balance_lamports": r.min_balance_lamports,
+        })
+    }
+
+    #[test]
+    fn one_malformed_row_only_breaks_its_own_project() {
+        let mut bad = to_value(row());
+        bad["aud"] = "client-bad".into();
+        bad["user_daily_quota"] = "2O".into(); // text in a number column (SQLite accepts it)
+        let mut good_b = row();
+        good_b.aud = "client-b".into();
+        let no_aud = serde_json::json!({ "aud": 42 });
+        let s = Snapshot::build(
+            vec![bad, to_value(row()), to_value(good_b), no_aud],
+            &[],
+            0.0,
+        );
+        assert!(s.project("client-bad").unwrap().is_err());
+        assert!(s.project("client-a").unwrap().is_ok());
+        assert!(s.project("client-b").unwrap().is_ok());
+        assert_eq!(s.projects.len(), 3);
+    }
 
     pub fn row() -> ProjectRow {
         ProjectRow {
@@ -404,7 +458,7 @@ mod tests {
         broken.policy = "{}".into();
         broken.allowed_origins = r#"["https://broken.test"]"#.into();
         let s = Snapshot::build(
-            vec![row(), paused, broken],
+            vec![to_value(row()), to_value(paused), to_value(broken)],
             &[("mainnet_enabled".into(), "true".into())],
             0.0,
         );

@@ -94,6 +94,11 @@ impl ApiError {
         worker::console_error!("config error: {}", reason.into());
         Self::new(500, "internal", "relayer misconfigured")
     }
+    /// Misconfigured project already logged once when the registry loaded: no per-request log
+    /// (a forged, unverified token naming it must not be able to flood the log).
+    pub fn misconfigured_quiet() -> Self {
+        Self::new(500, "internal", "relayer misconfigured")
+    }
     /// Unexpected failure: the detail goes to the log only, never to the client.
     pub fn internal(reason: impl Into<String>) -> Self {
         worker::console_error!("internal error: {}", reason.into());

@@ -103,10 +103,11 @@ fn fee_payer(env: &Env, project: &Project) -> std::result::Result<Keypair, ApiEr
                 )));
             }
             let name = format!("FEE_PAYER_{}", project.slug);
+            // Secret and Var are the same binding type at runtime: the code cannot tell a
+            // `[vars]` value from a secret, so keys must never be put in wrangler.toml.
             let secret = env
                 .secret(&name)
                 .map(|s| s.to_string())
-                .or_else(|_| env.var(&name).map(|v| v.to_string()))
                 .map_err(|_| ApiError::config(format!("missing {name}")))?;
             let kp = Keypair::try_from_base58_string(secret.trim())
                 .map_err(|_| ApiError::config(format!("{name} is not a valid base58 keypair")))?;
@@ -141,6 +142,9 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     if !matches!(path.as_str(), "/relayer" | "/relay") {
         return ApiError::not_found().into_response();
     }
+    // Like the config 500 above, this 503 carries no CORS headers: allowed origins come from
+    // the registry, so a cold isolate that cannot read D1 has no origin to echo (accepted;
+    // the browser reports a CORS failure instead of the JSON body).
     let snap = match registry::snapshot(&env, &cfg, now_ms()).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
@@ -285,7 +289,8 @@ async fn handle_relay(
     let aud = jwt::unverified_aud(&token).map_err(|e| ApiError::unauthorized(format!("{e:?}")))?;
     let project = match snap.project(&aud) {
         Some(Ok(p)) => p,
-        Some(Err(e)) => return Err(ApiError::config(format!("project {aud}: {e}"))),
+        // Logged once per registry load (registry.rs), not per request.
+        Some(Err(_)) => return Err(ApiError::misconfigured_quiet()),
         // Same answer as any bad token: do not reveal which clientIds are registered.
         None => return Err(ApiError::unauthorized("UnknownProject")),
     };

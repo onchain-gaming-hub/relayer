@@ -32,15 +32,11 @@ bindings = [
   { name = "CLUSTER_THROTTLE", class_name = "ClusterThrottle" },
 ]
 
-[[migrations]]
-tag = "v1"
-new_sqlite_classes = ["RelayController", "GlobalThrottle"]
-
-# v2 (spec V15): new SQLite-backed classes; v1 state (devnet only) is dropped.
+# The v1 POC never reached a remote deploy (local `wrangler dev` only), so the first remote
+# deploy starts from this single migration (spec V15); no unexported v1 classes are referenced.
 [[migrations]]
 tag = "v2"
 new_sqlite_classes = ["UserController", "ProjectThrottle", "ClusterThrottle"]
-deleted_classes = ["RelayController", "GlobalThrottle"]
 
 [[d1_databases]]
 binding = "DB"

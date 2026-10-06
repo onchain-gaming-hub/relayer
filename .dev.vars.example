@@ -1,3 +1,5 @@
-# Copy to .dev.vars (gitignored). Base58 of the 64-byte keypair.
-# Create one with: cargo run -q --example keygen   (writes .dev.vars, prints pubkey only)
-RELAYER_PRIVATE_KEY=
+# Copy to .dev.vars (gitignored). Never put these in wrangler.toml.
+# One Base58 keypair (64 bytes) per project: cargo run -q --example keygen -- <SLUG>
+FEE_PAYER_POC=
+# Keyed devnet RPC (the public api.devnet.solana.com returns 403 to Workers)
+RPC_URL_DEVNET=
