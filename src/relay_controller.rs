@@ -228,7 +228,14 @@ impl RelayController {
             init.with_method(Method::Post)
                 .with_body(Some(json!({ "window": window }).to_string().into()));
             let req = Request::new_with_init("https://global/refund", &init)?;
-            stub.fetch_with_request(req).await.map(|_| ())
+            let resp = stub.fetch_with_request(req).await?;
+            if resp.status_code() != 200 {
+                console_error!(
+                    "global refund: GlobalThrottle returned {}",
+                    resp.status_code()
+                );
+            }
+            Ok::<(), worker::Error>(())
         };
         match rpc::with_timeout(call, cfg.rpc_timeout_ms).await {
             Some(Ok(())) => {}

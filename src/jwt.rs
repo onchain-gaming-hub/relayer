@@ -31,14 +31,16 @@ pub struct Jwk {
 
 #[derive(Deserialize)]
 struct JwkSet {
-    keys: Vec<Jwk>,
+    keys: Vec<Value>,
 }
 
 pub fn parse_jwks(json: &str) -> Result<Vec<Jwk>, String> {
     let set: JwkSet = serde_json::from_str(json).map_err(|e| format!("jwks: {e}"))?;
+    // Parse each key on its own: a malformed entry (null / wrong type) is skipped, not fatal.
     let keys: Vec<Jwk> = set
         .keys
         .into_iter()
+        .filter_map(|k| serde_json::from_value::<Jwk>(k).ok())
         .filter(|k| {
             k.kty == "EC"
                 && k.crv == "P-256"
@@ -382,7 +384,7 @@ mod tests {
         let rsa = r#"{"kid":"r","kty":"RSA","alg":"RS256","n":"0vx7","e":"AQAB"}"#;
         let ec = r#"{"kty":"EC","crv":"P-256","x":"PzwlL8X3P1SpXieB8i6z-KzqVEPI8Vu_JysBiGa7dgA","y":"7OtaCKJjbNvs3Oo5pmwGkWKm4oJZOiyl2oWb_odopKo","kid":"TYOgg_-5EOEblaY-VVRYqVaDAgptnfKV4535MZPC0w0"}"#;
         let keys = parse_jwks(&format!(
-            r#"{{"keys":[{rsa},{ec},{{"kty":"EC","crv":"P-256"}}]}}"#
+            r#"{{"keys":[{rsa},{ec},{{"kty":"EC","crv":"P-256"}},{{"kty":"EC","kid":null,"x":123}},"junk"]}}"#
         ))
         .unwrap();
         assert_eq!(keys.len(), 1);
