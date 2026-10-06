@@ -299,7 +299,12 @@ fn bearer_token(req: &Request) -> std::result::Result<String, ApiError> {
         .ok()
         .flatten()
         .unwrap_or_default();
-    // Auth scheme is case-insensitive (RFC 9110 §11.1).
+    parse_bearer(&header).ok_or_else(|| ApiError::unauthorized("missing bearer token"))
+}
+
+/// `Bearer <token>` with a case-insensitive scheme (RFC 9110 §11.1). Char-boundary safe:
+/// `get(..7)` is `None` for headers shorter than 7 bytes or split inside a UTF-8 char.
+fn parse_bearer(header: &str) -> Option<String> {
     header
         .get(..7)
         .filter(|scheme| scheme.eq_ignore_ascii_case("bearer "))
@@ -307,7 +312,6 @@ fn bearer_token(req: &Request) -> std::result::Result<String, ApiError> {
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| ApiError::unauthorized("missing bearer token"))
 }
 
 async fn authenticate(
@@ -442,6 +446,23 @@ mod tests {
         let mut decoded = txcore::decode(&bytes).unwrap();
         assert_eq!(decoded, tx);
         txcore::cosign_and_verify(&mut decoded, &relayer).unwrap();
+    }
+
+    #[test]
+    fn parses_bearer_scheme() {
+        use super::parse_bearer;
+        assert_eq!(
+            parse_bearer("Bearer abc.def.ghi").as_deref(),
+            Some("abc.def.ghi")
+        );
+        assert_eq!(parse_bearer("bearer abc").as_deref(), Some("abc"));
+        assert_eq!(parse_bearer("BEARER   abc  ").as_deref(), Some("abc"));
+        assert_eq!(parse_bearer("Bearer"), None); // no space, shorter than 7 bytes
+        assert_eq!(parse_bearer("Bearer    "), None); // empty token
+        assert_eq!(parse_bearer("BearerXabc"), None);
+        assert_eq!(parse_bearer("Basic dXNlcjpwYXNz"), None);
+        assert_eq!(parse_bearer(""), None);
+        assert_eq!(parse_bearer("Bearé abc"), None); // byte 7 inside a UTF-8 char: no panic
     }
 
     #[test]

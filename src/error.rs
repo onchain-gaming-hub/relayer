@@ -98,7 +98,10 @@ impl ApiError {
     }
     /// Detail (may contain raw transport errors / upstream URLs) is logged, never returned.
     pub fn upstream(reason: impl Into<String>) -> Self {
-        worker::console_error!("upstream: {}", reason.into());
+        Self::upstream_relayed().logged(reason)
+    }
+    /// A 503 `upstream` passed through from another component that already logged the detail.
+    pub fn upstream_relayed() -> Self {
         Self::new(503, "upstream", "upstream dependency unavailable")
     }
     pub fn rpc_unknown(reason: impl Into<String>, signature: String) -> Self {

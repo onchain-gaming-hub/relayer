@@ -283,6 +283,8 @@ impl RelayController {
             (_, Some("low_balance")) => ApiError::low_balance(),
             // Today GlobalThrottle only returns 500 for config errors; keep the log generic.
             (500, Some("internal")) => ApiError::config("global throttle returned 500"),
+            // GlobalThrottle already logged its own upstream failure; don't log it twice.
+            (503, Some("upstream")) => ApiError::upstream_relayed(),
             _ => ApiError::upstream(format!("global status {status}")),
         })
     }
