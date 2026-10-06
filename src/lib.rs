@@ -462,7 +462,11 @@ mod tests {
         assert_eq!(parse_bearer("BearerXabc"), None);
         assert_eq!(parse_bearer("Basic dXNlcjpwYXNz"), None);
         assert_eq!(parse_bearer(""), None);
-        assert_eq!(parse_bearer("Bearé abc"), None); // byte 7 inside a UTF-8 char: no panic
+        // Byte 7 falls inside a multi-byte char -> get(..7) is None (no panic).
+        assert!(!"Bearer€x".is_char_boundary(7));
+        assert_eq!(parse_bearer("Bearer€x"), None);
+        assert!(!"Beareré".is_char_boundary(7));
+        assert_eq!(parse_bearer("Beareré"), None);
     }
 
     #[test]
