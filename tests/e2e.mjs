@@ -76,6 +76,7 @@ function d1Counts() {
 async function suiteA() {
   const info = await request('/relayer', { method: 'GET' });
   check('relayer-info', info.status === 200 && info.json?.pubkey === relayerPubkey && info.json?.allowlist?.[0] === 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr');
+  check('relayer-info cooldown_ms is an integer in the raw JSON', /"cooldown_ms":\d+[,}]/.test(info.text), info.text);
   check('relayer-info-bad-origin', (await request('/relayer', { method: 'GET', headers: { origin: 'https://evil.test' } })).status === 403);
   const pre = await request('/relay', { method: 'OPTIONS', headers: { origin: ORIGIN } });
   check('cors-preflight', pre.status === 204 && pre.headers['access-control-allow-origin'] === ORIGIN && /authorization/i.test(pre.headers['access-control-allow-headers'] || ''));

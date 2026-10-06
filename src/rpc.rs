@@ -57,7 +57,9 @@ async fn post(url: &str, timeout_ms: u64, body: &Value) -> Raw {
     }
 }
 
-/// Races `fut` against a `Delay`; `None` means the timeout won.
+/// Races `fut` against a `Delay`; `None` means the timeout won. The losing side is dropped:
+/// `worker::Delay` clears its `setTimeout` on drop (worker 0.8.7 `delay.rs` `PinnedDrop`),
+/// so a fast call leaves no timer behind.
 pub async fn with_timeout<F: Future>(fut: F, timeout_ms: u64) -> Option<F::Output> {
     let timeout = Delay::from(Duration::from_millis(timeout_ms));
     match select(Box::pin(fut), Box::pin(timeout)).await {

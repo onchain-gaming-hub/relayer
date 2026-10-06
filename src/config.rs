@@ -113,6 +113,10 @@ impl Config {
         if !(1..=600_000).contains(&self.rpc_timeout_ms) {
             return Err("invalid config RPC_TIMEOUT_MS: must be 1..=600000".into());
         }
+        // 0 would answer every request with global_throttle (an accidental kill switch).
+        if self.global_rpm == 0 {
+            return Err("invalid config GLOBAL_RPM: must be >= 1".into());
+        }
         if self.reject_cooldown_max_ms < self.reject_cooldown_ms {
             return Err(
                 "invalid config REJECT_COOLDOWN_MAX_MS: must be >= REJECT_COOLDOWN_MS".into(),
@@ -166,6 +170,9 @@ mod tests {
         assert!(cfg(10_000.0, 3_000.0, 1_000.0).validated().is_err());
         assert!(cfg(f64::NAN, 3_000.0, 60_000.0).validated().is_err());
         assert!(cfg(f64::INFINITY, 3_000.0, 60_000.0).validated().is_err());
+        let mut c = cfg(10_000.0, 3_000.0, 60_000.0);
+        c.global_rpm = 0;
+        assert!(c.validated().is_err());
         for bad in [0, u64::MAX] {
             let mut c = cfg(10_000.0, 3_000.0, 60_000.0);
             c.rpc_timeout_ms = bad;
