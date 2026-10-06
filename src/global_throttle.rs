@@ -42,8 +42,16 @@ impl DurableObject for GlobalThrottle {
         let now = Date::now().as_millis() as f64;
         let cfg = match Config::from_env(&self.env) {
             Ok(c) => c,
-            Err(e) => return ApiError::internal(e).into_response(),
+            Err(e) => return ApiError::config(e).into_response(),
         };
+
+        // Roll the window first so a refund for an expired window reports refunded:false.
+        // (Synchronous, before the first await.)
+        if now - self.window_start.get() >= WINDOW_MS {
+            self.window_start.set(now);
+            self.count.set(0);
+        }
+
         if req.path() == "/refund" {
             // A request the RPC rejected sent nothing on-chain: give its slot back (D17),
             // but only within the window it was counted in.
@@ -56,11 +64,7 @@ impl DurableObject for GlobalThrottle {
             return Response::from_json(&json!({ "refunded": refunded }));
         }
 
-        // Window check + increment happen synchronously, before the first await.
-        if now - self.window_start.get() >= WINDOW_MS {
-            self.window_start.set(now);
-            self.count.set(0);
-        }
+        // Capacity check + increment happen synchronously, before the first await.
         if self.count.get() >= cfg.global_rpm {
             return ApiError::global_throttle(self.window_start.get() + WINDOW_MS - now)
                 .into_response();

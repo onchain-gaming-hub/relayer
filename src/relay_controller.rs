@@ -71,7 +71,7 @@ impl DurableObject for RelayController {
         let now = Date::now().as_millis() as f64;
         let cfg = match Config::from_env(&self.env) {
             Ok(c) => c,
-            Err(e) => return ApiError::internal(e).into_response(),
+            Err(e) => return ApiError::config(e).into_response(),
         };
 
         // --- synchronous check-and-set: no await above this line ---

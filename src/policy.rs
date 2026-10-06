@@ -30,6 +30,8 @@ pub fn validate(
     if header.num_required_signatures != 2 || tx.signatures.len() != 2 {
         return Err("exactly 2 signatures required");
     }
+    // Already implied by sanitize (readonly_signed < required_signatures = 2); kept as
+    // defense-in-depth so this policy does not silently depend on sanitize's internals.
     if header.num_readonly_signed_accounts > 1 {
         return Err("invalid readonly signer count");
     }

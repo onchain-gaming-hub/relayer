@@ -73,7 +73,9 @@ impl Config {
             web3auth_client_id: required("WEB3AUTH_CLIENT_ID")?,
             web3auth_jwks_url: var("WEB3AUTH_JWKS_URL")
                 .unwrap_or_else(|| "https://api-auth.web3auth.io/jwks".into()),
-            web3auth_issuer: required("WEB3AUTH_ISSUER")?,
+            // Social-login issuer per Web3Auth docs; override if spike 0.2 shows otherwise.
+            web3auth_issuer: var("WEB3AUTH_ISSUER")
+                .unwrap_or_else(|| "https://api-auth.web3auth.io".into()),
             wallet_binding,
             cooldown_ms: num(var("COOLDOWN_MS"), "COOLDOWN_MS", 10_000.0)?,
             reject_cooldown_ms: num(var("REJECT_COOLDOWN_MS"), "REJECT_COOLDOWN_MS", 3_000.0)?,

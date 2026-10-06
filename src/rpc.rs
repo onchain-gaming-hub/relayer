@@ -70,6 +70,10 @@ fn rpc_body(method: &str, params: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params })
 }
 
+/// JSON-RPC errors raised by the node itself rather than by the transaction:
+/// -32603 internal error, -32005 node unhealthy, -32004 block not available.
+const NODE_SIDE_ERROR_CODES: [i64; 3] = [-32603, -32005, -32004];
+
 pub fn classify_send(status: u16, text: &str) -> SendOutcome {
     if (400..500).contains(&status) {
         return SendOutcome::Rejected {
@@ -92,10 +96,12 @@ pub fn classify_send(status: u16, text: &str) -> SendOutcome {
         if msg.contains("already been processed") || msg.contains("AlreadyProcessed") {
             return SendOutcome::AlreadyProcessed;
         }
+        let code = err.get("code").and_then(Value::as_i64);
         return SendOutcome::Rejected {
             reason: truncate(msg, 200),
             http_429: false,
-            tx_fault: true,
+            // Node-side failures say nothing about the transaction (D17: treat like 429).
+            tx_fault: !code.is_some_and(|c| NODE_SIDE_ERROR_CODES.contains(&c)),
         };
     }
     match v.get("result").and_then(Value::as_str) {
@@ -213,6 +219,17 @@ mod tests {
                 ..
             }
         ));
+        for code in [-32603, -32005, -32004] {
+            let body = format!(r#"{{"error":{{"code":{code},"message":"Node is unhealthy"}}}}"#);
+            assert!(matches!(
+                classify_send(200, &body),
+                SendOutcome::Rejected {
+                    tx_fault: false,
+                    http_429: false,
+                    ..
+                }
+            ));
+        }
         assert!(matches!(
             classify_send(400, ""),
             SendOutcome::Rejected { tx_fault: true, .. }

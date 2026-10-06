@@ -114,7 +114,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
             if cors.is_some() && req.method() == Method::Options {
                 return with_cors(Response::empty()?.with_status(204), cors);
             }
-            return with_cors(ApiError::internal(e).into_response()?, cors);
+            return with_cors(ApiError::config(e).into_response()?, cors);
         }
     };
     let origin_ok = origin.as_deref() == Some(cfg.allowed_origin.as_str());
@@ -365,7 +365,9 @@ async fn load_jwks(cfg: &Config, force: bool) -> std::result::Result<Vec<jwt::Jw
         return Ok(keys.clone());
     }
     // Negative cache: after a failed fetch, don't retry for JWKS_FAILURE_BACKOFF_MS.
-    let recently_failed = now_ms() - JWKS_LAST_FAILURE.with(Cell::get) < JWKS_FAILURE_BACKOFF_MS;
+    // A forced refetch is already rate-limited by its own window, so it always hits the network.
+    let recently_failed =
+        !force && now_ms() - JWKS_LAST_FAILURE.with(Cell::get) < JWKS_FAILURE_BACKOFF_MS;
     let fetched = if recently_failed {
         Err("jwks: recently failed".to_string())
     } else {

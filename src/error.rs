@@ -78,6 +78,11 @@ impl ApiError {
     pub fn global_throttle(retry_after_ms: f64) -> Self {
         Self::new(429, "global_throttle", "relayer is at capacity").with_retry_after(retry_after_ms)
     }
+    /// Misconfiguration: the detail (e.g. which env var is missing) goes to the log only.
+    pub fn config(reason: impl Into<String>) -> Self {
+        worker::console_error!("config error: {}", reason.into());
+        Self::new(500, "internal", "relayer misconfigured")
+    }
     pub fn internal(reason: impl Into<String>) -> Self {
         Self::new(500, "internal", "internal error").with_reason(reason)
     }

@@ -5,7 +5,7 @@ Spec: `../docs/plans/2026-10-05_gasless-relayer-poc-spec.md`
 
 ```
 POST /relay   { "transaction": "<base64 wire tx>" }   Authorization: Bearer <Web3Auth idToken>
-GET  /relayer → { pubkey, cooldown_ms, allowlist, max_memo_bytes }
+GET  /relayer → { pubkey, cooldown_ms, allowlist, max_memo_bytes, wallet_binding }
 ```
 
 ## Layout

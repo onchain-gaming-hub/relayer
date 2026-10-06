@@ -31,11 +31,16 @@ struct JwkSet {
 
 pub fn parse_jwks(json: &str) -> Result<Vec<Jwk>, String> {
     let set: JwkSet = serde_json::from_str(json).map_err(|e| format!("jwks: {e}"))?;
-    Ok(set
+    let keys: Vec<Jwk> = set
         .keys
         .into_iter()
         .filter(|k| k.kty == "EC" && k.crv == "P-256")
-        .collect())
+        .collect();
+    // An empty set must not be cached as a success (every token would be UnknownKid for 1 h).
+    if keys.is_empty() {
+        return Err("jwks: no usable EC P-256 keys".into());
+    }
+    Ok(keys)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -351,6 +356,14 @@ mod tests {
         assert_eq!(precheck(&no_kid), Err(AuthError::Malformed));
         let ok = token(&sk, json!({"alg":"ES256","kid":"k1"}), claims(2000.0));
         assert!(precheck(&ok).is_ok());
+    }
+
+    #[test]
+    fn empty_or_foreign_jwks_is_an_error() {
+        assert!(parse_jwks(r#"{"keys":[]}"#).is_err());
+        assert!(
+            parse_jwks(r#"{"keys":[{"kid":"r","kty":"RSA","crv":"","x":"a","y":"b"}]}"#).is_err()
+        );
     }
 
     #[test]

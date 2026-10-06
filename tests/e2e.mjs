@@ -240,6 +240,14 @@ async function suiteA() {
   await sleep(c1 + 100);
   r = await relayAs(u8);
   check('T24 RPC overload does not grow user backoff', r.status === 502 && r.json?.retry_after_ms <= 1000, `c1=${c1} c2=${r.json?.retry_after_ms}`);
+  // T28: node-side JSON-RPC error (-32005) is not the tx's fault -> base cooldown, no backoff
+  const u10 = freshSeed();
+  await setState({ send: 'unhealthy' });
+  r = await relayAs(u10);
+  const n1 = r.json?.retry_after_ms;
+  await sleep(n1 + 100);
+  r = await relayAs(u10);
+  check('T28 node unhealthy does not grow user backoff', r.status === 502 && n1 <= 1000 && r.json?.retry_after_ms <= 1000, `n1=${n1} n2=${r.json?.retry_after_ms}`);
   await setState({ send: 'already' });
   r = await relayAs(freshSeed());
   check('already-processed -> 200 with signature', r.status === 200 && typeof r.json?.signature === 'string', `${r.status}`);
@@ -258,10 +266,13 @@ async function suiteA() {
 async function suiteB() {
   let r;
   // GLOBAL_RPM=3, COOLDOWN_MS=5000
-  // T26 (R8): rejected requests return their global slot, so 3 rejects + 3 successes fit in rpm=3
-  await setState({ send: 'reject' });
+  // T26 (R8): tx-fault rejects (JSON-RPC error, HTTP 400) return their global slot,
+  // so 3 rejects + 3 successes fit in rpm=3
   const rej = [];
-  for (let i = 0; i < 3; i++) rej.push((await relayAs(freshSeed())).status);
+  for (const mode of ['reject', 'http400', 'reject']) {
+    await setState({ send: mode });
+    rej.push((await relayAs(freshSeed())).status);
+  }
   await setState({ send: 'ok' });
   const ok = [];
   for (let i = 0; i < 3; i++) ok.push((await relayAs(freshSeed())).status);
@@ -282,6 +293,18 @@ async function suiteB() {
   check('T12 3rd admit ok', r.status === 200, `${r.status}`);
   r = await relayAs(freshSeed());
   check('T12 global throttle', r.status === 429 && r.json?.code === 'global_throttle' && Number(r.headers['retry-after']) >= 1, `${r.status} ${r.json?.code}`);
+
+  // T24/T28: RPC overload (HTTP 429, node-side -32005) does NOT refund: 3 such failures use up rpm=3
+  console.log('… waiting 61 s for the global window to roll over');
+  await sleep(61_000);
+  const over = [];
+  for (const mode of ['http429', 'unhealthy', 'http429']) {
+    await setState({ send: mode });
+    over.push((await relayAs(freshSeed())).status);
+  }
+  await setState({ send: 'ok' });
+  r = await relayAs(freshSeed());
+  check('T24/T28 overload rejects keep their global slot', over.every((s) => s === 502) && r.status === 429 && r.json?.code === 'global_throttle', `over=${over} next=${r.status} ${r.json?.code}`);
 }
 
 async function suiteC() {
