@@ -83,10 +83,10 @@ fn relayer_keypair(env: &Env) -> std::result::Result<Keypair, ApiError> {
     }
     let secret = env
         .secret("RELAYER_PRIVATE_KEY")
-        .map_err(|_| ApiError::internal("missing RELAYER_PRIVATE_KEY"))?
+        .map_err(|_| ApiError::config("missing RELAYER_PRIVATE_KEY"))?
         .to_string();
     let kp = Keypair::try_from_base58_string(secret.trim())
-        .map_err(|_| ApiError::internal("RELAYER_PRIVATE_KEY is not a valid base58 keypair"))?;
+        .map_err(|_| ApiError::config("RELAYER_PRIVATE_KEY is not a valid base58 keypair"))?;
     RELAYER_KEYPAIR.with(|c| *c.borrow_mut() = Some(kp.insecure_clone()));
     Ok(kp)
 }

@@ -123,7 +123,8 @@ impl RelayController {
         let outcome = rpc::send_transaction(&cfg.rpc_url, cfg.rpc_timeout_ms, &job.tx).await;
         let done = Date::now().as_millis() as f64;
 
-        // D17: only a rejection caused by the transaction itself (JSON-RPC error, HTTP 400/413)
+        // D17: only a rejection caused by the transaction itself (JSON-RPC error except node-side
+        // codes -32603/-32005/-32004, HTTP 400/413)
         // returns the global slot and grows this wallet's backoff. An overloaded RPC (429, other
         // 4xx) is not the user's fault and must not free capacity to hit it again.
         let tx_fault = matches!(outcome, SendOutcome::Rejected { tx_fault: true, .. });
