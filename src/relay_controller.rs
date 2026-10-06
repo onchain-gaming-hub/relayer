@@ -172,12 +172,15 @@ impl RelayController {
                     })
                     .await
             }
+            // Only a real acceptance clears the streak (AlreadyProcessed can be replayed);
+            // one atomic write so a crash cannot leave the old streak behind.
             (SendOutcome::Accepted(_), _) => {
-                // Only a real acceptance clears the streak (AlreadyProcessed can be replayed).
-                match storage.put(COOLDOWN_KEY, done + cooldown_ms).await {
-                    Ok(()) => storage.delete(REJECT_STREAK_KEY).await.map(|_| ()),
-                    Err(e) => Err(e),
-                }
+                storage
+                    .put_multiple(CooldownState {
+                        cooldown_until: done + cooldown_ms,
+                        reject_streak: 0,
+                    })
+                    .await
             }
             _ => storage.put(COOLDOWN_KEY, done + cooldown_ms).await,
         };

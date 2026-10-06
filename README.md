@@ -55,3 +55,7 @@ RSA key so every suite also exercises mixed key sets.
 ## Deploy
 
 See the runbook in spec §8. Never deploy or run remote D1 migrations without approval.
+
+⚠️ **The relayer keypair is devnet-only — never fund it on mainnet or any other cluster.** A 504 `rpc_unknown`
+returns the relayer's slot-0 signature, so a user holds a fully signed transaction; the relayer cannot tell which
+cluster its blockhash came from. Use a fresh, dedicated keypair per cluster.

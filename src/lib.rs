@@ -299,8 +299,11 @@ fn bearer_token(req: &Request) -> std::result::Result<String, ApiError> {
         .ok()
         .flatten()
         .unwrap_or_default();
+    // Auth scheme is case-insensitive (RFC 9110 §11.1).
     header
-        .strip_prefix("Bearer ")
+        .get(..7)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("bearer "))
+        .and_then(|_| header.get(7..))
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .map(str::to_string)

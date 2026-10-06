@@ -96,8 +96,10 @@ impl ApiError {
     pub fn low_balance() -> Self {
         Self::new(503, "low_balance", "relayer balance below floor")
     }
+    /// Detail (may contain raw transport errors / upstream URLs) is logged, never returned.
     pub fn upstream(reason: impl Into<String>) -> Self {
-        Self::new(503, "upstream", "upstream dependency unavailable").with_reason(reason)
+        worker::console_error!("upstream: {}", reason.into());
+        Self::new(503, "upstream", "upstream dependency unavailable")
     }
     pub fn rpc_unknown(reason: impl Into<String>, signature: String) -> Self {
         Self::new(
@@ -105,8 +107,14 @@ impl ApiError {
             "rpc_unknown",
             "RPC outcome unknown; poll the signature",
         )
-        .with_reason(reason)
         .with_signature(signature)
+        .logged(reason)
+    }
+
+    /// Logs a detail that must not reach the client (transport errors can contain URLs).
+    fn logged(self, reason: impl Into<String>) -> Self {
+        worker::console_error!("{}: {}", self.code, reason.into());
+        self
     }
 
     pub fn into_response(self) -> Result<Response> {

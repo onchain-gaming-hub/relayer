@@ -141,6 +141,13 @@ async function suiteA() {
   const t10 = mk(freshSeed());
   r = await relay(t10, {});
   check('T10 missing token', r.status === 401 && r.json?.code === 'unauthorized');
+  {
+    // Auth scheme is case-insensitive.
+    const tl = mk(freshSeed());
+    const lower = await request('/relay', { headers: { 'content-type': 'application/json', origin: ORIGIN,
+      authorization: `bearer ${await tokenFor(tl.user_hex)}` }, body: JSON.stringify({ transaction: tl.tx }) });
+    check('T10 lowercase bearer scheme accepted', lower.status === 200, `${lower.status} ${lower.json?.code}`);
+  }
   r = await relay(t10, { token: await tokenFor(t10.user_hex, { exp: String(Math.floor(Date.now() / 1000) - 120) }) });
   check('T10 expired token', r.status === 401, r.json?.reason);
   r = await relay(t10, { token: await tokenFor(t10.user_hex, { aud: 'other-client' }) });
@@ -338,7 +345,7 @@ async function suiteC() {
   const jwksFetches = (await stats()).jwks - jc0;
   check('JWKS cold start under concurrency', cold.every((x) => x.status === 503 && x.json?.code === 'upstream'), `statuses=${cold.map((x) => x.status)} jwks fetches=${jwksFetches}`);
   let r = await relayAs(freshSeed());
-  check('T20 non-devnet RPC', r.status === 503 && r.json?.code === 'upstream', r.json?.reason);
+  check('T20 non-devnet RPC', r.status === 503 && r.json?.code === 'upstream' && r.json?.reason === undefined, JSON.stringify(r.json));
   await setState({ genesis: 'EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG', balance: 0 });
   // Cold balance cache + concurrent wallets, with getBalance held open for 1.5 s so all five
   // admits overlap inside GlobalThrottle: single-flight must share ONE call across requests
