@@ -162,8 +162,19 @@ async function suiteA() {
   const big = JSON.stringify({ transaction: 'A'.repeat(5000) });
   r = await relay(t10, { body: big });
   check('T10 missing token fails fast (before body read)', r.status === 401, `${r.status}`);
-  r = await relay(t10, { token: tok, body: big });
-  check('T11 body too large (Content-Length)', r.status === 413);
+  r = await new Promise((resolve) => {
+    const u = new URL(RELAYER + '/relay');
+    const req = http.request({ hostname: u.hostname, port: u.port, path: '/relay', method: 'POST', agent: false,
+      headers: { 'content-type': 'application/json', origin: ORIGIN, 'transfer-encoding': 'chunked' } }, (res) => {
+      let d = ''; res.on('data', (c) => (d += c)); res.on('end', () => resolve({ status: res.statusCode }));
+    });
+    for (let i = 0; i < 6; i++) req.write('A'.repeat(1000));
+    req.end();
+  });
+  check('T10 missing token, multi-chunk upload -> 401', r.status === 401, `${r.status}`);
+  r = await request('/relay', { headers: { 'content-type': 'application/json', origin: ORIGIN,
+    authorization: `Bearer ${tok}`, 'content-length': String(Buffer.byteLength(big)) }, body: big });
+  check('T11 body too large (Content-Length)', r.status === 413, `${r.status}`);
   r = await new Promise((resolve) => {
     const u = new URL(RELAYER + '/relay');
     const req = http.request({ hostname: u.hostname, port: u.port, path: '/relay', method: 'POST',

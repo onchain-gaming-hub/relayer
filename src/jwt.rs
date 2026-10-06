@@ -56,6 +56,22 @@ struct Header {
     kid: Option<String>,
 }
 
+/// Cheap structural check (3 parts, header `alg == ES256`, `kid` present) that needs no JWKS,
+/// so malformed tokens are rejected before any network fetch.
+pub fn precheck(token: &str) -> Result<(), AuthError> {
+    let mut parts = token.split('.');
+    let (Some(h), Some(_), Some(_), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(AuthError::Malformed);
+    };
+    let header: Header = decode_json(h)?;
+    if header.alg != "ES256" {
+        return Err(AuthError::BadAlg);
+    }
+    header.kid.map(|_| ()).ok_or(AuthError::Malformed)
+}
+
 /// Verifies an ES256 JWT against `jwks` and checks `exp`, `aud`, `iss`. Returns the claims.
 pub fn verify(
     token: &str,
@@ -124,21 +140,24 @@ pub fn token_binds_wallet(claims: &Value, user: &Pubkey) -> bool {
         if !curve.eq_ignore_ascii_case("ed25519") || kind != "web3auth_app_key" {
             return false;
         }
-        ["public_key", "address"]
-            .iter()
-            .filter_map(|f| w.get(*f).and_then(Value::as_str))
-            .any(|v| key_matches(v, user))
+        // Social-login app keys carry `public_key` only (`address` belongs to external wallets).
+        w.get("public_key")
+            .and_then(Value::as_str)
+            .is_some_and(|v| key_matches(v, user))
     })
 }
 
 fn key_matches(value: &str, user: &Pubkey) -> bool {
-    let user_bytes = user.to_bytes();
-    // Web3Auth's own verifier strips an optional 0x prefix and compares case-insensitively.
-    let value = value.strip_prefix("0x").unwrap_or(value);
-    if value.len() == 64
-        && let Some(bytes) = decode_hex(value)
+    // Web3Auth's own verifier strips an optional 0x prefix and compares hex case-insensitively
+    // (`decode_hex` accepts both cases). Base58 is case-sensitive, so it uses the raw value.
+    let hex = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    if hex.len() == 64
+        && let Some(bytes) = decode_hex(hex)
     {
-        return bytes == user_bytes;
+        return bytes == user.to_bytes();
     }
     value.parse::<Pubkey>().map(|p| p == *user).unwrap_or(false)
 }
@@ -289,7 +308,16 @@ mod tests {
             &user
         ));
         assert!(token_binds_wallet(
-            &w(json!({"type":app,"curve":"ED25519","address":user.to_string()})),
+            &w(json!({"type":app,"curve":"ED25519","public_key":user.to_string()})),
+            &user
+        ));
+        assert!(token_binds_wallet(
+            &w(json!({"type":app,"curve":"ed25519","public_key":format!("0X{hex}")})),
+            &user
+        ));
+        // `address` (external-wallet field) is not accepted for app keys.
+        assert!(!token_binds_wallet(
+            &w(json!({"type":app,"curve":"ed25519","address":user.to_string()})),
             &user
         ));
         assert!(!token_binds_wallet(
@@ -311,6 +339,18 @@ mod tests {
             &user
         ));
         assert!(!token_binds_wallet(&json!({}), &user));
+    }
+
+    #[test]
+    fn precheck_rejects_without_jwks() {
+        let (sk, _) = key();
+        assert_eq!(precheck("x"), Err(AuthError::Malformed));
+        let none = token(&sk, json!({"alg":"none","kid":"k1"}), claims(2000.0));
+        assert_eq!(precheck(&none), Err(AuthError::BadAlg));
+        let no_kid = token(&sk, json!({"alg":"ES256"}), claims(2000.0));
+        assert_eq!(precheck(&no_kid), Err(AuthError::Malformed));
+        let ok = token(&sk, json!({"alg":"ES256","kid":"k1"}), claims(2000.0));
+        assert!(precheck(&ok).is_ok());
     }
 
     #[test]

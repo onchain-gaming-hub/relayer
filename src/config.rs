@@ -9,6 +9,7 @@ pub const MAX_DRAIN_BYTES: usize = 64 * 1024;
 pub const BALANCE_CACHE_MS: f64 = 30_000.0;
 pub const INFLIGHT_STALE_MARGIN_MS: f64 = 5_000.0;
 pub const JWKS_TTL_MS: f64 = 60.0 * 60_000.0;
+pub const JWKS_FAILURE_BACKOFF_MS: f64 = 30_000.0;
 pub const JWT_LEEWAY_SECS: f64 = 30.0;
 pub const JWKS_UNKNOWN_KID_REFETCH_MS: f64 = 5.0 * 60_000.0;
 

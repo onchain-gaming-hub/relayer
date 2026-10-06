@@ -45,7 +45,7 @@ cargo test --lib            # policy / jwt / rpc / tx unit tests
 ./tests/run-e2e.sh          # local e2e vs wrangler dev + mock RPC/JWKS (spec §7) — no network
 ```
 
-`tests/run-e2e.sh` covers T1–T6, T8–T18, T20, T22–T25; T7 shape cases are unit tests (`cargo test`).
+`tests/run-e2e.sh` covers T1–T18, T20, T22–T25 (T7: HTTP spot-checks here, shape cases as unit tests in `cargo test`).
 Not covered here: T19 (storage `put` failing after a broadcast — not simulable locally) and T21 (Memo Count — frontend).
 
 ## Deploy

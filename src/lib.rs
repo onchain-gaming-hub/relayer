@@ -23,8 +23,8 @@ use solana_signer::Signer;
 use worker::*;
 
 use config::{
-    Config, DEVNET_GENESIS_HASH, JWKS_TTL_MS, JWKS_UNKNOWN_KID_REFETCH_MS, MAX_BODY_BYTES,
-    MAX_DRAIN_BYTES, WalletBinding,
+    Config, DEVNET_GENESIS_HASH, JWKS_FAILURE_BACKOFF_MS, JWKS_TTL_MS, JWKS_UNKNOWN_KID_REFETCH_MS,
+    MAX_BODY_BYTES, MAX_DRAIN_BYTES, WalletBinding,
 };
 use error::ApiError;
 
@@ -72,6 +72,7 @@ thread_local! {
     static JWKS: RefCell<Option<(Vec<jwt::Jwk>, f64)>> = const { RefCell::new(None) };
     static RELAYER_KEYPAIR: RefCell<Option<Keypair>> = const { RefCell::new(None) };
     static JWKS_LAST_FORCED_REFETCH: Cell<f64> = const { Cell::new(f64::NEG_INFINITY) };
+    static JWKS_LAST_FAILURE: Cell<f64> = const { Cell::new(f64::NEG_INFINITY) };
     static DEVNET_CONFIRMED: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -104,11 +105,15 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let cfg = match Config::from_env(&env) {
         Ok(c) => c,
         Err(e) => {
-            // Still attach CORS so the browser shows the 500 instead of a CORS failure.
+            // Keep CORS working so the browser surfaces the 500: preflights must get a 2xx,
+            // otherwise POST /relay would only ever show a CORS failure.
             let allowed = env.var("ALLOWED_ORIGIN").ok().map(|v| v.to_string());
             let cors = origin
                 .as_deref()
                 .filter(|o| allowed.as_deref() == Some(*o) && *o != "*");
+            if cors.is_some() && req.method() == Method::Options {
+                return with_cors(Response::empty()?.with_status(204), cors);
+            }
             return with_cors(ApiError::internal(e).into_response()?, cors);
         }
     };
@@ -306,6 +311,8 @@ async fn authenticate(
     user: &Pubkey,
 ) -> std::result::Result<(), ApiError> {
     let now_s = now_ms() / 1000.0;
+    // Reject malformed / non-ES256 / kid-less tokens before touching the network.
+    jwt::precheck(token).map_err(|e| ApiError::unauthorized(format!("{e:?}")))?;
 
     let mut jwks = load_jwks(cfg, false).await?;
     let mut result = jwt::verify(
@@ -352,17 +359,40 @@ async fn authenticate(
 async fn load_jwks(cfg: &Config, force: bool) -> std::result::Result<Vec<jwt::Jwk>, ApiError> {
     let cached = JWKS.with(|c| c.borrow().clone());
     if !force
-        && let Some((keys, fetched_at)) = cached
+        && let Some((keys, fetched_at)) = &cached
         && now_ms() - fetched_at < JWKS_TTL_MS
     {
-        return Ok(keys);
+        return Ok(keys.clone());
     }
-    let text = rpc::get_text(&cfg.web3auth_jwks_url, cfg.rpc_timeout_ms)
-        .await
-        .map_err(|e| ApiError::upstream(format!("jwks: {e}")))?;
-    let keys = jwt::parse_jwks(&text).map_err(ApiError::upstream)?;
-    JWKS.with(|c| *c.borrow_mut() = Some((keys.clone(), now_ms())));
-    Ok(keys)
+    // Negative cache: after a failed fetch, don't retry for JWKS_FAILURE_BACKOFF_MS.
+    let recently_failed = now_ms() - JWKS_LAST_FAILURE.with(Cell::get) < JWKS_FAILURE_BACKOFF_MS;
+    let fetched = if recently_failed {
+        Err("jwks: recently failed".to_string())
+    } else {
+        match rpc::get_text(&cfg.web3auth_jwks_url, cfg.rpc_timeout_ms).await {
+            Ok(text) => jwt::parse_jwks(&text),
+            Err(e) => Err(format!("jwks: {e}")),
+        }
+    };
+    match fetched {
+        Ok(keys) => {
+            JWKS.with(|c| *c.borrow_mut() = Some((keys.clone(), now_ms())));
+            Ok(keys)
+        }
+        Err(e) => {
+            if !recently_failed {
+                JWKS_LAST_FAILURE.with(|c| c.set(now_ms()));
+            }
+            // Prefer stale keys over an outage: Web3Auth keys rotate rarely.
+            match cached {
+                Some((keys, _)) => {
+                    console_warn!("{e}; serving stale JWKS");
+                    Ok(keys)
+                }
+                None => Err(ApiError::upstream(e)),
+            }
+        }
+    }
 }
 
 /// Lazy per-isolate devnet guard: only a confirmed match is cached; fetch failures retry.
