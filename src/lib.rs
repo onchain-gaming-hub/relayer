@@ -259,10 +259,12 @@ async fn read_body_limited(
     req: &mut Request,
     limit: usize,
 ) -> std::result::Result<Vec<u8>, ApiError> {
-    if let Some(len) = req.headers().get("Content-Length").ok().flatten()
-        && len.trim().parse::<usize>().map_or(true, |n| n > limit)
-    {
-        return Err(ApiError::too_large());
+    if let Some(len) = req.headers().get("Content-Length").ok().flatten() {
+        match len.trim().parse::<usize>() {
+            Ok(n) if n > limit => return Err(ApiError::too_large()),
+            Ok(_) => {}
+            Err(_) => return Err(ApiError::validation("invalid Content-Length")),
+        }
     }
     // Content-Length can be absent (chunked); cap what is actually read as well.
     let mut stream = req

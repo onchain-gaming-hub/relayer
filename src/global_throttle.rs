@@ -48,12 +48,6 @@ impl DurableObject for GlobalThrottle {
             Ok(c) => c,
             Err(e) => return ApiError::config(e).into_response(),
         };
-        // Misconfigured keypair is a 500 config error, never a cached "balance failure".
-        let pubkey = match relayer_keypair_pubkey(&self.env) {
-            Ok(p) => p,
-            Err(e) => return e.into_response(),
-        };
-
         // Roll the window first so a refund for an expired window reports refunded:false.
         // (Synchronous, before the first await.)
         if now - self.window_start.get() >= WINDOW_MS {
@@ -72,6 +66,13 @@ impl DurableObject for GlobalThrottle {
             let refunded = window.is_some_and(|w| self.release(w));
             return Response::from_json(&json!({ "refunded": refunded }));
         }
+
+        // Admit path only (refund never needs it). Misconfigured keypair is a 500 config error,
+        // never a cached "balance failure".
+        let pubkey = match relayer_keypair_pubkey(&self.env) {
+            Ok(p) => p,
+            Err(e) => return e.into_response(),
+        };
 
         // Capacity check + increment happen synchronously, before the first await.
         if self.count.get() >= cfg.global_rpm {

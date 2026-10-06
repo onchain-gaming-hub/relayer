@@ -47,7 +47,10 @@ cargo test --lib            # policy / jwt / rpc / tx unit tests
 
 `tests/run-e2e.sh` covers T1–T18, T20, T22–T28 (T7: HTTP spot-checks here, shape cases as unit tests in `cargo test`).
 Not covered here: T19 (storage `put` failing after a broadcast — not simulable locally), T21 (Memo Count — frontend),
-and the "GlobalThrottle DO itself fails" half of T18 (only the `getBalance` failure path is simulated).
+the "GlobalThrottle DO itself fails" half of T18 (only the `getBalance` failure path is simulated), a refund that
+arrives after the global window rolled over (`refunded:false`; needs >60 s between reject and refund), and an
+unparseable `Content-Length` (→ 400; clients/proxies normally reject it before the Worker). The mock JWKS includes an
+RSA key so every suite also exercises mixed key sets.
 
 ## Deploy
 

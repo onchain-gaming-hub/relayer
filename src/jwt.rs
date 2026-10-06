@@ -13,14 +13,19 @@ use solana_pubkey::Pubkey;
 
 use crate::config::JWT_LEEWAY_SECS;
 
+/// Every field is optional at parse time so a key of another type in the same set (e.g. RSA,
+/// which has `n`/`e` and no `x`/`y`) is skipped by `parse_jwks` instead of failing the whole set.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Jwk {
+    #[serde(default)]
     pub kid: String,
     #[serde(default)]
     pub kty: String,
     #[serde(default)]
     pub crv: String,
+    #[serde(default)]
     pub x: String,
+    #[serde(default)]
     pub y: String,
 }
 
@@ -34,7 +39,13 @@ pub fn parse_jwks(json: &str) -> Result<Vec<Jwk>, String> {
     let keys: Vec<Jwk> = set
         .keys
         .into_iter()
-        .filter(|k| k.kty == "EC" && k.crv == "P-256")
+        .filter(|k| {
+            k.kty == "EC"
+                && k.crv == "P-256"
+                && !k.kid.is_empty()
+                && !k.x.is_empty()
+                && !k.y.is_empty()
+        })
         .collect();
     // An empty set must not be cached as a success (every token would be UnknownKid for 1 h).
     if keys.is_empty() {
@@ -361,9 +372,21 @@ mod tests {
     #[test]
     fn empty_or_foreign_jwks_is_an_error() {
         assert!(parse_jwks(r#"{"keys":[]}"#).is_err());
-        assert!(
-            parse_jwks(r#"{"keys":[{"kid":"r","kty":"RSA","crv":"","x":"a","y":"b"}]}"#).is_err()
-        );
+        // Realistic RSA key: n/e, no x/y.
+        let rsa = r#"{"kid":"r","kty":"RSA","alg":"RS256","n":"0vx7","e":"AQAB"}"#;
+        assert!(parse_jwks(&format!(r#"{{"keys":[{rsa}]}}"#)).is_err());
+    }
+
+    #[test]
+    fn foreign_keys_in_the_set_are_skipped_not_fatal() {
+        let rsa = r#"{"kid":"r","kty":"RSA","alg":"RS256","n":"0vx7","e":"AQAB"}"#;
+        let ec = r#"{"kty":"EC","crv":"P-256","x":"PzwlL8X3P1SpXieB8i6z-KzqVEPI8Vu_JysBiGa7dgA","y":"7OtaCKJjbNvs3Oo5pmwGkWKm4oJZOiyl2oWb_odopKo","kid":"TYOgg_-5EOEblaY-VVRYqVaDAgptnfKV4535MZPC0w0"}"#;
+        let keys = parse_jwks(&format!(
+            r#"{{"keys":[{rsa},{ec},{{"kty":"EC","crv":"P-256"}}]}}"#
+        ))
+        .unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].kty, "EC");
     }
 
     #[test]
