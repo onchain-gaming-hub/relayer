@@ -20,6 +20,11 @@ CLUSTER_RPM_MAINNET = "300"
 # Daily fee budget across every project on the cluster, lamports (spec v2 §5): 10 SOL / 0.2 SOL.
 CLUSTER_DAILY_BUDGET_DEVNET = "10000000000"
 CLUSTER_DAILY_BUDGET_MAINNET = "200000000"
+# v3 W9: daily rent the fee payers may front, per cluster (rent returns when accounts close): 10 SOL.
+CLUSTER_DAILY_RENT_BUDGET_DEVNET = "10000000000"
+CLUSTER_DAILY_RENT_BUDGET_MAINNET = "10000000000"
+# v3 W11: cooldown after a registered retryable error, projects without an override (>= 100).
+RETRY_COOLDOWN_MS = "1000"
 CLUSTER_HOP_TIMEOUT_MS = "2000"
 REGISTRY_CACHE_MS = "60000"
 REGISTRY_MAX_STALE_MS = "600000"
