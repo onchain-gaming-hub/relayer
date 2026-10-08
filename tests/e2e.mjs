@@ -10,7 +10,7 @@ const MOCK = process.env.MOCK_URL || 'http://127.0.0.1:8899';
 const ORIGIN = 'http://localhost:5173';
 const PERSIST = process.env.PERSIST_DIR;
 const WRANGLER_LOG = process.env.WRANGLER_LOG;
-const { PK_A, PK_B, PK_M, PK_X, PK_Y, PK_C, PK_D, PK_G, PK_H, TESTKIT, NOVERIFY, PINX } = process.env;
+const { PK_A, PK_B, PK_M, PK_X, PK_Y, PK_C, PK_D, PK_G, PK_H, PK_S, PK_U, TESTKIT, NOVERIFY, PINX } = process.env;
 const ORIGIN_G = 'http://localhost:5181';
 const SYSTEM = '11111111111111111111111111111111';
 const ORIGIN_B = 'http://localhost:5174';
@@ -22,6 +22,14 @@ const BLOCKHASH = '11111111111111111111111111111111';
 const results = [];
 const check = (id, ok, detail = '') => { results.push({ id, ok, detail }); console.log(`${ok ? 'PASS' : 'FAIL'} ${id} ${detail}`); };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+/** Base58 (Bitcoin alphabet), as the RPC's memcmp `bytes`. */
+function bs58(buf) {
+  const ALPHA = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+  let n = BigInt('0x' + (buf.toString('hex') || '0')), out = '';
+  while (n > 0n) { out = ALPHA[Number(n % 58n)] + out; n /= 58n; }
+  for (const b of buf) { if (b !== 0) break; out = '1' + out; }
+  return out;
+}
 let seedN = 0;
 // Distinct wallets per suite (D2 reuses D's state, so it needs its own range).
 const SEED_BASE = SUITE === 'D2' ? 3000 : SUITE.charCodeAt(0) * 16;
@@ -799,10 +807,109 @@ async function suiteF() {
   check('sendTransaction only for the 10 relayed program txs + 1 memo + 2 preflight-retryable', sends === 13, `sends=${sends}`);
 }
 
+async function suiteS() {
+  // Cron sweep (spec v3 W13, §5) — V3-11. client-s: testkit Room close, ≤ 2 simulations per run.
+  const RENT = 1_398_960, FEE = 5_000;
+  const keys = [0, 1, 2].map(() => execFileSync('./target/debug/examples/genkey').toString().trim().split(/\s+/)[1]);
+  const [A, B, C] = [...keys].sort();
+  const bal = (pre, post, extra = {}) => ({ err: null, fee: FEE, preBalances: [pre, RENT], postBalances: [post, 0],
+    innerInstructions: [], accounts: [null], ...extra });
+  await setState({
+    programs: { [TESTKIT]: { slot: 1 }, [PINX]: { slot: 6 }, [NOVERIFY]: { slot: 7 } },
+    gpa: { [TESTKIT]: [C, A, B], [PINX]: [A] },
+    simByAddr: {
+      [A]: bal(5_000_000_000, 5_000_000_000 + RENT - FEE), // closable
+      [B]: { ...bal(5_000_000_000, 5_000_000_000 - FEE), err: { InstructionError: [0, { Custom: 6001 }] }, accounts: null, innerInstructions: null }, // too early
+      [C]: bal(5_000_000_000, 5_000_000_000 - FEE), // "closes" but no rent comes back
+    },
+  });
+  const tick = () => request('/__scheduled?cron=*%2F5+*+*+*+*', { method: 'GET' });
+  const delta = async (fn) => {
+    const s0 = await stats();
+    await fn();
+    const s1 = await stats();
+    return { gpa: s1.gpaPrograms.slice(s0.gpaPrograms.length), sims: s1.simulatedAddrs.slice(s0.simulatedAddrs.length),
+      sent: s1.sentTxs.slice(s0.sentTxs.length), s1 };
+  };
+
+  let d = await delta(tick);
+  check('V3-11 run 1: list, sorted, first 2 simulated (max_simulations_per_run)', d.sims.join() === [A, B].join(), JSON.stringify(d.sims));
+  check('V3-11 run 1: only the closable account is sent', d.sent.length === 1, `sent=${d.sent.length}`);
+  check('W13 sweep tx has exactly one signature (fee payer)', Buffer.from(d.sent[0] ?? '', 'base64')[0] === 1, `first byte ${Buffer.from(d.sent[0] ?? '', 'base64')[0]}`);
+  const gpaTk = [...(d.s1.gpaCalls ?? [])].reverse().find((c) => c.program === TESTKIT)?.cfg;
+  const f = gpaTk?.filters ?? [];
+  check('W13 getProgramAccounts: memcmp(0, Room disc) + memcmp(8, fee payer) + empty dataSlice',
+    f[0]?.memcmp?.offset === 0 && f[0]?.memcmp?.bytes === bs58(Buffer.from('9cc7431bde17b95e', 'hex')) && f[1]?.memcmp?.offset === 8
+    && f[1]?.memcmp?.bytes === PK_S && gpaTk?.dataSlice?.length === 0, JSON.stringify(gpaTk));
+  check('W6 sweep skipped for a project whose pinned program changed (no getProgramAccounts)',
+    !d.gpa.includes(PINX) && /sweep: skip client-t \(program_changed\)/.test(fs.readFileSync(WRANGLER_LOG, 'utf8')), JSON.stringify(d.gpa));
+
+  d = await delta(tick);
+  check('V3-11 run 2: resumes after the cursor (the tail), no rent back → not sent', d.sims.join() === C && d.sent.length === 0,
+    `sims=${JSON.stringify(d.sims)} sent=${d.sent.length}`);
+  d = await delta(tick);
+  check('V3-11 run 3: cursor wrapped to the head of the list', d.sims.join() === [A, B].join() && d.sent.length === 1, `sims=${JSON.stringify(d.sims)} sent=${d.sent.length}`);
+  check('W13 minimum rent(0) fetched once and cached', d.s1.getMinimumBalanceForRentExemption === 1, `calls=${d.s1.getMinimumBalanceForRentExemption}`);
+
+  // Overlapping runs: the second finds the first in flight and does nothing.
+  await setState({ gpaDelayMs: 1500 });
+  d = await delta(() => Promise.all([tick(), sleep(200).then(tick)]));
+  await setState({ gpaDelayMs: 0 });
+  check('V3-11 overlapping cron runs: the second is skipped', d.gpa.filter((p) => p === TESTKIT).length === 1, JSON.stringify(d.gpa));
+
+  // Expired blockhash in simulation: refresh once and retry the same address (not a skip).
+  await setState({ simOnce: { [A]: { err: 'BlockhashNotFound', accounts: null, innerInstructions: null } } });
+  d = await delta(tick);
+  const s0bh = d.s1.getLatestBlockhash;
+  check('W13 BlockhashNotFound in simulation: fresh blockhash, same address retried and sent',
+    d.sims.join() === [A, A].join() && d.sent.length === 1, `sims=${JSON.stringify(d.sims)} sent=${d.sent.length} bh=${s0bh}`);
+  // A simulate RPC failure advances the cursor (a broken address cannot pin it).
+  await setState({ simOnce: { [B]: { __rpcError: true } } });
+  d = await delta(tick);
+  check('W13 simulate RPC error: cursor moves on to the next address', d.sims.join() === [B, C].join() && d.sent.length === 0, `sims=${JSON.stringify(d.sims)}`);
+
+  // client-u (program NOVERIFY, fee budget = one 5000 send): rejected sends refund, then budget stops the run.
+  const U = [0, 1, 2].map(() => execFileSync('./target/debug/examples/genkey').toString().trim().split(/\s+/)[1]).sort();
+  const okU = bal(5_000_000_000, 5_000_000_000 + RENT - FEE);
+  await setState({
+    gpa: { [TESTKIT]: [], [PINX]: [A], [NOVERIFY]: [U[2], U[0], U[1]] },
+    simByAddr: {
+      [U[0]]: bal(5_000_000_000, 5_000_000_000 + RENT - FEE - 1_000_000, { innerInstructions: [{ index: 0, instructions: [
+        { program: 'system', programId: '11111111111111111111111111111111', parsed: { type: 'transfer', info: { source: PK_U, destination: A, lamports: 1_000_000 } }, stackHeight: 2 }] }] }),
+      [U[1]]: okU, [U[2]]: okU,
+    },
+    send: 'reject',
+  });
+  d = await delta(tick);
+  check('W13 run with rejected sends: both closable addresses reach send (the first refund freed the 5000 budget)',
+    d.sims.join() === U.join() && d.sent.length === 2, `sims=${d.sims.length} sent=${d.sent.length}`);
+  await setState({ send: 'ok' });
+  d = await delta(tick);
+  check('W13 fee budget exhausted: one send, then the run stops before the next send', d.sent.length === 1 && d.sims.join() === U.join(),
+    `sims=${d.sims.length} sent=${d.sent.length}`);
+  check('W13 budget stop reported', /sweep client-u: .*"stopped":"budget: project_budget fee"/.test(fs.readFileSync(WRANGLER_LOG, 'utf8')), 'no stop line in the log');
+  await sleep(500);
+  const rowsU = d1Query(`SELECT status, reason, cost_lamports AS c, wallet_address AS w FROM relay_log WHERE aud = 'client-u' ORDER BY id`);
+  check('W13 §4.3 rule 3 in a sweep: fee payer transfer to a non-program account → sweep_rejected, not sent',
+    rowsU.filter((x) => x.w === U[0]).every((x) => x.status === 'rpc_error' && /^sweep_rejected: transfer/.test(x.reason) && x.c === 0)
+    && rowsU.some((x) => x.w === U[0]), JSON.stringify(rowsU).slice(0, 500));
+  check('W13 audit: rejected sends logged with cost 0, the landed one with 5000',
+    rowsU.filter((x) => /^sweep rejected/.test(x.reason ?? '')).length === 2 && rowsU.filter((x) => /^sweep rejected/.test(x.reason ?? '')).every((x) => x.c === 0)
+    && rowsU.filter((x) => x.status === 'sweep').length === 1 && rowsU.find((x) => x.status === 'sweep').c === FEE, JSON.stringify(rowsU).slice(0, 500));
+
+  await sleep(500);
+  const rows = d1Query(`SELECT status, reason, rent_lamports AS r, cost_lamports AS c, wallet_address AS w FROM relay_log WHERE aud = 'client-s' ORDER BY id`);
+  const sweeps = rows.filter((x) => x.status === 'sweep');
+  check('W13 audit: each send logged as status sweep with the rent returned', sweeps.length >= 2 && sweeps.every((x) => x.r === RENT && x.c === FEE && x.w === A),
+    JSON.stringify(rows).slice(0, 400));
+  check('W13 audit: rent that did not come back logged as sweep_rejected', rows.some((x) => x.status === 'rpc_error' && x.w === C && /^sweep_rejected: rent did not come back/.test(x.reason)),
+    JSON.stringify(rows).slice(0, 400));
+}
+
 const info = await request('/relayer?project=test-client', { method: 'GET' });
 relayerPubkey = info.json?.pubkey;
 if (!relayerPubkey) { console.error('relayer not reachable', info); process.exit(2); }
-await { A: suiteA, B: suiteB, C: suiteC, D: suiteD, D2: suiteD2, E: suiteE, F: suiteF }[SUITE]();
+await { A: suiteA, B: suiteB, C: suiteC, D: suiteD, D2: suiteD2, E: suiteE, F: suiteF, S: suiteS }[SUITE]();
 const failed = results.filter((r) => !r.ok);
 console.log(`\nsuite ${SUITE}: ${results.length - failed.length}/${results.length} passed`);
 process.exit(failed.length ? 1 : 0);

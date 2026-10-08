@@ -7,6 +7,10 @@
 //                     the request with owner state.simOwner when absent; the string "$REQ0" becomes the
 //                     first requested address) · stats.lastSimulate = its params
 //   stats.lastSendSkipPreflight   `skipPreflight` of the last sendTransaction
+//   state.gpa         { programId: [addresses] } for getProgramAccounts (state.gpaDelayMs holds it)
+//   state.simByAddr   { address: value }: simulateTransaction by the first requested address (sweep)
+//   state.simOnce     same, used once then dropped; value { __rpcError: true } answers HTTP 500
+//   stats.gpaPrograms / stats.lastGpa / stats.simulatedAddrs / stats.sentTxs   what the relayer asked
 //   state.programs    { <programId>: { slot, authority? } } → getAccountInfo returns BPF Upgradeable layouts
 //   POST /__state     merge JSON into state · GET /__stats -> call counters
 import http from 'node:http';
@@ -19,8 +23,9 @@ const jwk = { ...publicKey.export({ format: 'jwk' }), kid: 'test-kid', use: 'sig
 const rsaJwk = { ...crypto.generateKeyPairSync('rsa', { modulusLength: 2048 }).publicKey.export({ format: 'jwk' }), kid: 'rsa-kid', use: 'sig', alg: 'RS256' };
 
 const state = { genesis: DEVNET, genesisMainnet: MAINNET, balances: {}, balance: 10_000_000_000, balanceMode: 'ok', balanceDelayMs: 0, jwksMode: 'ok', send: 'ok', delayMs: 0 };
-const stats = { sendTransaction: 0, getBalance: 0, getGenesisHash: 0, jwks: 0, sendMainnet: 0, simulateTransaction: 0, getAccountInfo: 0, lastSimulate: null, lastSendSkipPreflight: null };
-Object.assign(state, { simulate: null, simOwner: '11111111111111111111111111111111', programs: {} });
+const stats = { sendTransaction: 0, getBalance: 0, getGenesisHash: 0, jwks: 0, sendMainnet: 0, simulateTransaction: 0, getAccountInfo: 0, lastSimulate: null, lastSendSkipPreflight: null,
+  gpaPrograms: [], lastGpa: null, simulatedAddrs: [], sentTxs: [] };
+Object.assign(state, { simulate: null, simOwner: '11111111111111111111111111111111', programs: {}, gpa: {}, gpaDelayMs: 0, simByAddr: {}, simOnce: {} });
 
 // Minimal base58 (pubkeys only) for the fake ProgramData addresses.
 const B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
@@ -79,11 +84,29 @@ http.createServer(async (req, res) => {
     case 'simulateTransaction': {
       const addresses = rpc.params?.[1]?.accounts?.addresses ?? [];
       stats.lastSimulate = rpc.params?.[1];
+      stats.simulatedAddrs.push(addresses[0] ?? null);
+      if (addresses[0] && state.simOnce[addresses[0]]) {
+        const once = state.simOnce[addresses[0]];
+        delete state.simOnce[addresses[0]];
+        if (once.__rpcError) return json(res, 500, {});
+        return ok({ context: { slot: 1 }, value: structuredClone(once) });
+      }
+      if (addresses[0] && state.simByAddr[addresses[0]]) return ok({ context: { slot: 1 }, value: structuredClone(state.simByAddr[addresses[0]]) });
       const v = state.simulate ? JSON.parse(JSON.stringify(state.simulate).replaceAll('$REQ0', addresses[0] ?? '')) : {
         err: null, fee: 10000, preBalances: [10_000_000_000], postBalances: [9_999_990_000], innerInstructions: [] };
       if (!('accounts' in v)) v.accounts = addresses.map(() => ({ owner: state.simOwner, lamports: 1, data: ['', 'base64'] }));
       return ok({ context: { slot: 1 }, value: v });
     }
+    case 'getProgramAccounts': {
+      const [program, cfg] = rpc.params;
+      stats.gpaPrograms.push(program);
+      stats.lastGpa = cfg;
+      (stats.gpaCalls ??= []).push({ program, cfg });
+      if (state.gpaDelayMs) await new Promise((r) => setTimeout(r, state.gpaDelayMs));
+      return ok((state.gpa[program] ?? []).map((pubkey) => ({ pubkey, account: { data: ['', 'base64'], lamports: 1, owner: program } })));
+    }
+    case 'getLatestBlockhash': return ok({ context: { slot: 1 }, value: { blockhash: state.genesis, lastValidBlockHeight: 1000 } });
+    case 'getMinimumBalanceForRentExemption': return ok(890_880);
     case 'getAccountInfo': {
       const [addr, cfg] = rpc.params;
       const len = cfg?.dataSlice?.length;
@@ -108,6 +131,7 @@ http.createServer(async (req, res) => {
       return ok({ context: { slot: 1 }, value: state.balances[rpc.params?.[0]] ?? state.balance });
     case 'sendTransaction': {
       if (mainnet) stats.sendMainnet++;
+      stats.sentTxs.push(rpc.params?.[0]);
       stats.lastSendSkipPreflight = rpc.params?.[1]?.skipPreflight ?? null;
       if (state.delayMs) await new Promise((r) => setTimeout(r, state.delayMs));
       switch (state.send) {

@@ -211,6 +211,69 @@ pub async fn simulate(
         .ok_or_else(|| "simulateTransaction: missing value".into())
 }
 
+/// `getProgramAccounts` with memcmp filters and an empty data slice (v3 §5 step 3; verified on
+/// Alchemy devnet, Phase 0 spike 0.3): only the addresses, as returned.
+pub async fn get_program_accounts(
+    url: &str,
+    timeout_ms: u64,
+    program: &str,
+    memcmp: &[(u64, String)],
+) -> Result<Vec<String>, String> {
+    let filters: Vec<Value> = memcmp
+        .iter()
+        .map(|(offset, bytes)| json!({ "memcmp": { "offset": offset, "bytes": bytes } }))
+        .collect();
+    let cfg = json!({
+        "encoding": "base64",
+        "commitment": "confirmed",
+        "dataSlice": { "offset": 0, "length": 0 },
+        "filters": filters,
+    });
+    let r = call_result(url, timeout_ms, "getProgramAccounts", json!([program, cfg])).await?;
+    r.as_array()
+        .ok_or("getProgramAccounts: bad result")?
+        .iter()
+        .map(|a| {
+            a.get("pubkey")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| "getProgramAccounts: missing pubkey".to_string())
+        })
+        .collect()
+}
+
+pub async fn get_latest_blockhash(url: &str, timeout_ms: u64) -> Result<String, String> {
+    let r = call_result(
+        url,
+        timeout_ms,
+        "getLatestBlockhash",
+        json!([{ "commitment": "confirmed" }]),
+    )
+    .await?;
+    r.get("value")
+        .and_then(|v| v.get("blockhash"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| "getLatestBlockhash: bad result".into())
+}
+
+/// Rent-exempt minimum for `size` bytes, from the cluster (never a hardcoded rate).
+pub async fn get_minimum_balance_for_rent_exemption(
+    url: &str,
+    timeout_ms: u64,
+    size: u64,
+) -> Result<u64, String> {
+    let r = call_result(
+        url,
+        timeout_ms,
+        "getMinimumBalanceForRentExemption",
+        json!([size, { "commitment": "confirmed" }]),
+    )
+    .await?;
+    r.as_u64()
+        .ok_or_else(|| "getMinimumBalanceForRentExemption: bad result".into())
+}
+
 /// `getAccountInfo` → `(owner, data)`; `None` when the account does not exist.
 pub async fn get_account(
     url: &str,

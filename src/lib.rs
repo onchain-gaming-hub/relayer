@@ -18,6 +18,8 @@ mod program_policy;
 mod project_throttle;
 mod registry;
 mod rpc;
+mod sweep;
+mod sweep_controller;
 mod user_controller;
 mod window;
 
@@ -44,6 +46,7 @@ use registry::{Project, Snapshot, Status};
 
 pub use cluster_throttle::ClusterThrottle;
 pub use project_throttle::ProjectThrottle;
+pub use sweep_controller::SweepController;
 pub use user_controller::UserController;
 
 pub mod txcore {
@@ -161,7 +164,9 @@ async fn ensure_pins(
 }
 
 /// Writable, non-signer static keys: the accounts whose post-state §4.3 needs.
-fn writable_unsigned_keys(tx: &solana_transaction::versioned::VersionedTransaction) -> Vec<Pubkey> {
+pub(crate) fn writable_unsigned_keys(
+    tx: &solana_transaction::versioned::VersionedTransaction,
+) -> Vec<Pubkey> {
     let h = tx.message.header();
     let keys = tx.message.static_account_keys();
     let start = h.num_required_signatures as usize;
@@ -175,18 +180,25 @@ fn writable_unsigned_keys(tx: &solana_transaction::versioned::VersionedTransacti
 
 /// The project's fee payer from `FEE_PAYER_<SLUG>`; must match `fee_payer_pubkey` in D1 (V3).
 fn fee_payer(env: &Env, project: &Project) -> std::result::Result<Keypair, ApiError> {
-    let cached = FEE_PAYERS.with(|c| c.borrow().get(&project.slug).map(Keypair::insecure_clone));
+    fee_payer_key(env, &project.slug, &project.aud, &project.fee_payer)
+}
+
+/// Same, from the parts a Durable Object receives in its job (the cron sweep signs too).
+pub(crate) fn fee_payer_key(
+    env: &Env,
+    slug: &str,
+    aud: &str,
+    expected: &Pubkey,
+) -> std::result::Result<Keypair, ApiError> {
+    let cached = FEE_PAYERS.with(|c| c.borrow().get(slug).map(Keypair::insecure_clone));
     let kp = match cached {
         Some(kp) => kp,
         None => {
             // Re-validate before building a binding name from registry data (V3).
-            if !registry::valid_slug(&project.slug) {
-                return Err(ApiError::config(format!(
-                    "project {}: bad slug",
-                    project.aud
-                )));
+            if !registry::valid_slug(slug) {
+                return Err(ApiError::config(format!("project {aud}: bad slug")));
             }
-            let name = format!("FEE_PAYER_{}", project.slug);
+            let name = format!("FEE_PAYER_{slug}");
             // Secret and Var are the same binding type at runtime: the code cannot tell a
             // `[vars]` value from a secret, so keys must never be put in wrangler.toml.
             let secret = env
@@ -195,17 +207,13 @@ fn fee_payer(env: &Env, project: &Project) -> std::result::Result<Keypair, ApiEr
                 .map_err(|_| ApiError::config(format!("missing {name}")))?;
             let kp = Keypair::try_from_base58_string(secret.trim())
                 .map_err(|_| ApiError::config(format!("{name} is not a valid base58 keypair")))?;
-            FEE_PAYERS.with(|c| {
-                c.borrow_mut()
-                    .insert(project.slug.clone(), kp.insecure_clone())
-            });
+            FEE_PAYERS.with(|c| c.borrow_mut().insert(slug.to_string(), kp.insecure_clone()));
             kp
         }
     };
-    if kp.pubkey() != project.fee_payer {
+    if kp.pubkey() != *expected {
         return Err(ApiError::config(format!(
-            "project {}: FEE_PAYER_{} does not match fee_payer_pubkey",
-            project.aud, project.slug
+            "project {aud}: FEE_PAYER_{slug} does not match fee_payer_pubkey"
         )));
     }
     Ok(kp)
@@ -781,6 +789,99 @@ async fn load_jwks(
             }
         }
     }
+}
+
+/// Cron sweep (spec v3 W13, §5): hand each active project with sweeps to its `SweepController`.
+/// The Worker only resolves the job (cluster gate, genesis, version pins); the DO does the work.
+#[event(scheduled)]
+pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
+    let cfg = match Config::from_env(&env) {
+        Ok(c) => c,
+        Err(e) => {
+            console_error!("sweep: config: {e}");
+            return;
+        }
+    };
+    let snap = match registry::snapshot(&env, &cfg, now_ms()).await {
+        Ok(s) => s,
+        Err(e) => {
+            console_error!("sweep: registry unavailable ({})", e.code);
+            return;
+        }
+    };
+    let mut runs = Vec::new();
+    for project in snap.active_projects() {
+        let Some(policy) = &project.program else {
+            continue;
+        };
+        let swept: Vec<_> = policy
+            .programs
+            .iter()
+            .filter(|p| !p.sweeps.is_empty())
+            .collect();
+        if swept.is_empty() {
+            continue;
+        }
+        if let Err(e) = project_gate(project, &snap, &cfg) {
+            console_log!("sweep: skip {} ({})", project.aud, e.code);
+            continue;
+        }
+        if let Err(e) = ensure_cluster(&env, &cfg, project.cluster).await {
+            console_error!("sweep: skip {} ({})", project.aud, e.code);
+            continue;
+        }
+        // W6: never sign for a program whose code changed since it was registered.
+        let pins: Vec<_> = swept
+            .iter()
+            .filter_map(|p| p.pin.map(|pin| (p.program_id, pin)))
+            .collect();
+        if let Err(e) = ensure_pins(&env, &cfg, project.cluster, &pins).await {
+            console_error!("sweep: skip {} ({})", project.aud, e.code);
+            continue;
+        }
+        let job = sweep::SweepJob {
+            aud: project.aud.clone(),
+            slug: project.slug.clone(),
+            cluster: project.cluster.as_str().into(),
+            fee_payer: project.fee_payer.to_string(),
+            project_rpm: project.project_rpm,
+            project_daily_budget: project.project_daily_budget_lamports,
+            min_balance: project.min_balance_lamports,
+            registered: policy
+                .programs
+                .iter()
+                .map(|p| p.program_id.to_string())
+                .collect(),
+            sweeps: swept
+                .iter()
+                .flat_map(|p| {
+                    p.sweeps
+                        .iter()
+                        .map(|r| sweep::SweepSpec::from_rule(&p.program_id, r))
+                })
+                .collect(),
+        };
+        runs.push(dispatch_sweep(&env, job));
+    }
+    for result in futures_util::future::join_all(runs).await {
+        match result {
+            Ok((aud, report)) => console_log!("sweep {aud}: {report}"),
+            Err(e) => console_error!("sweep dispatch failed: {e}"),
+        }
+    }
+}
+
+async fn dispatch_sweep(env: &Env, job: sweep::SweepJob) -> Result<(String, String)> {
+    let stub = env
+        .durable_object("SWEEP_CONTROLLER")?
+        .id_from_name(&job.aud)?
+        .get_stub()?;
+    let body = serde_json::to_string(&job).map_err(|e| Error::RustError(e.to_string()))?;
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post).with_body(Some(body.into()));
+    let req = Request::new_with_init("https://sweep/run", &init)?;
+    let mut resp = stub.fetch_with_request(req).await?;
+    Ok((job.aud, resp.text().await?))
 }
 
 /// Lazy per-isolate cluster guard (V5): the RPC of each cluster must report that cluster's

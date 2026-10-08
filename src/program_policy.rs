@@ -298,6 +298,26 @@ fn parse_sweep(v: &Value, program: &str) -> Result<SweepRule, String> {
     if swept != 1 {
         return Err(format!("{w}: exactly one swept account required"));
     }
+    // The rent comes back to the fee payer (the close target) and the swept account is closed:
+    // both must be writable, and the fee payer appears exactly once.
+    let fee_payers: Vec<_> = accounts
+        .iter()
+        .filter_map(|a| match a {
+            SweepAccount::FeePayer { writable } => Some(*writable),
+            _ => None,
+        })
+        .collect();
+    if fee_payers != [true] {
+        return Err(format!(
+            "{w}: exactly one writable fee_payer account required"
+        ));
+    }
+    if !accounts
+        .iter()
+        .any(|a| matches!(a, SweepAccount::Swept { writable: true }))
+    {
+        return Err(format!("{w}: the swept account must be writable"));
+    }
     Ok(SweepRule {
         account_discriminator: hex_bytes(
             v.get("account_discriminator"),
@@ -398,6 +418,10 @@ pub fn parse_program(v: &Value) -> Result<ProgramRule, String> {
             .collect::<Result<_, _>>()?,
         Some(_) => return Err(format!("{p}.sweeps: array required")),
     };
+    // The sweep signs and pays for txs no user asked for: same W6 bar as a payer slot.
+    if !sweeps.is_empty() && pin.is_none() {
+        return Err(format!("{p}: sweeps require deploy_slot or immutable (W6)"));
+    }
     Ok(ProgramRule {
         program_id,
         pin,
@@ -968,6 +992,25 @@ mod tests {
         assert!(with(&|v| v["instructions"] = json!([])).is_err());
         assert!(with(&|v| v["sweeps"] = json!([{ "name":"s","account_discriminator":"0102","rent_payer_offset":40,"ix_discriminator":"0304","accounts":[{"kind":"fee_payer","writable":true}],"max_sends_per_run":5,"max_simulations_per_run":10 }])).is_err(), "sweep needs a swept account");
         assert!(with(&|v| v["sweeps"] = json!([{ "name":"s","account_discriminator":"0102","rent_payer_offset":40,"ix_discriminator":"0304","accounts":[{"kind":"swept","writable":true},{"kind":"fee_payer","writable":true}],"max_sends_per_run":5,"max_simulations_per_run":10 }])).is_ok());
+        let sweep = |accounts: Value| json!([{ "name":"s","account_discriminator":"0102","rent_payer_offset":8,"ix_discriminator":"0304","accounts":accounts,"max_sends_per_run":5,"max_simulations_per_run":10 }]);
+        let err = |accounts: Value| with(&|v| v["sweeps"] = sweep(accounts.clone())).unwrap_err();
+        assert!(err(json!([{"kind":"swept","writable":true}])).contains("fee_payer"));
+        assert!(
+            err(json!([{"kind":"swept","writable":true},{"kind":"fee_payer","writable":false}]))
+                .contains("fee_payer")
+        );
+        assert!(err(json!([{"kind":"swept","writable":true},{"kind":"fee_payer","writable":true},{"kind":"fee_payer","writable":true}])).contains("fee_payer"));
+        assert!(
+            err(json!([{"kind":"swept","writable":false},{"kind":"fee_payer","writable":true}]))
+                .contains("swept account must be writable")
+        );
+        // Unpinned program with a sweep (no payer slot, verify on): still needs a pin.
+        let mut v = policy_json();
+        v["sweeps"] =
+            sweep(json!([{"kind":"swept","writable":true},{"kind":"fee_payer","writable":true}]));
+        v.as_object_mut().unwrap().remove("deploy_slot");
+        v["instructions"] = json!([{ "name": "noop", "discriminator": "0909090909090909", "min_accounts": 0, "max_accounts": 1, "max_data_len": 8 }]);
+        assert!(parse_program(&v).unwrap_err().contains("sweeps require"));
     }
 
     #[test]

@@ -33,6 +33,7 @@ bindings = [
   { name = "USER_CONTROLLER", class_name = "UserController" },
   { name = "PROJECT_THROTTLE", class_name = "ProjectThrottle" },
   { name = "CLUSTER_THROTTLE", class_name = "ClusterThrottle" },
+  { name = "SWEEP_CONTROLLER", class_name = "SweepController" },
 ]
 
 # The v1 POC never reached a remote deploy (local `wrangler dev` only), so the first remote
@@ -40,6 +41,15 @@ bindings = [
 [[migrations]]
 tag = "v2"
 new_sqlite_classes = ["UserController", "ProjectThrottle", "ClusterThrottle"]
+
+# v3 Phase 4: cron sweep (W13), one SweepController per project.
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["SweepController"]
+
+# v3 W13 §5: the sweep runs every 5 minutes for active projects whose policy has `sweeps`.
+[triggers]
+crons = ["*/5 * * * *"]
 
 [[d1_databases]]
 binding = "DB"

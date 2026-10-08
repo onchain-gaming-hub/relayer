@@ -336,6 +336,14 @@ impl Snapshot {
         }
     }
 
+    /// Projects that parsed and are active (cron sweep, v3 W13).
+    pub fn active_projects(&self) -> impl Iterator<Item = &Project> {
+        self.projects
+            .values()
+            .filter_map(|p| p.as_ref().ok())
+            .filter(|p| p.status == Status::Active)
+    }
+
     pub fn project(&self, aud: &str) -> Option<&Result<Project, String>> {
         self.projects.get(aud)
     }

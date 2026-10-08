@@ -26,6 +26,9 @@ read -r SK_C PK_C <<<"$(./target/debug/examples/genkey)"
 read -r SK_D PK_D <<<"$(./target/debug/examples/genkey)"
 read -r SK_G PK_G <<<"$(./target/debug/examples/genkey)"
 read -r SK_H PK_H <<<"$(./target/debug/examples/genkey)"
+read -r SK_S PK_S <<<"$(./target/debug/examples/genkey)"
+read -r SK_T PK_T <<<"$(./target/debug/examples/genkey)"
+read -r SK_U PK_U <<<"$(./target/debug/examples/genkey)"
 read -r _ NOVERIFY <<<"$(./target/debug/examples/genkey)"   # program id: verify_inner_ix=false (W7)
 read -r _ PINX <<<"$(./target/debug/examples/genkey)"       # program id: pinned slot never matches (W6)
 read -r _ PK_X <<<"$(./target/debug/examples/genkey)"
@@ -42,13 +45,18 @@ COMMON=(
   --var "RPC_TIMEOUT_MS:2000"
   --var "FEE_PAYER_PA:$SK_A" --var "FEE_PAYER_PB:$SK_B" --var "FEE_PAYER_PM:$SK_M"
   --var "FEE_PAYER_PP:$SK_P" --var "FEE_PAYER_PY:$SK_Y"
-  --var "FEE_PAYER_PC:$SK_C" --var "FEE_PAYER_PD:$SK_D" --var "FEE_PAYER_PG:$SK_G" --var "FEE_PAYER_PH:$SK_H"
+  --var "FEE_PAYER_PC:$SK_C" --var "FEE_PAYER_PD:$SK_D" --var "FEE_PAYER_PG:$SK_G" --var "FEE_PAYER_PH:$SK_H" --var "FEE_PAYER_PS:$SK_S" --var "FEE_PAYER_PT:$SK_T" --var "FEE_PAYER_PU:$SK_U"
 )
 
 TESTKIT=Bh4GY79ytnEZ4t3ZGf7qUVooaSKYyC8sM1uJpiM2xdCW
 BIG_BUDGET=1000000000
 NOOP_IX='{"name":"noop","discriminator":"09b20d738123ed66","min_accounts":0,"max_accounts":1,"max_data_len":8}'
 PROGRAM_POLICY='{"actions":[{"type":"program","program_id":"'$TESTKIT'","deploy_slot":1,"retryable_errors":[6000],"instructions":[{"name":"create","discriminator":"181ec828051c0777","payer_index":1,"max_rent_lamports":1100000,"min_accounts":4,"max_accounts":4,"max_data_len":8},{"name":"close_thing","discriminator":"a75149fabad23e79","refund_index":2,"min_accounts":3,"max_accounts":3,"max_data_len":8},'$NOOP_IX']},{"type":"program","program_id":"'$NOVERIFY'","deploy_slot":7,"verify_inner_ix":false,"retryable_errors":[6000],"instructions":['$NOOP_IX']},{"type":"program","program_id":"'$PINX'","deploy_slot":5,"instructions":['$NOOP_IX']}],"limits":{"max_instructions":4,"max_cu":400000,"max_cu_price_micro_lamports":1000,"skip_preflight_after_verify":true}}'
+
+SWEEP_RULE='{"name":"close_room","account_discriminator":"9cc7431bde17b95e","rent_payer_offset":8,"ix_discriminator":"f1ed4afddfe936dc","accounts":[{"kind":"swept","writable":true},{"kind":"fee_payer","writable":true}],"max_sends_per_run":5,"max_simulations_per_run":2}'
+SWEEP_POLICY='{"actions":[{"type":"program","program_id":"'$TESTKIT'","deploy_slot":1,"instructions":['$NOOP_IX'],"sweeps":['$SWEEP_RULE']}]}'
+SWEEP_POLICY_U='{"actions":[{"type":"program","program_id":"'$NOVERIFY'","deploy_slot":7,"instructions":['$NOOP_IX'],"sweeps":['${SWEEP_RULE/\"max_simulations_per_run\":2/\"max_simulations_per_run\":10}']}]}'
+SWEEP_POLICY_PINX='{"actions":[{"type":"program","program_id":"'$PINX'","deploy_slot":5,"instructions":['$NOOP_IX'],"sweeps":['$SWEEP_RULE']}]}'
 
 # seed <rpm_a> <rpm_b> <mainnet_enabled> <quota_a> <budget_a> <budget_cd> <budget_b>
 seed() {
@@ -75,6 +83,11 @@ seed() {
     # W9 accounting: fee budget = 3 noop fees, rent budget = one declared create.
     row client-h PH active devnet sapphire_devnet http://localhost:5182 "$PK_H" 1000 100 30000 "$PROGRAM_POLICY"
     echo "UPDATE projects SET project_daily_rent_budget_lamports = 1100000 WHERE aud = 'client-h';"
+    # v3 W13 cron sweep: testkit Room close (2 simulations / run), and one on a program whose pin never matches.
+    row client-s PS active devnet sapphire_devnet http://localhost:5183 "$PK_S" 1000 100 "$BIG_BUDGET" "$SWEEP_POLICY"
+    row client-t PT active devnet sapphire_devnet http://localhost:5184 "$PK_T" 1000 100 "$BIG_BUDGET" "$SWEEP_POLICY_PINX"
+    # Fee budget = one sweep send (5000): refund on rejected sends, budget stop.
+    row client-u PU active devnet sapphire_devnet http://localhost:5185 "$PK_U" 1000 100 5000 "$SWEEP_POLICY_U"
     echo "INSERT INTO settings (key, value) VALUES ('mainnet_enabled', '$3');"
   } > "$WORK/seed.sql"
 }
@@ -97,19 +110,19 @@ run_suite() {
   until grep -qE "Ready on|ERROR" "$log"; do sleep 0.3; done
   local rc=0
   PERSIST_DIR="$persist" WRANGLER_LOG="$log" RELAYER_URL="http://127.0.0.1:$PORT" MOCK_URL="$MOCK" \
-    PK_A="$PK_A" PK_B="$PK_B" PK_M="$PK_M" PK_X="$PK_X" PK_Y="$PK_Y" PK_C="$PK_C" PK_D="$PK_D" PK_G="$PK_G" PK_H="$PK_H" TESTKIT="$TESTKIT" NOVERIFY="$NOVERIFY" PINX="$PINX" \
+    PK_A="$PK_A" PK_B="$PK_B" PK_M="$PK_M" PK_X="$PK_X" PK_Y="$PK_Y" PK_C="$PK_C" PK_D="$PK_D" PK_G="$PK_G" PK_H="$PK_H" PK_S="$PK_S" PK_U="$PK_U" TESTKIT="$TESTKIT" NOVERIFY="$NOVERIFY" PINX="$PINX" \
     node tests/e2e.mjs "$suite" || rc=$?
   kill $pid 2>/dev/null; wait $pid 2>/dev/null || true
   # Reset mock behavior between suites.
   curl -s -X POST "$MOCK/__state" \
-    -d '{"genesis":"EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG","genesisMainnet":"5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d","balances":{},"balance":10000000000,"balanceMode":"ok","balanceDelayMs":0,"jwksMode":"ok","send":"ok","delayMs":0,"simulate":null,"simOwner":"11111111111111111111111111111111","programs":{}}' >/dev/null
+    -d '{"genesis":"EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG","genesisMainnet":"5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d","balances":{},"balance":10000000000,"balanceMode":"ok","balanceDelayMs":0,"jwksMode":"ok","send":"ok","delayMs":0,"simulate":null,"simOwner":"11111111111111111111111111111111","programs":{},"gpa":{},"gpaDelayMs":0,"simByAddr":{},"simOnce":{}}' >/dev/null
   return $rc
 }
 
-# Usage: ./tests/run-e2e.sh [A] [B] [C] [D] [E] [F] [M]   (default: A–F; D also runs D2 = restart check)
+# Usage: ./tests/run-e2e.sh [A] [B] [C] [D] [E] [F] [S] [M]   (default: A–F + S; D also runs D2 = restart check)
 # M (v3 W9 counter migration): D on an older Worker checkout (OLD_WORKER_DIR, e.g. a git worktree
 #   of the previous commit), then D2 on this one over the same state: quota and budgets must hold.
-SUITES=${*:-A B C D E F}
+SUITES=${*:-A B C D E F S}
 BIG=1000000000
 status=0
 for s in $SUITES; do
@@ -126,6 +139,8 @@ for s in $SUITES; do
        run_suite D D yes 1000 1000 false 2 30000 $BIG 40000 "${D_ARGS[@]}" || status=1
        run_suite D2 D no 0 0 0 0 0 0 0 "${D_ARGS[@]}" || status=1 ;;
     E) run_suite E E yes 1000 1000 false 100 $BIG 30000 $BIG --var COOLDOWN_MS:300 || status=1 ;;
+    # S: cron sweep (W13) through wrangler's /__scheduled.
+    S) run_suite S S yes 1000 1000 false 100 $BIG $BIG $BIG --test-scheduled || status=1 ;;
     M) [ -d "${OLD_WORKER_DIR:-}" ] || { echo "M needs OLD_WORKER_DIR"; status=1; continue; }
        D_ARGS=(--var COOLDOWN_MS:300 --var REJECT_COOLDOWN_MS:300 --var CLUSTER_DAILY_BUDGET_DEVNET:60000)
        WORKER_DIR="$OLD_WORKER_DIR" run_suite D M yes 1000 1000 false 2 30000 $BIG 40000 "${D_ARGS[@]}" || status=1
