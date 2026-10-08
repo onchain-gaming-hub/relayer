@@ -25,6 +25,8 @@ read -r SK_P PK_P <<<"$(./target/debug/examples/genkey)"
 read -r SK_C PK_C <<<"$(./target/debug/examples/genkey)"
 read -r SK_D PK_D <<<"$(./target/debug/examples/genkey)"
 read -r SK_G PK_G <<<"$(./target/debug/examples/genkey)"
+read -r _ NOVERIFY <<<"$(./target/debug/examples/genkey)"   # program id: verify_inner_ix=false (W7)
+read -r _ PINX <<<"$(./target/debug/examples/genkey)"       # program id: pinned slot never matches (W6)
 read -r _ PK_X <<<"$(./target/debug/examples/genkey)"
 read -r SK_Y _ <<<"$(./target/debug/examples/genkey)"
 read -r _ PK_Y <<<"$(./target/debug/examples/genkey)"
@@ -44,7 +46,8 @@ COMMON=(
 
 TESTKIT=Bh4GY79ytnEZ4t3ZGf7qUVooaSKYyC8sM1uJpiM2xdCW
 BIG_BUDGET=1000000000
-PROGRAM_POLICY='{"actions":[{"type":"program","program_id":"'$TESTKIT'","deploy_slot":1,"retryable_errors":[6000],"instructions":[{"name":"create","discriminator":"181ec828051c0777","payer_index":1,"max_rent_lamports":1100000,"min_accounts":4,"max_accounts":4,"max_data_len":8},{"name":"close_thing","discriminator":"a75149fabad23e79","refund_index":2,"min_accounts":3,"max_accounts":3,"max_data_len":8},{"name":"noop","discriminator":"09b20d738123ed66","min_accounts":0,"max_accounts":1,"max_data_len":8}]}],"limits":{"max_instructions":4,"max_cu":400000,"max_cu_price_micro_lamports":1000}}'
+NOOP_IX='{"name":"noop","discriminator":"09b20d738123ed66","min_accounts":0,"max_accounts":1,"max_data_len":8}'
+PROGRAM_POLICY='{"actions":[{"type":"program","program_id":"'$TESTKIT'","deploy_slot":1,"retryable_errors":[6000],"instructions":[{"name":"create","discriminator":"181ec828051c0777","payer_index":1,"max_rent_lamports":1100000,"min_accounts":4,"max_accounts":4,"max_data_len":8},{"name":"close_thing","discriminator":"a75149fabad23e79","refund_index":2,"min_accounts":3,"max_accounts":3,"max_data_len":8},'$NOOP_IX']},{"type":"program","program_id":"'$NOVERIFY'","deploy_slot":7,"verify_inner_ix":false,"instructions":['$NOOP_IX']},{"type":"program","program_id":"'$PINX'","deploy_slot":5,"instructions":['$NOOP_IX']}],"limits":{"max_instructions":4,"max_cu":400000,"max_cu_price_micro_lamports":1000}}'
 
 # seed <rpm_a> <rpm_b> <mainnet_enabled> <quota_a> <budget_a> <budget_cd> <budget_b>
 seed() {
@@ -86,12 +89,12 @@ run_suite() {
   until grep -qE "Ready on|ERROR" "$log"; do sleep 0.3; done
   local rc=0
   PERSIST_DIR="$persist" WRANGLER_LOG="$log" RELAYER_URL="http://127.0.0.1:$PORT" MOCK_URL="$MOCK" \
-    PK_A="$PK_A" PK_B="$PK_B" PK_M="$PK_M" PK_X="$PK_X" PK_Y="$PK_Y" PK_C="$PK_C" PK_D="$PK_D" PK_G="$PK_G" TESTKIT="$TESTKIT" \
+    PK_A="$PK_A" PK_B="$PK_B" PK_M="$PK_M" PK_X="$PK_X" PK_Y="$PK_Y" PK_C="$PK_C" PK_D="$PK_D" PK_G="$PK_G" TESTKIT="$TESTKIT" NOVERIFY="$NOVERIFY" PINX="$PINX" \
     node tests/e2e.mjs "$suite" || rc=$?
   kill $pid 2>/dev/null; wait $pid 2>/dev/null || true
   # Reset mock behavior between suites.
   curl -s -X POST "$MOCK/__state" \
-    -d '{"genesis":"EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG","genesisMainnet":"5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d","balances":{},"balance":10000000000,"balanceMode":"ok","balanceDelayMs":0,"jwksMode":"ok","send":"ok","delayMs":0}' >/dev/null
+    -d '{"genesis":"EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG","genesisMainnet":"5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d","balances":{},"balance":10000000000,"balanceMode":"ok","balanceDelayMs":0,"jwksMode":"ok","send":"ok","delayMs":0,"simulate":null,"simOwner":"11111111111111111111111111111111","programs":{}}' >/dev/null
   return $rc
 }
 

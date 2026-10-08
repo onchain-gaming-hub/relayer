@@ -32,6 +32,24 @@ struct Admit {
     min_balance: u64,
 }
 
+/// v3 program path, step 1 (W14): one RPM slot per call, before any RPC is touched.
+#[derive(Deserialize)]
+struct AdmitRpm {
+    cluster: String,
+    rpm: u32,
+}
+
+/// v3 program path, step 2 (W14): budget + balance, after simulation passed.
+#[derive(Deserialize)]
+struct AdmitBudget {
+    cluster: String,
+    /// fee + declared rent (rent shares the fee budget until v3 Phase 3 splits them).
+    cost: u64,
+    budget: u64,
+    fee_payer: String,
+    min_balance: u64,
+}
+
 #[derive(Deserialize)]
 struct Refund {
     cluster: String,
@@ -89,6 +107,14 @@ impl DurableObject for ProjectThrottle {
             "/admit" => match serde_json::from_value::<Admit>(body) {
                 Ok(a) => self.admit(a, &cfg, now).await,
                 Err(e) => Err(ApiError::internal(format!("admit body: {e}"))),
+            },
+            "/admit_rpm" => match serde_json::from_value::<AdmitRpm>(body) {
+                Ok(a) => self.admit_rpm(a, &cfg, now).await,
+                Err(e) => Err(ApiError::internal(format!("admit_rpm body: {e}"))),
+            },
+            "/admit_budget" => match serde_json::from_value::<AdmitBudget>(body) {
+                Ok(a) => self.admit_budget(a, &cfg, now).await,
+                Err(e) => Err(ApiError::internal(format!("admit_budget body: {e}"))),
             },
             "/refund" => match serde_json::from_value::<Refund>(body) {
                 Ok(r) => self.refund(r, &cfg).await,
@@ -185,6 +211,99 @@ impl ProjectThrottle {
             }
             // The cluster may have counted it: keep our slot too (fail-closed, R-v2-5).
             None => Err(ApiError::upstream("cluster admit timeout")),
+        }
+    }
+
+    async fn admit_rpm(
+        &self,
+        a: AdmitRpm,
+        cfg: &Config,
+        now: f64,
+    ) -> std::result::Result<Response, ApiError> {
+        let cluster =
+            Cluster::parse(&a.cluster).ok_or_else(|| ApiError::internal("bad cluster"))?;
+        if a.rpm == 0 {
+            return Err(ApiError::internal("project rpm 0"));
+        }
+        let window = self
+            .rpm
+            .take(a.rpm, now)
+            .map_err(ApiError::project_throttle)?;
+        let call = cluster_call(
+            &self.env,
+            "admit_rpm",
+            json!({ "cluster": cluster.as_str(), "cost": 0 }),
+        );
+        match rpc::with_timeout(call, cfg.cluster_hop_timeout_ms).await {
+            Some(Ok((200, body))) => {
+                let Some(cluster_window) = body.get("window").and_then(Value::as_f64) else {
+                    return Err(ApiError::upstream("cluster admit_rpm: missing window"));
+                };
+                Response::from_json(&json!({ "window": window, "cluster_window": cluster_window }))
+                    .map_err(|e| ApiError::internal(e.to_string()))
+            }
+            Some(Ok((status, body))) => {
+                self.rpm.release(window);
+                Err(ApiError::relayed(status, &body))
+            }
+            Some(Err(e)) => {
+                self.rpm.release(window);
+                Err(ApiError::upstream(format!("cluster admit_rpm: {e}")))
+            }
+            // The cluster may have counted it: keep ours (fail-closed, R-v2-5).
+            None => Err(ApiError::upstream("cluster admit_rpm timeout")),
+        }
+    }
+
+    async fn admit_budget(
+        &self,
+        a: AdmitBudget,
+        cfg: &Config,
+        now: f64,
+    ) -> std::result::Result<Response, ApiError> {
+        let cluster =
+            Cluster::parse(&a.cluster).ok_or_else(|| ApiError::internal("bad cluster"))?;
+        let url = rpc_url(&self.env, cluster).map_err(ApiError::config)?;
+        let day = daily::day_of(now);
+        let cost = lamports(a.cost);
+        match daily::try_add(&self.state.storage().sql(), day, cost, lamports(a.budget)) {
+            Ok(Some(_)) => {}
+            Ok(None) => return Err(ApiError::project_budget(daily::ms_until_next_day(now))),
+            Err(e) => return Err(ApiError::internal(format!("project budget: {e}"))),
+        }
+        match self.balance(&a.fee_payer, &url, cfg, now).await {
+            Err(e) => {
+                self.refund_budget(day, cost);
+                return Err(ApiError::upstream(e));
+            }
+            Ok(balance) if balance < a.min_balance => {
+                self.refund_budget(day, cost);
+                return Err(ApiError::low_balance());
+            }
+            Ok(_) => {}
+        }
+        let call = cluster_call(
+            &self.env,
+            "admit_budget",
+            json!({ "cluster": cluster.as_str(), "cost": a.cost }),
+        );
+        match rpc::with_timeout(call, cfg.cluster_hop_timeout_ms).await {
+            Some(Ok((200, body))) => {
+                let Some(cluster_day) = body.get("day").and_then(Value::as_i64) else {
+                    return Err(ApiError::upstream("cluster admit_budget: missing day"));
+                };
+                Response::from_json(&json!({ "day": day, "cluster_day": cluster_day }))
+                    .map_err(|e| ApiError::internal(e.to_string()))
+            }
+            Some(Ok((status, body))) => {
+                self.refund_budget(day, cost);
+                Err(ApiError::relayed(status, &body))
+            }
+            Some(Err(e)) => {
+                self.refund_budget(day, cost);
+                Err(ApiError::upstream(format!("cluster admit_budget: {e}")))
+            }
+            None => Err(ApiError::upstream("cluster admit_budget timeout")),
         }
     }
 

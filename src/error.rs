@@ -95,12 +95,32 @@ impl ApiError {
         Self::new(503, "cluster_budget", "relayer daily budget exhausted")
             .with_retry_after(retry_after_ms)
     }
-    /// Program actions pass policy but are not relayed yet (v3 Phase 1: no simulation / pin).
-    pub fn program_actions_disabled() -> Self {
+    /// The program failed in simulation (v3 §4.2): nothing was sent; backoff like a reject.
+    pub fn simulation_failed(reason: impl Into<String>, retry_after_ms: f64) -> Self {
+        Self::new(
+            400,
+            "simulation_failed",
+            "the transaction failed in simulation",
+        )
+        .with_reason(reason)
+        .with_retry_after(retry_after_ms)
+    }
+    /// The simulation shows the fee payer used in a way §4.3 forbids (logged in full).
+    pub fn inner_ix_rejected(reason: impl Into<String>, retry_after_ms: f64) -> Self {
+        Self::new(
+            400,
+            "inner_ix_rejected",
+            "the transaction uses the relayer in a way that is not allowed",
+        )
+        .with_reason(reason)
+        .with_retry_after(retry_after_ms)
+    }
+    /// The program's on-chain version differs from the registered pin (v3 W6).
+    pub fn program_changed() -> Self {
         Self::new(
             503,
-            "program_actions_disabled",
-            "program actions are not enabled on this relayer yet",
+            "program_changed",
+            "the program changed since it was registered",
         )
     }
     pub fn project_paused() -> Self {

@@ -10,7 +10,9 @@ mod cluster_throttle;
 mod config;
 mod daily;
 mod error;
+mod inner_ix;
 mod jwt;
+mod pin;
 mod policy;
 mod program_policy;
 mod project_throttle;
@@ -89,6 +91,73 @@ thread_local! {
     /// Fee payer keypairs by project slug (secrets do not change within an isolate).
     static FEE_PAYERS: RefCell<HashMap<String, Keypair>> = RefCell::new(HashMap::new());
     static CLUSTERS_CONFIRMED: RefCell<HashSet<Cluster>> = RefCell::new(HashSet::new());
+    /// Version pins (v3 W6): program → (ProgramData slot, upgrade authority, fetched_at).
+    static PINS: RefCell<HashMap<Pubkey, PinState>> = RefCell::new(HashMap::new());
+}
+
+const PIN_CACHE_MS: f64 = 60_000.0;
+/// (ProgramData slot, upgrade authority, fetched_at).
+type PinState = (u64, Option<Pubkey>, f64);
+
+/// Every pinned program in the tx must match its registered version (W6): 503
+/// `program_changed` otherwise. Cached 60 s per isolate; RPC failures are not cached.
+async fn ensure_pins(
+    env: &Env,
+    cfg: &Config,
+    cluster: Cluster,
+    pins: &[(Pubkey, program_policy::Pin)],
+) -> std::result::Result<(), ApiError> {
+    for (program, pin) in pins {
+        let cached = PINS.with(|c| c.borrow().get(program).copied());
+        let (slot, authority) = match cached {
+            Some((slot, auth, at)) if now_ms() - at < PIN_CACHE_MS => (slot, auth),
+            _ => {
+                let url = config::rpc_url(env, cluster).map_err(ApiError::config)?;
+                let (owner, data) =
+                    rpc::get_account(&url, cfg.rpc_timeout_ms, &program.to_string(), Some(36))
+                        .await
+                        .map_err(ApiError::upstream)?
+                        .ok_or_else(|| {
+                            ApiError::config(format!("program {program} not found on chain"))
+                        })?;
+                let owner: Pubkey = owner.parse().map_err(|_| ApiError::upstream("bad owner"))?;
+                let pd = pin::programdata_address(&owner, &data)
+                    .map_err(|e| ApiError::config(format!("program {program}: {e}")))?;
+                let (owner, data) =
+                    rpc::get_account(&url, cfg.rpc_timeout_ms, &pd.to_string(), Some(45))
+                        .await
+                        .map_err(ApiError::upstream)?
+                        .ok_or_else(|| {
+                            ApiError::config(format!("programdata of {program} not found"))
+                        })?;
+                let owner: Pubkey = owner.parse().map_err(|_| ApiError::upstream("bad owner"))?;
+                let (slot, auth) = pin::programdata_state(&owner, &data)
+                    .map_err(|e| ApiError::config(format!("program {program}: {e}")))?;
+                PINS.with(|c| c.borrow_mut().insert(*program, (slot, auth, now_ms())));
+                (slot, auth)
+            }
+        };
+        if !pin::matches(*pin, slot, authority) {
+            console_error!(
+                "program {program} changed: pin {pin:?}, on-chain slot {slot}, authority {authority:?}"
+            );
+            return Err(ApiError::program_changed());
+        }
+    }
+    Ok(())
+}
+
+/// Writable, non-signer static keys: the accounts whose post-state §4.3 needs.
+fn writable_unsigned_keys(tx: &solana_transaction::versioned::VersionedTransaction) -> Vec<Pubkey> {
+    let h = tx.message.header();
+    let keys = tx.message.static_account_keys();
+    let start = h.num_required_signatures as usize;
+    let end = keys
+        .len()
+        .saturating_sub(h.num_readonly_unsigned_accounts as usize);
+    keys.get(start..end)
+        .map(<[Pubkey]>::to_vec)
+        .unwrap_or_default()
 }
 
 /// The project's fee payer from `FEE_PAYER_<SLUG>`; must match `fee_payer_pubkey` in D1 (V3).
@@ -271,12 +340,12 @@ struct RelayBody {
     transaction: String,
 }
 
-/// Program action (spec v3): structural → identity → project policy + declared cost.
-/// Phase 1 stops here with 503: simulation + inner-ix verification (§4.3) and version pinning
-/// (W6) arrive in Phase 2, and no program tx may be co-signed before they exist.
+/// Program action (spec v3): structural → allowlist → identity → project policy + declared
+/// cost → version pin (W6) → co-sign → UserController (RPM → simulate + verify → budget → send).
 async fn handle_program_tx(
-    tx: &solana_transaction::versioned::VersionedTransaction,
+    tx: &mut solana_transaction::versioned::VersionedTransaction,
     token: &str,
+    env: &Env,
     cfg: &Config,
     snap: &Snapshot,
     origin: &str,
@@ -300,13 +369,72 @@ async fn handle_program_tx(
         .ok_or_else(|| ApiError::validation("program actions not enabled for this project"))?;
     let checked =
         program_policy::check(tx, &project.fee_payer, policy).map_err(ApiError::validation)?;
-    console_log!(
-        "program tx passed policy (fee {} rent {} sim {}) but program actions are disabled until v3 Phase 2",
-        checked.fee_cost,
-        checked.declared_rent,
-        checked.needs_simulation
-    );
-    Err(ApiError::program_actions_disabled())
+    ensure_pins(env, cfg, project.cluster, &checked.pinned_programs).await?;
+
+    let relayer = fee_payer(env, project)?;
+    txcore::cosign_and_verify(tx, &relayer).map_err(ApiError::validation)?;
+    let signature = tx.signatures[0].to_string();
+    let static_keys: Vec<String> = tx
+        .message
+        .static_account_keys()
+        .iter()
+        .map(Pubkey::to_string)
+        .collect();
+    let requested: Vec<String> = writable_unsigned_keys(tx)
+        .iter()
+        .map(Pubkey::to_string)
+        .collect();
+    let signed = txcore::encode(tx).map_err(ApiError::internal)?;
+    ensure_cluster(env, cfg, project.cluster).await?;
+
+    let user = checked.user.to_string();
+    let job = json!({
+        "tx": B64.encode(signed),
+        "user": user,
+        "signature": signature,
+        "aud": project.aud,
+        "cluster": project.cluster.as_str(),
+        // Fee + declared rent: rent shares the fee budget until v3 Phase 3 splits them.
+        "cost": checked.fee_cost.saturating_add(checked.declared_rent),
+        "project_rpm": project.project_rpm,
+        "project_daily_budget": project.project_daily_budget_lamports,
+        "user_daily_quota": project.user_daily_quota,
+        "fee_payer": project.fee_payer.to_string(),
+        "min_balance": project.min_balance_lamports,
+        "program": {
+            "fee_cost": checked.fee_cost,
+            "declared_rent": checked.declared_rent,
+            "needs_simulation": checked.needs_simulation,
+            "refund_only": !checked.has_payer_slot,
+            "registered": policy.programs.iter().map(|p| p.program_id.to_string()).collect::<Vec<_>>(),
+            "static_keys": static_keys,
+            "requested": requested,
+        },
+    });
+    send_job(env, &project.aud, &user, job).await
+}
+
+/// Hands a job to the user's controller for this project and relays its answer.
+async fn send_job(
+    env: &Env,
+    aud: &str,
+    user: &str,
+    job: serde_json::Value,
+) -> std::result::Result<Response, ApiError> {
+    let stub = env
+        .durable_object("USER_CONTROLLER")
+        .and_then(|ns| ns.id_from_name(&format!("{aud}:{user}"))?.get_stub())
+        .map_err(|e| ApiError::upstream(format!("user stub: {e}")))?;
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post)
+        .with_body(Some(job.to_string().into()));
+    let do_req = Request::new_with_init("https://user/relay", &init)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let mut resp = stub
+        .fetch_with_request(do_req)
+        .await
+        .map_err(|e| ApiError::upstream(format!("user fetch: {e}")))?;
+    passthrough(&mut resp).await
 }
 
 /// The project named by a token (unverified `aud`, then a full verify bound to `wallet`),
@@ -407,7 +535,7 @@ async fn handle_relay(
     let mut tx = txcore::decode(&raw).map_err(ApiError::validation)?;
     // W15: one Memo instruction = the v2 memo path; anything else = a program action (v3).
     if !program_policy::is_memo_shape(&tx) {
-        return handle_program_tx(&tx, &token, cfg, snap, origin).await;
+        return handle_program_tx(&mut tx, &token, env, cfg, snap, origin).await;
     }
     let shape = policy::structural(&tx).map_err(ApiError::validation)?;
 

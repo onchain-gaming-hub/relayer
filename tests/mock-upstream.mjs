@@ -3,6 +3,9 @@
 //   GET  /jwks        JWKS for a generated ES256 key (kid "test-kid")
 //   GET  /__token     ?user_hex=&exp=&aud=&aud_array=&iss=&kid=&curve= -> signed JWT
 //   state.balances    { <pubkey>: lamports } overrides state.balance per fee payer
+//   state.simulate    `result.value` for simulateTransaction (null = generic success; `accounts` filled from
+//                     the request with owner state.simOwner when absent) · stats.lastSimulate = its params
+//   state.programs    { <programId>: { slot, authority? } } → getAccountInfo returns BPF Upgradeable layouts
 //   POST /__state     merge JSON into state · GET /__stats -> call counters
 import http from 'node:http';
 import crypto from 'node:crypto';
@@ -14,7 +17,27 @@ const jwk = { ...publicKey.export({ format: 'jwk' }), kid: 'test-kid', use: 'sig
 const rsaJwk = { ...crypto.generateKeyPairSync('rsa', { modulusLength: 2048 }).publicKey.export({ format: 'jwk' }), kid: 'rsa-kid', use: 'sig', alg: 'RS256' };
 
 const state = { genesis: DEVNET, genesisMainnet: MAINNET, balances: {}, balance: 10_000_000_000, balanceMode: 'ok', balanceDelayMs: 0, jwksMode: 'ok', send: 'ok', delayMs: 0 };
-const stats = { sendTransaction: 0, getBalance: 0, getGenesisHash: 0, jwks: 0, sendMainnet: 0 };
+const stats = { sendTransaction: 0, getBalance: 0, getGenesisHash: 0, jwks: 0, sendMainnet: 0, simulateTransaction: 0, getAccountInfo: 0, lastSimulate: null };
+Object.assign(state, { simulate: null, simOwner: '11111111111111111111111111111111', programs: {} });
+
+// Minimal base58 (pubkeys only) for the fake ProgramData addresses.
+const B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+function b58encode(buf) {
+  let n = BigInt('0x' + Buffer.from(buf).toString('hex')), out = '';
+  while (n > 0n) { out = B58[Number(n % 58n)] + out; n /= 58n; }
+  for (const b of buf) { if (b !== 0) break; out = '1' + out; }
+  return out;
+}
+function b58decode(str) {
+  let n = 0n;
+  for (const c of str) n = n * 58n + BigInt(B58.indexOf(c));
+  let hex = n.toString(16); if (hex.length % 2) hex = '0' + hex;
+  const bytes = Buffer.from(hex, 'hex');
+  const zeros = str.match(/^1*/)[0].length;
+  return Buffer.concat([Buffer.alloc(zeros), bytes, Buffer.alloc(Math.max(0, 32 - zeros - bytes.length))]).subarray(0, 32);
+}
+const LOADER = 'BPFLoaderUpgradeab1e11111111111111111111111';
+const programDataOf = (id) => b58encode(crypto.createHash('sha256').update('pd:' + id).digest());
 
 const b64url = (b) => Buffer.from(b).toString('base64url');
 function token({ user_hex, exp, aud = 'test-client', aud_array, iss = 'https://issuer.test', kid = 'test-kid', curve = 'ed25519' }) {
@@ -51,6 +74,32 @@ http.createServer(async (req, res) => {
   const ok = (result) => json(res, 200, { jsonrpc: '2.0', id: rpc.id, result });
   switch (rpc.method) {
     case 'getGenesisHash': return ok(mainnet ? state.genesisMainnet : state.genesis);
+    case 'simulateTransaction': {
+      const addresses = rpc.params?.[1]?.accounts?.addresses ?? [];
+      stats.lastSimulate = rpc.params?.[1];
+      const v = state.simulate ? structuredClone(state.simulate) : {
+        err: null, fee: 10000, preBalances: [10_000_000_000], postBalances: [9_999_990_000], innerInstructions: [] };
+      if (!('accounts' in v)) v.accounts = addresses.map(() => ({ owner: state.simOwner, lamports: 1, data: ['', 'base64'] }));
+      return ok({ context: { slot: 1 }, value: v });
+    }
+    case 'getAccountInfo': {
+      const [addr, cfg] = rpc.params;
+      const len = cfg?.dataSlice?.length;
+      const slice = (b) => (len === undefined ? b : b.subarray(0, len)).toString('base64');
+      for (const [id, p] of Object.entries(state.programs)) {
+        if (addr === id) {
+          return ok({ context: { slot: 1 }, value: { owner: LOADER, lamports: 1, executable: true,
+            data: [slice(Buffer.concat([Buffer.from([2, 0, 0, 0]), b58decode(programDataOf(id))])), 'base64'] } });
+        }
+        if (addr === programDataOf(id)) {
+          const slot = Buffer.alloc(8); slot.writeBigUInt64LE(BigInt(p.slot));
+          const auth = p.authority ? Buffer.concat([Buffer.from([1]), b58decode(p.authority)]) : Buffer.from([0]);
+          return ok({ context: { slot: 1 }, value: { owner: LOADER, lamports: 1, executable: false,
+            data: [slice(Buffer.concat([Buffer.from([3, 0, 0, 0]), slot, auth, Buffer.alloc(64)])), 'base64'] } });
+        }
+      }
+      return ok({ context: { slot: 1 }, value: null });
+    }
     case 'getBalance':
       if (state.balanceDelayMs) await new Promise((r) => setTimeout(r, state.balanceDelayMs));
       if (state.balanceMode === 'http500') return json(res, 500, {});

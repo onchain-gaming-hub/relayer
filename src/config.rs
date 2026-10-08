@@ -266,11 +266,12 @@ impl Config {
         }
     }
 
-    /// Longest a healthy request can hold the wallet lock (spec v2 §4.4): admit
-    /// (RPC_TIMEOUT_MS + 4 s) + sendTransaction (RPC_TIMEOUT_MS) + refund (5 s) + 5 s margin.
+    /// Longest a healthy request can hold the wallet lock. Program path (spec v3 W14), the
+    /// longer one: admit_rpm (4 s) + simulate (RPC_TIMEOUT_MS) + admit_budget (RPC_TIMEOUT_MS +
+    /// 4 s) + sendTransaction (RPC_TIMEOUT_MS) + refund (5 s) + 5 s margin = 3T + 18 s.
     pub fn inflight_stale_ms(&self) -> f64 {
-        2.0 * self.rpc_timeout_ms as f64
-            + ADMIT_MARGIN_MS as f64
+        3.0 * self.rpc_timeout_ms as f64
+            + 2.0 * ADMIT_MARGIN_MS as f64
             + REFUND_TIMEOUT_MS as f64
             + INFLIGHT_STALE_MARGIN_MS
     }
@@ -345,7 +346,7 @@ mod tests {
     #[test]
     fn inflight_stale_matches_spec_formula() {
         // 2 × RPC_TIMEOUT_MS + 14 s
-        assert_eq!(cfg(0.0, 0.0, 0.0).inflight_stale_ms(), 44_000.0);
+        assert_eq!(cfg(0.0, 0.0, 0.0).inflight_stale_ms(), 63_000.0); // 3T + 18 s (v3)
     }
 
     #[test]

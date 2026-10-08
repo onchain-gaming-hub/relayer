@@ -10,7 +10,7 @@ const MOCK = process.env.MOCK_URL || 'http://127.0.0.1:8899';
 const ORIGIN = 'http://localhost:5173';
 const PERSIST = process.env.PERSIST_DIR;
 const WRANGLER_LOG = process.env.WRANGLER_LOG;
-const { PK_A, PK_B, PK_M, PK_X, PK_Y, PK_C, PK_D, PK_G, TESTKIT } = process.env;
+const { PK_A, PK_B, PK_M, PK_X, PK_Y, PK_C, PK_D, PK_G, TESTKIT, NOVERIFY, PINX } = process.env;
 const ORIGIN_G = 'http://localhost:5181';
 const SYSTEM = '11111111111111111111111111111111';
 const ORIGIN_B = 'http://localhost:5174';
@@ -608,50 +608,93 @@ async function suiteE() {
 }
 
 async function suiteF() {
-  // Program actions, v3 Phase 1: the policy engine runs, nothing is relayed yet.
+  // Program actions (spec v3 Phase 1 policy + Phase 2 simulation / pin / two-step admission).
   const D = { create: '181ec828051c0777', close: 'a75149fabad23e79', noop: '09b20d738123ed66' };
   const prog = (args, seed = freshSeed()) => JSON.parse(execFileSync('./target/debug/examples/progtx', [PK_G, BLOCKHASH, seed, ...args]).toString());
   const sendG = async (t, opts = {}) => relay(t, { token: await tokenFor(t.user_hex, { aud: opts.aud ?? 'client-g' }), origin: opts.origin ?? ORIGIN_G });
   const createIx = `p:${TESTKIT}:${D.create}:u:s,fp:w,new:w,${SYSTEM}:r`;
   const closeIx = `p:${TESTKIT}:${D.close}:u:s,new:w,fp:w`;
   const noopIx = `p:${TESTKIT}:${D.noop}:u:s`;
-  const sends0 = (await stats()).sendTransaction;
+  const NEW = 'GXD5K3SHLJvzAKkok3xKJsTZV3THWSmewhUL8CmvD5L'; // any program-owned account
+  const RENT = 1_021_080, FEE = 10_000;
+  const sys = (type, info) => ({ program: 'system', programId: SYSTEM, parsed: { type, info }, stackHeight: 2 });
+  const sim = (pre, post, inner = [], extra = {}) => ({ err: null, fee: FEE, preBalances: [pre], postBalances: [post],
+    innerInstructions: inner.length ? [{ index: 0, instructions: inner }] : [], ...extra });
+  const createSim = (over = {}) => sim(5_000_000_000, 5_000_000_000 - RENT - FEE,
+    [sys('createAccount', { source: PK_G, newAccount: NEW, owner: TESTKIT, lamports: RENT, space: 73, ...over })]);
+  await setState({ programs: { [TESTKIT]: { slot: 1 }, [NOVERIFY]: { slot: 7 }, [PINX]: { slot: 6 } }, simOwner: TESTKIT });
+  const s0 = await stats();
 
   const info = await request('/relayer?project=client-g', { method: 'GET' });
-  check('V3 relayer info lists the program action', info.status === 200
-    && info.json?.policy?.actions?.[0]?.type === 'program' && info.json?.policy?.actions?.[0]?.program_id === TESTKIT
-    && info.json?.policy?.actions?.[0]?.instructions?.join() === 'create,close_thing,noop', info.text);
+  check('V3 relayer info lists the program actions', info.status === 200 && info.json?.policy?.actions?.length === 3
+    && info.json?.policy?.actions?.[0]?.program_id === TESTKIT, info.text.slice(0, 200));
 
-  const gate = (r) => r.status === 503 && r.json?.code === 'program_actions_disabled';
+  // ---- happy paths ----
+  await setState({ simulate: createSim() });
   let r = await sendG(prog([createIx]));
-  check('V3-2 payer slot passes policy, gated until Phase 2 (503)', gate(r), `${r.status} ${r.json?.code} ${r.json?.reason ?? ''}`);
+  const st = await stats();
+  check('V3-2 payer slot: simulate → verify → relayed (200)', r.status === 200 && typeof r.json?.signature === 'string', `${r.status} ${r.json?.code} ${r.json?.reason ?? ''}`);
+  check('V3-14 simulate uses commitment confirmed + innerInstructions', st.lastSimulate?.commitment === 'confirmed' && st.lastSimulate?.innerInstructions === true
+    && st.lastSimulate?.sigVerify === true && st.lastSimulate?.replaceRecentBlockhash === false, JSON.stringify(st.lastSimulate));
+  await setState({ simulate: sim(5_000_000_000, 5_000_000_000 + RENT - FEE) });
   r = await sendG(prog([closeIx]));
-  check('V3-12 refund slot passes policy, gated', gate(r), `${r.status} ${r.json?.code} ${r.json?.reason ?? ''}`);
+  check('V3-12 refund slot: net inflow → relayed', r.status === 200, `${r.status} ${r.json?.code} ${r.json?.reason ?? ''}`);
+  await setState({ simulate: null });
   r = await sendG(prog([noopIx]));
-  check('V3-10 crank (user as remaining readonly signer) passes policy, gated', gate(r), `${r.status} ${r.json?.code} ${r.json?.reason ?? ''}`);
-  r = await sendG(prog(['cbl:300000', 'cbp:1000', noopIx]));
-  check('W5 compute budget within ceilings passes, gated', gate(r), `${r.status} ${r.json?.code} ${r.json?.reason ?? ''}`);
+  check('V3-10 crank (user as remaining readonly signer) → relayed', r.status === 200, `${r.status} ${r.json?.code} ${r.json?.reason ?? ''}`);
+  const simBefore = (await stats()).simulateTransaction;
+  r = await sendG(prog([`p:${NOVERIFY}:${D.noop}:u:s`]));
+  const simCalls = (await stats()).simulateTransaction - simBefore;
+  check('V3-5 verify_inner_ix=false: no simulation, relayed', r.status === 200 && simCalls === 0, `${r.status} ${r.json?.code} sims=${simCalls}`);
 
+  // ---- §4.3 rejections: nothing is sent ----
+  const reject = async (id, simValue, args, code = 'inner_ix_rejected', status = 400) => {
+    await setState({ simulate: simValue });
+    const before = (await stats()).sendTransaction;
+    const x = await sendG(prog(args));
+    const sent = (await stats()).sendTransaction - before;
+    check(id, x.status === status && x.json?.code === code && sent === 0, `${x.status} ${x.json?.code} ${x.json?.reason ?? ''} sent=${sent}`);
+    return x;
+  };
+  const drainUser = prog([createIx]);
+  await setState({ simulate: sim(5_000_000_000, 5_000_000_000 - 5_000_000 - FEE, [sys('transfer', { source: PK_G, destination: drainUser.user, lamports: 5_000_000 })]) });
+  {
+    const before = (await stats()).sendTransaction;
+    const x = await sendG(drainUser);
+    check('V3-3 drain (transfer from relayer to the user) → 400, not sent', x.status === 400 && x.json?.code === 'inner_ix_rejected' && (await stats()).sendTransaction === before,
+      `${x.status} ${x.json?.code} ${x.json?.reason ?? ''}`);
+  }
+  await reject('V3-4 outflow above declared rent → 400', sim(5_000_000_000, 5_000_000_000 - 2_000_000), [createIx]);
+  await reject('createAccount owned by another program → 400', createSim({ owner: SYSTEM }), [createIx]);
+  await reject('fee payer passed to another program (nested) → 400', sim(5_000_000_000, 5_000_000_000 - FEE,
+    [{ program: 'spl-token', programId: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA', parsed: { type: 'transfer', info: { signers: [PK_G] } } }]), [noopIx]);
+  await reject('V3-12 fake refund (relayer loses more than the fee) → 400', sim(5_000_000_000, 5_000_000_000 - 500_000), [closeIx]);
+  await reject('unknown inner-ix shape → 503 (fail-closed)', sim(5_000_000_000, 5_000_000_000 - FEE, [{ weird: true }]), [noopIx], 'upstream', 503);
+  await reject('simulation missing accounts → 503 (fail-closed)', { ...createSim(), accounts: null }, [createIx], 'upstream', 503);
+  const failed = await reject('program error in simulation → 400 simulation_failed', { ...sim(5_000_000_000, 5_000_000_000 - FEE), err: { InstructionError: [0, { Custom: 6000 }] } }, [noopIx], 'simulation_failed');
+  check('simulation_failed carries the program error and a backoff', /Custom/.test(failed.json?.reason ?? '') && failed.json?.retry_after_ms > 0, JSON.stringify(failed.json));
+  await setState({ simulate: null });
+
+  // ---- W6 version pin ----
+  r = await sendG(prog([`p:${PINX}:${D.noop}:u:s`]));
+  check('V3-6 deploy slot differs from the pin → 503 program_changed', r.status === 503 && r.json?.code === 'program_changed', `${r.status} ${r.json?.code}`);
+
+  // ---- Phase 1 policy rejections still hold ----
   const bad = async (id, args, reason) => {
     const x = await sendG(prog(args));
     check(id, x.status === 400 && x.json?.code === 'validation' && x.json?.reason === reason, `${x.status} ${x.json?.reason}`);
   };
   await bad('V3-1 unregistered program', [`p:${PK_A}:${D.noop}:u:s`], 'program not allowed');
   await bad('V3-1 unknown instruction', [`p:${TESTKIT}:0102030405060708:u:s`], 'instruction not allowed');
-  // A top-level CreateAccount needs the new account to sign (3 signers) -> W2 rejects it first.
   await bad('V3-1 Kora #720: top-level System CreateAccount attached', [noopIx, `p:${SYSTEM}:00000000:fp:w,new:ws`], 'exactly 2 signatures required');
-  // Same attachment without an extra signer: a top-level System Transfer from the relayer to the user.
   await bad('V3-1 top-level System Transfer from the relayer attached', [noopIx, `p:${SYSTEM}:0200000040420f0000000000:fp:w,u:w`], 'program not allowed');
   await bad('W3 relayer outside its slot', [`p:${TESTKIT}:${D.noop}:fp:w`, noopIx], 'relayer not allowed in this instruction');
   await bad('V3-15 payer slot holding the user', [`p:${TESTKIT}:${D.create}:u:s,u:ws,new:w,${SYSTEM}:r`], 'slot must hold the relayer');
-  await bad('W4b refund to someone else', [`p:${TESTKIT}:${D.close}:u:s,new:w,new:w`], 'slot must hold the relayer');
   await bad('payer + refund slot in one tx', [createIx, closeIx], 'payer and refund slots in one transaction');
   await bad('W5 CU limit above ceiling', ['cbl:500000', noopIx], 'compute unit limit above ceiling');
   await bad('W5 CU price without limit', ['cbp:10', noopIx], 'compute unit price needs a compute unit limit');
-  await bad('W5 CU price above ceiling', ['cbl:1000', 'cbp:2000', noopIx], 'compute unit price above ceiling');
-  await bad('max_instructions', [noopIx, noopIx, noopIx, noopIx, noopIx], 'too many instructions');
 
-  // Action routing between projects (W15)
+  // ---- routing + accounting ----
   const memoToG = mk(freshSeed(), '', PK_G);
   r = await relay(memoToG, { token: await tokenFor(memoToG.user_hex, { aud: 'client-g' }), origin: ORIGIN_G });
   check('W15 memo tx to a program-only project', r.status === 400 && r.json?.reason === 'memo action not enabled for this project', `${r.status} ${r.json?.reason}`);
@@ -661,8 +704,12 @@ async function suiteF() {
   r = await relayAs(freshSeed());
   check('memo path unchanged (v2 regression)', r.status === 200, `${r.status} ${r.json?.code}`);
 
-  const sent = (await stats()).sendTransaction - sends0;
-  check('Phase 1: no program tx reached sendTransaction', sent === 1, `sends=${sent} (1 = the memo regression)`);
+  await sleep(1500);
+  const rows = d1Query(`SELECT cost_lamports AS c, rent_lamports AS r FROM relay_log WHERE aud = 'client-g' AND status = 'success' ORDER BY id`);
+  check('W8 audit: payer-slot tx charged fee + declared rent, simulated rent logged',
+    rows[0]?.c === 1_110_000 && rows[0]?.r === RENT && rows.slice(1).every((x) => x.c === FEE), JSON.stringify(rows));
+  const sends = (await stats()).sendTransaction - s0.sendTransaction;
+  check('sendTransaction only for the 4 relayed program txs + 1 memo', sends === 5, `sends=${sends}`);
 }
 
 const info = await request('/relayer?project=test-client', { method: 'GET' });

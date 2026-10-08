@@ -22,6 +22,8 @@ solana-pubkey = "4"
 p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await-macro"] }
 wasm-bindgen = "0.2"
+# Variable-length base58 (inner-ix data in Compiled / PartiallyDecoded shapes, v3 §4.3).
+bs58 = { version = "0.5.1", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 solana-instruction = "4"

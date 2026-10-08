@@ -487,6 +487,7 @@ pub struct ProgramCheck {
     pub pinned_programs: Vec<(Pubkey, Pin)>,
     /// Registered program of each top-level instruction (None = ComputeBudget), for W11.
     pub ix_programs: Vec<Option<Pubkey>>,
+    pub has_payer_slot: bool,
 }
 
 fn compute_budget(data: &[u8], accounts: &[u8]) -> Result<(u8, u64), &'static str> {
@@ -618,6 +619,7 @@ pub fn check(
         needs_simulation,
         pinned_programs: pinned,
         ix_programs,
+        has_payer_slot: has_payer,
     })
 }
 

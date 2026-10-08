@@ -78,6 +78,22 @@ impl DurableObject for ClusterThrottle {
                     }
                 }
             }
+            // v3 program path (W14): RPM before simulation, budget after verification.
+            "/admit_rpm" => match self.rpm.take(cfg.cluster_rpm(cluster), now) {
+                Ok(window) => Response::from_json(&json!({ "window": window })),
+                Err(retry) => ApiError::cluster_throttle(retry).into_response(),
+            },
+            "/admit_budget" => {
+                let day = daily::day_of(now);
+                let budget = i64::try_from(cfg.cluster_daily_budget(cluster)).unwrap_or(i64::MAX);
+                match daily::try_add(&sql, day, cost, budget) {
+                    Ok(Some(_)) => Response::from_json(&json!({ "day": day })),
+                    Ok(None) => {
+                        ApiError::cluster_budget(daily::ms_until_next_day(now)).into_response()
+                    }
+                    Err(e) => ApiError::internal(format!("cluster budget: {e}")).into_response(),
+                }
+            }
             "/refund" => {
                 let refunded = body.window.is_some_and(|w| self.rpm.release(w));
                 if let Some(day) = body.day

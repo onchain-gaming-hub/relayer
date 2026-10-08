@@ -17,6 +17,7 @@ use crate::{
     config::{ADMIT_MARGIN_MS, Cluster, Config, REFUND_TIMEOUT_MS, reject_backoff_ms, rpc_url},
     daily,
     error::ApiError,
+    inner_ix::{self, Expect, Verdict},
     rpc::{self, SendOutcome},
 };
 
@@ -45,6 +46,25 @@ pub struct RelayJob {
     pub fee_payer: String,
     pub min_balance: u64,
     pub user_daily_quota: u32,
+    /// Present for program actions (spec v3): two-step admission + simulation (W14, §4.3).
+    #[serde(default)]
+    pub program: Option<ProgramJob>,
+}
+
+/// What the program path needs beyond a memo job (spec v3).
+#[derive(Deserialize)]
+pub struct ProgramJob {
+    pub fee_cost: u64,
+    pub declared_rent: u64,
+    pub needs_simulation: bool,
+    /// No payer slot: the fee payer may not lose more than the fee (W4b).
+    pub refund_only: bool,
+    /// Programs registered by the project (allowed owners of rent-funded accounts).
+    pub registered: Vec<String>,
+    /// Static account keys of the tx (Compiled inner-ix shape) and the writable non-signer
+    /// keys whose post-state the simulation returns.
+    pub static_keys: Vec<String>,
+    pub requested: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -179,8 +199,15 @@ impl UserController {
             Err(e) => return Err(ApiError::internal(format!("user quota: {e}"))),
         }
 
-        // Bounded: ProjectThrottle may wait one RPC timeout on getBalance plus the cluster hop.
-        let admitted =
+        let mut rent_simulated = None;
+        let admitted = if let Some(p) = &job.program {
+            // Program action (v3 W14): RPM → simulate + verify → budget. Refunds the user's
+            // count itself on every refusal.
+            let (a, rent) = self.admit_program(&job, p, &url, cfg, day).await?;
+            rent_simulated = rent;
+            a
+        } else {
+            // Bounded: ProjectThrottle may wait one RPC timeout on getBalance plus the cluster hop.
             match rpc::with_timeout(self.admit(&job), cfg.rpc_timeout_ms + ADMIT_MARGIN_MS).await {
                 Some(Ok(admitted)) => admitted,
                 // Refused or unreachable: only our own count is known to be safe to return
@@ -202,7 +229,8 @@ impl UserController {
                     }
                     return Err(ApiError::upstream("project admit timeout"));
                 }
-            };
+            }
+        };
 
         let outcome = rpc::send_transaction(&url, cfg.rpc_timeout_ms, &job.tx).await;
         let done = Date::now().as_millis() as f64;
@@ -277,7 +305,7 @@ impl UserController {
             self.refund_user(day);
             self.refund(&job, &admitted).await;
         }
-        self.audit(&job, audit.0, audit.1, done);
+        self.audit(&job, audit.0, audit.1, done, rent_simulated);
         // `done`, not `now`: a request that crosses UTC midnight reports the new day.
         let quota = self.quota(job.user_daily_quota, done).ok();
 
@@ -295,6 +323,194 @@ impl UserController {
                 Err(ApiError::rpc_rejected(reason, cooldown_ms))
             }
             SendOutcome::Unknown(reason) => Err(ApiError::rpc_unknown(reason, job.signature)),
+        }
+    }
+
+    /// Program-action admission (spec v3 W14): RPM first (every RPC call is counted), then
+    /// simulation + inner-ix verification (§4.3), then the budget (fee + declared rent; rent
+    /// shares the fee budget until Phase 3 splits it). Returns where it was counted and the
+    /// rent the simulation saw. On every refusal the user's daily count is given back; the RPM
+    /// slot is kept (1 call = 1 slot).
+    async fn admit_program(
+        &self,
+        job: &RelayJob,
+        p: &ProgramJob,
+        url: &str,
+        cfg: &Config,
+        day: i64,
+    ) -> std::result::Result<(Admitted, Option<u64>), ApiError> {
+        let storage = self.state.storage();
+        // Step 1: RPM (in memory at both throttles; bounded by the cluster hop).
+        let rpm = json!({ "cluster": job.cluster, "rpm": job.project_rpm });
+        let (window, cluster_window) = match rpc::with_timeout(
+            self.project_call(&job.aud, "admit_rpm", rpm),
+            ADMIT_MARGIN_MS,
+        )
+        .await
+        {
+            Some(Ok((200, b))) => {
+                let get = |k: &str| b.get(k).and_then(serde_json::Value::as_f64);
+                match (get("window"), get("cluster_window")) {
+                    (Some(w), Some(c)) => (w, c),
+                    _ => {
+                        self.refund_user(day);
+                        return Err(ApiError::upstream("admit_rpm: missing window"));
+                    }
+                }
+            }
+            Some(Ok((status, b))) => {
+                self.refund_user(day);
+                return Err(ApiError::relayed(status, &b));
+            }
+            Some(Err(e)) => {
+                self.refund_user(day);
+                return Err(ApiError::upstream(format!("admit_rpm: {e}")));
+            }
+            None => {
+                self.short_cooldown(cfg, &job.user).await;
+                return Err(ApiError::upstream("admit_rpm timeout"));
+            }
+        };
+
+        // Step 2: simulate + verify (§4.3), unless every program in the tx opted out (W7).
+        let mut rent_simulated = None;
+        if p.needs_simulation {
+            let value = match rpc::simulate(url, cfg.rpc_timeout_ms, &job.tx, &p.requested).await {
+                Ok(v) => v,
+                Err(e) => {
+                    self.refund_user(day);
+                    return Err(ApiError::upstream(format!("simulate: {e}")));
+                }
+            };
+            let keys: Vec<_> = p
+                .static_keys
+                .iter()
+                .filter_map(|k| k.parse().ok())
+                .collect();
+            let requested: Vec<_> = p.requested.iter().filter_map(|k| k.parse().ok()).collect();
+            let registered: Vec<_> = p.registered.iter().filter_map(|k| k.parse().ok()).collect();
+            let (fee_payer, user) = match (job.fee_payer.parse(), job.user.parse()) {
+                (Ok(f), Ok(u))
+                    if keys.len() == p.static_keys.len()
+                        && requested.len() == p.requested.len()
+                        && registered.len() == p.registered.len() =>
+                {
+                    (f, u)
+                }
+                _ => {
+                    self.refund_user(day);
+                    return Err(ApiError::internal("program job: bad pubkeys"));
+                }
+            };
+            let sim = inner_ix::parse_simulation(&value, &keys, &requested);
+            let verdict = inner_ix::verify(
+                &sim,
+                Expect {
+                    fee_payer: &fee_payer,
+                    user: &user,
+                    registered: &registered,
+                    fee_cost: p.fee_cost,
+                    declared_rent: p.declared_rent,
+                    refund_only: p.refund_only,
+                },
+            );
+            match verdict {
+                Verdict::Ok { rent_spent } => rent_simulated = Some(rent_spent),
+                Verdict::ProgramError(reason) => {
+                    self.refund_user(day);
+                    let wait = self.penalize(&storage, cfg, &job.user).await;
+                    return Err(ApiError::simulation_failed(reason, wait));
+                }
+                Verdict::Incomplete(field) => {
+                    self.refund_user(day);
+                    return Err(ApiError::upstream(format!("simulation missing {field}")));
+                }
+                Verdict::Rejected(reason) => {
+                    console_error!("inner_ix_rejected for {} ({}): {reason}", job.user, job.aud);
+                    self.refund_user(day);
+                    let wait = self.penalize(&storage, cfg, &job.user).await;
+                    return Err(ApiError::inner_ix_rejected(reason, wait));
+                }
+            }
+        }
+
+        // Step 3: budget + balance (bounded like the memo admit: getBalance + cluster hop).
+        let budget = json!({
+            "cluster": job.cluster,
+            "cost": job.cost,
+            "budget": job.project_daily_budget,
+            "fee_payer": job.fee_payer,
+            "min_balance": job.min_balance,
+        });
+        let admit = self.project_call(&job.aud, "admit_budget", budget);
+        let (bday, cluster_day) =
+            match rpc::with_timeout(admit, cfg.rpc_timeout_ms + ADMIT_MARGIN_MS).await {
+                Some(Ok((200, b))) => match (
+                    b.get("day").and_then(serde_json::Value::as_i64),
+                    b.get("cluster_day").and_then(serde_json::Value::as_i64),
+                ) {
+                    (Some(d), Some(c)) => (d, c),
+                    _ => {
+                        self.refund_user(day);
+                        return Err(ApiError::upstream("admit_budget: missing day"));
+                    }
+                },
+                Some(Ok((status, b))) => {
+                    self.refund_user(day);
+                    return Err(ApiError::relayed(status, &b));
+                }
+                Some(Err(e)) => {
+                    self.refund_user(day);
+                    return Err(ApiError::upstream(format!("admit_budget: {e}")));
+                }
+                None => {
+                    self.short_cooldown(cfg, &job.user).await;
+                    return Err(ApiError::upstream("admit_budget timeout"));
+                }
+            };
+        Ok((
+            Admitted {
+                window,
+                day: bday,
+                cluster_window,
+                cluster_day,
+            },
+            rent_simulated,
+        ))
+    }
+
+    /// Grows the reject streak and sets the backoff cooldown (D17) — for simulation failures,
+    /// which cost the relayer an RPC call but no fee. Returns the cooldown in ms.
+    async fn penalize(&self, storage: &Storage, cfg: &Config, user: &str) -> f64 {
+        let streak = self.next_reject_streak(user).await;
+        let wait = reject_backoff_ms(
+            cfg.reject_cooldown_ms,
+            streak.unwrap_or(1),
+            cfg.reject_cooldown_max_ms,
+        );
+        let until = Date::now().as_millis() as f64 + wait;
+        let stored = match streak {
+            Some(reject_streak) => {
+                storage
+                    .put_multiple(CooldownState {
+                        cooldown_until: until,
+                        reject_streak,
+                    })
+                    .await
+            }
+            None => storage.put(COOLDOWN_KEY, until).await,
+        };
+        if let Err(e) = stored {
+            console_error!("cooldown put after simulation failure failed for {user}: {e}");
+        }
+        wait
+    }
+
+    /// After an admit timeout: the throttles may have counted it; stop immediate retries.
+    async fn short_cooldown(&self, cfg: &Config, user: &str) {
+        let until = Date::now().as_millis() as f64 + cfg.reject_cooldown_ms;
+        if let Err(e) = self.state.storage().put(COOLDOWN_KEY, until).await {
+            console_error!("cooldown put after admit timeout failed for {user}: {e}");
         }
     }
 
@@ -393,7 +609,14 @@ impl UserController {
     }
 
     /// Best-effort D1 write (spec D13): never affects the response.
-    fn audit(&self, job: &RelayJob, status: &'static str, reason: Option<String>, at: f64) {
+    fn audit(
+        &self,
+        job: &RelayJob,
+        status: &'static str,
+        reason: Option<String>,
+        at: f64,
+        rent_simulated: Option<u64>,
+    ) {
         let db = match self.env.d1("DB") {
             Ok(db) => db,
             Err(e) => {
@@ -411,7 +634,7 @@ impl UserController {
         self.state.wait_until(async move {
             let reason = reason.map(JsValue::from).unwrap_or(JsValue::NULL);
             let stmt = db.prepare(
-                "INSERT INTO relay_log (wallet_address, tx_signature, status, reason, created_at, aud, cluster, cost_lamports) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO relay_log (wallet_address, tx_signature, status, reason, created_at, aud, cluster, cost_lamports, rent_lamports) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             );
             let result = match stmt.bind(&[
                 wallet.into(),
@@ -422,6 +645,7 @@ impl UserController {
                 aud.into(),
                 cluster.into(),
                 JsValue::from_f64(cost),
+                rent_simulated.map(|r| JsValue::from_f64(r as f64)).unwrap_or(JsValue::NULL),
             ]) {
                 Ok(bound) => bound.run().await.map(|_| ()),
                 Err(e) => Err(e),

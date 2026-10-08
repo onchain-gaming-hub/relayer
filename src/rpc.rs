@@ -166,6 +166,60 @@ pub async fn get_genesis_hash(url: &str, timeout_ms: u64) -> Result<String, Stri
 }
 
 /// Plain GET with the same timeout semantics (used for the Web3Auth JWKS).
+/// `simulateTransaction` (spec v3 §4.3): returns `result.value`. Always `commitment: confirmed`
+/// (matches the FE blockhash and `preflightCommitment`; the RPC default `finalized` would report
+/// fresh blockhashes as not found).
+pub async fn simulate(
+    url: &str,
+    timeout_ms: u64,
+    tx_base64: &str,
+    addresses: &[String],
+) -> Result<Value, String> {
+    let params = json!([tx_base64, {
+        "encoding": "base64",
+        "commitment": "confirmed",
+        "sigVerify": true,
+        "replaceRecentBlockhash": false,
+        "innerInstructions": true,
+        "accounts": { "encoding": "base64", "addresses": addresses },
+    }]);
+    let r = call_result(url, timeout_ms, "simulateTransaction", params).await?;
+    r.get("value")
+        .cloned()
+        .ok_or_else(|| "simulateTransaction: missing value".into())
+}
+
+/// `getAccountInfo` → `(owner, data)`; `None` when the account does not exist.
+pub async fn get_account(
+    url: &str,
+    timeout_ms: u64,
+    pubkey: &str,
+    slice_len: Option<usize>,
+) -> Result<Option<(String, Vec<u8>)>, String> {
+    use base64::{Engine, engine::general_purpose::STANDARD as B64};
+    let mut cfg = json!({ "encoding": "base64", "commitment": "confirmed" });
+    if let Some(len) = slice_len {
+        cfg["dataSlice"] = json!({ "offset": 0, "length": len });
+    }
+    let r = call_result(url, timeout_ms, "getAccountInfo", json!([pubkey, cfg])).await?;
+    let Some(v) = r.get("value").filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let owner = v
+        .get("owner")
+        .and_then(Value::as_str)
+        .ok_or("getAccountInfo: missing owner")?;
+    let data = v
+        .get("data")
+        .and_then(|d| d.get(0))
+        .and_then(Value::as_str)
+        .ok_or("getAccountInfo: missing data")?;
+    let bytes = B64
+        .decode(data)
+        .map_err(|_| "getAccountInfo: bad base64".to_string())?;
+    Ok(Some((owner.to_string(), bytes)))
+}
+
 pub async fn get_text(url: &str, timeout_ms: u64) -> Result<String, String> {
     let call = async {
         let mut resp = Fetch::Url(url.parse().map_err(|_| "bad url".to_string())?)
