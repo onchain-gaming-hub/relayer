@@ -25,6 +25,9 @@ pub const JWKS_UNKNOWN_KID_REFETCH_MS: f64 = 5.0 * 60_000.0;
 
 /// Default of `RETRY_COOLDOWN_MS` / `retry_cooldown_ms` (v3 W10).
 pub const DEFAULT_RETRY_COOLDOWN_MS: f64 = 1_000.0;
+/// Floor of every retry cooldown (R-v3-9, decided 2026-10-08): a wallet that can trigger a
+/// registered retryable error on demand gets at most 10 tries per second.
+pub const MIN_RETRY_COOLDOWN_MS: f64 = 100.0;
 
 /// The cooldowns one request runs under (v3 W10): the project's overrides over the Worker's.
 /// Resolved in the Worker and carried in the job, so a UserController never needs the registry.
@@ -116,8 +119,8 @@ pub struct Config {
     /// Lamports per UTC day across every project on the cluster (V12 catastrophic stop).
     pub cluster_daily_budget_devnet: u64,
     pub cluster_daily_budget_mainnet: u64,
-    /// Lamports of rent per UTC day across the cluster (v3 W9). Mainnet defaults to 0: no
-    /// rent sponsorship until it is set on purpose.
+    /// Lamports of rent per UTC day across the cluster (v3 W9). Default 10 SOL on both
+    /// clusters (decided 2026-10-08); rent comes back when accounts close.
     pub cluster_daily_rent_budget_devnet: u64,
     pub cluster_daily_rent_budget_mainnet: u64,
     pub cluster_hop_timeout_ms: u64,
@@ -204,7 +207,7 @@ impl Config {
             cluster_daily_rent_budget_mainnet: num(
                 var("CLUSTER_DAILY_RENT_BUDGET_MAINNET"),
                 "CLUSTER_DAILY_RENT_BUDGET_MAINNET",
-                0,
+                10_000_000_000,
             )?,
             cluster_hop_timeout_ms: num(
                 var("CLUSTER_HOP_TIMEOUT_MS"),
@@ -258,6 +261,9 @@ impl Config {
         // 0 would answer every request with cluster_throttle (an accidental kill switch).
         if self.cluster_rpm_devnet == 0 || self.cluster_rpm_mainnet == 0 {
             return Err("invalid config CLUSTER_RPM_*: must be >= 1".into());
+        }
+        if self.retry_cooldown_ms < MIN_RETRY_COOLDOWN_MS {
+            return Err("invalid config RETRY_COOLDOWN_MS: must be >= 100".into());
         }
         if self.reject_cooldown_max_ms < self.reject_cooldown_ms {
             return Err(
@@ -365,7 +371,7 @@ mod tests {
             cluster_daily_budget_devnet: 10_000_000_000,
             cluster_daily_budget_mainnet: 200_000_000,
             cluster_daily_rent_budget_devnet: 10_000_000_000,
-            cluster_daily_rent_budget_mainnet: 0,
+            cluster_daily_rent_budget_mainnet: 10_000_000_000,
             cluster_hop_timeout_ms: 2_000,
             registry_cache_ms: 60_000.0,
             registry_max_stale_ms: 600_000.0,
@@ -405,6 +411,9 @@ mod tests {
         assert!(c.validated().is_err());
         let mut c = cfg(10_000.0, 3_000.0, 60_000.0);
         c.cluster_daily_rent_budget_devnet = u64::MAX;
+        assert!(c.validated().is_err());
+        let mut c = cfg(10_000.0, 3_000.0, 60_000.0);
+        c.retry_cooldown_ms = 99.0;
         assert!(c.validated().is_err());
     }
 

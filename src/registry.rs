@@ -20,7 +20,7 @@ use solana_pubkey::Pubkey;
 use worker::{Env, console_log, console_warn};
 
 use crate::{
-    config::{Cluster, Config, EffectiveTiming, Web3AuthNetwork},
+    config::{Cluster, Config, EffectiveTiming, MIN_RETRY_COOLDOWN_MS, Web3AuthNetwork},
     error::ApiError,
     policy::{MAX_MEMO_BYTES_CAP, MemoRule},
     program_policy::{self, ProgramPolicy},
@@ -253,7 +253,12 @@ pub fn parse_project(row: &ProjectRow) -> Result<Project, String> {
         cooldown_ms: opt_ms(row.cooldown_ms, "cooldown_ms")?,
         reject_cooldown_ms: opt_ms(row.reject_cooldown_ms, "reject_cooldown_ms")?,
         reject_cooldown_max_ms: opt_ms(row.reject_cooldown_max_ms, "reject_cooldown_max_ms")?,
-        retry_cooldown_ms: opt_ms(row.retry_cooldown_ms, "retry_cooldown_ms")?,
+        retry_cooldown_ms: match opt_ms(row.retry_cooldown_ms, "retry_cooldown_ms")? {
+            Some(ms) if ms < MIN_RETRY_COOLDOWN_MS => {
+                return Err("retry_cooldown_ms: must be >= 100 ms".into());
+            }
+            v => v,
+        },
     };
     Ok(Project {
         aud: row.aud.clone(),
@@ -526,6 +531,10 @@ mod tests {
         r.cooldown_ms = None;
         r.retry_cooldown_ms = Some(f64::NAN);
         assert!(parse_project(&r).is_err());
+        r.retry_cooldown_ms = Some(99.0);
+        assert!(parse_project(&r).unwrap_err().contains(">= 100"));
+        r.retry_cooldown_ms = Some(100.0);
+        assert!(parse_project(&r).is_ok());
     }
 
     #[test]
