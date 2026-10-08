@@ -11,7 +11,7 @@ MOCK_PORT=8899
 MOCK="http://127.0.0.1:$MOCK_PORT"
 trap 'kill $(jobs -p) 2>/dev/null || true; rm -rf "$WORK"' EXIT
 
-cargo build -q --example mktx --example genkey
+cargo build -q --example mktx --example genkey --example progtx
 worker-build --release >/dev/null
 
 MOCK_PORT=$MOCK_PORT node tests/mock-upstream.mjs > "$WORK/mock.log" 2>&1 &
@@ -24,6 +24,7 @@ read -r SK_M PK_M <<<"$(./target/debug/examples/genkey)"
 read -r SK_P PK_P <<<"$(./target/debug/examples/genkey)"
 read -r SK_C PK_C <<<"$(./target/debug/examples/genkey)"
 read -r SK_D PK_D <<<"$(./target/debug/examples/genkey)"
+read -r SK_G PK_G <<<"$(./target/debug/examples/genkey)"
 read -r _ PK_X <<<"$(./target/debug/examples/genkey)"
 read -r SK_Y _ <<<"$(./target/debug/examples/genkey)"
 read -r _ PK_Y <<<"$(./target/debug/examples/genkey)"
@@ -38,15 +39,19 @@ COMMON=(
   --var "RPC_TIMEOUT_MS:2000"
   --var "FEE_PAYER_PA:$SK_A" --var "FEE_PAYER_PB:$SK_B" --var "FEE_PAYER_PM:$SK_M"
   --var "FEE_PAYER_PP:$SK_P" --var "FEE_PAYER_PY:$SK_Y"
-  --var "FEE_PAYER_PC:$SK_C" --var "FEE_PAYER_PD:$SK_D"
+  --var "FEE_PAYER_PC:$SK_C" --var "FEE_PAYER_PD:$SK_D" --var "FEE_PAYER_PG:$SK_G"
 )
+
+TESTKIT=Bh4GY79ytnEZ4t3ZGf7qUVooaSKYyC8sM1uJpiM2xdCW
+BIG_BUDGET=1000000000
+PROGRAM_POLICY='{"actions":[{"type":"program","program_id":"'$TESTKIT'","deploy_slot":1,"retryable_errors":[6000],"instructions":[{"name":"create","discriminator":"181ec828051c0777","payer_index":1,"max_rent_lamports":1100000,"min_accounts":4,"max_accounts":4,"max_data_len":8},{"name":"close_thing","discriminator":"a75149fabad23e79","refund_index":2,"min_accounts":3,"max_accounts":3,"max_data_len":8},{"name":"noop","discriminator":"09b20d738123ed66","min_accounts":0,"max_accounts":1,"max_data_len":8}]}],"limits":{"max_instructions":4,"max_cu":400000,"max_cu_price_micro_lamports":1000}}'
 
 # seed <rpm_a> <rpm_b> <mainnet_enabled> <quota_a> <budget_a> <budget_cd> <budget_b>
 seed() {
   local memo='{"actions":[{"type":"memo","max_bytes":128,"prefix":"gasless-poc:"}]}'
   local cols="aud, slug, name, status, cluster, web3auth_network, allowed_origins, fee_payer_pubkey, policy, user_daily_quota, project_rpm, project_daily_budget_lamports, min_balance_lamports, created_at, updated_at"
-  row() { # aud slug status cluster network origin pubkey rpm [quota] [budget]
-    echo "INSERT INTO projects ($cols) VALUES ('$1','$2','$2','$3','$4','$5','[\"$6\"]','$7','$memo',${9:-100},$8,${10:-1000000000},50000000,0,0);"
+  row() { # aud slug status cluster network origin pubkey rpm [quota] [budget] [policy]
+    echo "INSERT INTO projects ($cols) VALUES ('$1','$2','$2','$3','$4','$5','[\"$6\"]','$7','${11:-$memo}',${9:-100},$8,${10:-1000000000},50000000,0,0);"
     echo "INSERT INTO fee_payer_history (pubkey, aud, cluster, created_at) VALUES ('$7','$1','$4',0);"
   }
   {
@@ -58,6 +63,8 @@ seed() {
     row client-y PY active devnet sapphire_devnet http://localhost:5178 "$PK_Y" 1000
     row client-c PC active devnet sapphire_devnet http://localhost:5179 "$PK_C" 1000 100 "$6"
     row client-d PD active devnet sapphire_devnet http://localhost:5180 "$PK_D" 1000 100 "$6"
+    # Program actions only (spec v3): testkit-shaped program, no memo action.
+    row client-g PG active devnet sapphire_devnet http://localhost:5181 "$PK_G" 1000 100 "$BIG_BUDGET" "$PROGRAM_POLICY"
     echo "INSERT INTO settings (key, value) VALUES ('mainnet_enabled', '$3');"
   } > "$WORK/seed.sql"
 }
@@ -79,7 +86,7 @@ run_suite() {
   until grep -qE "Ready on|ERROR" "$log"; do sleep 0.3; done
   local rc=0
   PERSIST_DIR="$persist" WRANGLER_LOG="$log" RELAYER_URL="http://127.0.0.1:$PORT" MOCK_URL="$MOCK" \
-    PK_A="$PK_A" PK_B="$PK_B" PK_M="$PK_M" PK_X="$PK_X" PK_Y="$PK_Y" PK_C="$PK_C" PK_D="$PK_D" \
+    PK_A="$PK_A" PK_B="$PK_B" PK_M="$PK_M" PK_X="$PK_X" PK_Y="$PK_Y" PK_C="$PK_C" PK_D="$PK_D" PK_G="$PK_G" TESTKIT="$TESTKIT" \
     node tests/e2e.mjs "$suite" || rc=$?
   kill $pid 2>/dev/null; wait $pid 2>/dev/null || true
   # Reset mock behavior between suites.
@@ -88,8 +95,8 @@ run_suite() {
   return $rc
 }
 
-# Usage: ./tests/run-e2e.sh [A] [B] [C] [D] [E]   (default: all; D also runs D2 = restart check)
-SUITES=${*:-A B C D E}
+# Usage: ./tests/run-e2e.sh [A] [B] [C] [D] [E] [F]   (default: all; D also runs D2 = restart check)
+SUITES=${*:-A B C D E F}
 BIG=1000000000
 status=0
 for s in $SUITES; do
@@ -106,6 +113,7 @@ for s in $SUITES; do
        run_suite D D yes 1000 1000 false 2 30000 $BIG 40000 "${D_ARGS[@]}" || status=1
        run_suite D2 D no 0 0 0 0 0 0 0 "${D_ARGS[@]}" || status=1 ;;
     E) run_suite E E yes 1000 1000 false 100 $BIG 30000 $BIG --var COOLDOWN_MS:300 || status=1 ;;
+    F) run_suite F F yes 1000 1000 false 100 $BIG $BIG $BIG --var COOLDOWN_MS:300 || status=1 ;;
     *) echo "unknown suite $s"; status=1 ;;
   esac
 done

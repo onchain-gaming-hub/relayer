@@ -95,6 +95,14 @@ impl ApiError {
         Self::new(503, "cluster_budget", "relayer daily budget exhausted")
             .with_retry_after(retry_after_ms)
     }
+    /// Program actions pass policy but are not relayed yet (v3 Phase 1: no simulation / pin).
+    pub fn program_actions_disabled() -> Self {
+        Self::new(
+            503,
+            "program_actions_disabled",
+            "program actions are not enabled on this relayer yet",
+        )
+    }
     pub fn project_paused() -> Self {
         Self::new(503, "project_paused", "project is not active")
     }

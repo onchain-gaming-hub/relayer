@@ -12,6 +12,7 @@ mod daily;
 mod error;
 mod jwt;
 mod policy;
+mod program_policy;
 mod project_throttle;
 mod registry;
 mod rpc;
@@ -233,14 +234,27 @@ fn relayer_info(
         Some(Ok(p)) if project_gate(p, snap, cfg).is_ok() => p,
         _ => return Err(ApiError::not_found()),
     };
-    let mut memo = json!({ "type": "memo", "max_bytes": project.memo.max_bytes });
-    if let Some(prefix) = &project.memo.prefix {
-        memo["prefix"] = json!(prefix);
+    let mut actions = Vec::new();
+    if let Some(m) = &project.memo {
+        let mut memo = json!({ "type": "memo", "max_bytes": m.max_bytes });
+        if let Some(prefix) = &m.prefix {
+            memo["prefix"] = json!(prefix);
+        }
+        actions.push(memo);
+    }
+    if let Some(p) = &project.program {
+        for rule in &p.programs {
+            actions.push(json!({
+                "type": "program",
+                "program_id": rule.program_id.to_string(),
+                "instructions": rule.instructions.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
+            }));
+        }
     }
     Response::from_json(&json!({
         "pubkey": project.fee_payer.to_string(),
         "cluster": project.cluster.as_str(),
-        "policy": { "actions": [memo] },
+        "policy": { "actions": actions },
         // Whole milliseconds; ceil like retry_after_ms.
         "cooldown_ms": cfg.cooldown_ms.ceil() as u64,
         "user_daily_quota": project.user_daily_quota,
@@ -255,6 +269,33 @@ fn relayer_info(
 #[derive(Deserialize)]
 struct RelayBody {
     transaction: String,
+}
+
+/// Program action (spec v3): structural → identity → project policy + declared cost.
+/// Phase 1 stops here with 503: simulation + inner-ix verification (§4.3) and version pinning
+/// (W6) arrive in Phase 2, and no program tx may be co-signed before they exist.
+async fn handle_program_tx(
+    tx: &solana_transaction::versioned::VersionedTransaction,
+    token: &str,
+    cfg: &Config,
+    snap: &Snapshot,
+    origin: &str,
+) -> std::result::Result<Response, ApiError> {
+    let user = program_policy::structural(tx).map_err(ApiError::validation)?;
+    let project = token_project(token, cfg, snap, &user, Some(origin)).await?;
+    let policy = project
+        .program
+        .as_ref()
+        .ok_or_else(|| ApiError::validation("program actions not enabled for this project"))?;
+    let checked =
+        program_policy::check(tx, &project.fee_payer, policy).map_err(ApiError::validation)?;
+    console_log!(
+        "program tx passed policy (fee {} rent {} sim {}) but program actions are disabled until v3 Phase 2",
+        checked.fee_cost,
+        checked.declared_rent,
+        checked.needs_simulation
+    );
+    Err(ApiError::program_actions_disabled())
 }
 
 /// The project named by a token (unverified `aud`, then a full verify bound to `wallet`),
@@ -353,6 +394,10 @@ async fn handle_relay(
         .decode(body.transaction.as_bytes())
         .map_err(|_| ApiError::validation("transaction is not base64"))?;
     let mut tx = txcore::decode(&raw).map_err(ApiError::validation)?;
+    // W15: one Memo instruction = the v2 memo path; anything else = a program action (v3).
+    if !program_policy::is_memo_shape(&tx) {
+        return handle_program_tx(&tx, &token, cfg, snap, origin).await;
+    }
     let shape = policy::structural(&tx).map_err(ApiError::validation)?;
 
     // 3–5. Identity (+ wallet binding; the unverified `aud` only picks the project and verify
@@ -360,8 +405,12 @@ async fn handle_relay(
     //      (Origin is hygiene; `aud` is the gate).
     let project = token_project(&token, cfg, snap, &shape.user, Some(origin)).await?;
     // 6. Project-dependent policy → cost (V7)
-    let cost = policy::for_project(&shape, &project.fee_payer, &project.memo)
-        .map_err(ApiError::validation)?;
+    let memo_rule = project
+        .memo
+        .as_ref()
+        .ok_or_else(|| ApiError::validation("memo action not enabled for this project"))?;
+    let cost =
+        policy::for_project(&shape, &project.fee_payer, memo_rule).map_err(ApiError::validation)?;
 
     // 7. Co-sign with the project's fee payer + verify every slot
     let relayer = fee_payer(env, project)?;

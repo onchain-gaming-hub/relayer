@@ -5,6 +5,10 @@ One project = one Web3Auth clientId (`aud`) = one fee payer wallet = one cluster
 Spec: `../docs/plans/2026-10-06_multi-project-relayer-v2-spec.md` (extends `2026-10-05_gasless-relayer-poc-spec.md`).
 Phases 1–2 are done: registry, per-project fee payers, project/cluster throttles, and persistent daily limits
 (UTC day) — tx count per user, fee budget per project and per cluster. Devnet only until Phase 5 is approved.
+**v3 (program actions, spec `../docs/plans/2026-10-08_program-actions-v3-spec.md`): Phase 1 done** — the policy
+engine (registered programs/instructions, payer and refund slots, ComputeBudget ceilings, declared fee/rent) runs on
+every program-action tx, which then answers **503 `program_actions_disabled`** until Phase 2 adds simulation +
+inner-ix verification and version pinning. Memo txs are unaffected.
 
 ```
 POST /relay                    { "transaction": "<base64 wire tx>" }   Authorization: Bearer <Web3Auth idToken>
@@ -19,7 +23,8 @@ GET  /quota?wallet=<base58>  → { used, limit, resets_at }                Autho
 |------|------|
 | `src/lib.rs` | Worker router, CORS (union of active origins), idToken auth (JWKS per network), cluster guard, co-sign |
 | `src/registry.rs` | D1 `projects` + `settings` snapshot per isolate (stale-while-revalidate), project parsing |
-| `src/policy.rs` | Tx policy: structural (before auth) + per project (fee payer, memo limit/prefix, cost) |
+| `src/policy.rs` | Memo tx policy (v2 shape): structural (before auth) + per project (fee payer, memo limit/prefix, cost) |
+| `src/program_policy.rs` | Program actions (v3): parse the `program` action, check txs (allowlist, slots, ComputeBudget, cost) |
 | `src/jwt.rs` | ES256 JWT verify (`alg`/`kid`/`aud`/`iss`/`exp`) + wallet binding |
 | `src/user_controller.rs` | DO per `<aud>:<wallet>`: sync in-flight lock → cooldown → daily tx quota → ProjectThrottle → RPC → audit |
 | `src/project_throttle.rs` | DO per project: RPM + daily fee budget + cached fee payer balance → ClusterThrottle |
@@ -27,7 +32,7 @@ GET  /quota?wallet=<base58>  → { used, limit, resets_at }                Autho
 | `src/window.rs` | Fixed one-minute window counter (memory) |
 | `src/daily.rs` | Per-UTC-day counter in DO SQLite: one atomic `UPDATE … WHERE spent + cost <= limit RETURNING` |
 | `src/rpc.rs` | JSON-RPC with timeout; send outcome = accepted / rejected / unknown |
-| `migrations/` | D1: `relay_log` (0001), `projects` / `fee_payer_history` / `settings` (0002) |
+| `migrations/` | D1: `relay_log` (0001), `projects` / `fee_payer_history` / `settings` (0002), v3 columns + `relay_log` rebuild (0003) |
 
 ## Setup (local, devnet)
 

@@ -23,6 +23,7 @@ use crate::{
     config::{Cluster, Config, Web3AuthNetwork},
     error::ApiError,
     policy::{MAX_MEMO_BYTES_CAP, MemoRule},
+    program_policy::{self, ProgramPolicy},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,11 +42,28 @@ pub struct Project {
     pub network: Web3AuthNetwork,
     pub allowed_origins: Vec<String>,
     pub fee_payer: Pubkey,
-    pub memo: MemoRule,
+    /// Memo action (v2 shape). `None` = memo txs are not sponsored.
+    pub memo: Option<MemoRule>,
+    /// Program actions (spec v3). `None` = program txs are not sponsored.
+    pub program: Option<ProgramPolicy>,
     pub user_daily_quota: u32,
     pub project_rpm: u32,
     pub project_daily_budget_lamports: u64,
+    /// Rent the fee payer may front per UTC day (v3 W9; enforced from Phase 3). 0 = none.
+    #[allow(dead_code)]
+    pub project_daily_rent_budget_lamports: u64,
+    /// Per-project timing overrides (v3 W10; enforced from Phase 3). `None` = Worker default.
+    #[allow(dead_code)]
+    pub timing: Timing,
     pub min_balance_lamports: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Timing {
+    pub cooldown_ms: Option<f64>,
+    pub reject_cooldown_ms: Option<f64>,
+    pub reject_cooldown_max_ms: Option<f64>,
+    pub retry_cooldown_ms: Option<f64>,
 }
 
 /// One `projects` row as D1 returns it (numbers arrive as JS numbers).
@@ -63,6 +81,15 @@ pub struct ProjectRow {
     pub project_rpm: f64,
     pub project_daily_budget_lamports: f64,
     pub min_balance_lamports: f64,
+    pub project_daily_rent_budget_lamports: f64,
+    #[serde(default)]
+    pub cooldown_ms: Option<f64>,
+    #[serde(default)]
+    pub reject_cooldown_ms: Option<f64>,
+    #[serde(default)]
+    pub reject_cooldown_max_ms: Option<f64>,
+    #[serde(default)]
+    pub retry_cooldown_ms: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,42 +122,71 @@ fn whole<T: TryFrom<u64>>(v: f64, name: &str, min: u64) -> Result<T, String> {
     T::try_from(v as u64).map_err(|_| format!("{name}: out of range"))
 }
 
-/// Parses the memo action of `projects.policy` (spec v2 V11). Unknown action types fail closed.
-fn parse_policy(json: &str) -> Result<MemoRule, String> {
+fn parse_memo(a: &Value) -> Result<MemoRule, String> {
+    let max_bytes = a
+        .get("max_bytes")
+        .and_then(Value::as_u64)
+        .ok_or("policy: memo.max_bytes required")? as usize;
+    if !(1..=MAX_MEMO_BYTES_CAP).contains(&max_bytes) {
+        return Err(format!(
+            "policy: memo.max_bytes must be 1..={MAX_MEMO_BYTES_CAP}"
+        ));
+    }
+    let prefix = match a.get("prefix") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(p)) if !p.is_empty() && p.len() <= max_bytes => Some(p.clone()),
+        Some(_) => return Err("policy: memo.prefix must be a short non-empty string".into()),
+    };
+    Ok(MemoRule { max_bytes, prefix })
+}
+
+/// Parses `projects.policy` (v2 V11 + v3 §3). Unknown action types fail closed.
+fn parse_policy(json: &str) -> Result<(Option<MemoRule>, Option<ProgramPolicy>), String> {
     let v: Value = serde_json::from_str(json).map_err(|_| "policy: invalid JSON".to_string())?;
     let actions = v
         .get("actions")
         .and_then(Value::as_array)
         .ok_or("policy: missing actions")?;
     let mut memo = None;
+    let mut programs: Vec<program_policy::ProgramRule> = Vec::new();
     for a in actions {
         match a.get("type").and_then(Value::as_str) {
-            Some("memo") if memo.is_none() => {
-                let max_bytes =
-                    a.get("max_bytes")
-                        .and_then(Value::as_u64)
-                        .ok_or("policy: memo.max_bytes required")? as usize;
-                if !(1..=MAX_MEMO_BYTES_CAP).contains(&max_bytes) {
-                    return Err(format!(
-                        "policy: memo.max_bytes must be 1..={MAX_MEMO_BYTES_CAP}"
-                    ));
-                }
-                let prefix = match a.get("prefix") {
-                    None | Some(Value::Null) => None,
-                    Some(Value::String(p)) if !p.is_empty() && p.len() <= max_bytes => {
-                        Some(p.clone())
-                    }
-                    Some(_) => {
-                        return Err("policy: memo.prefix must be a short non-empty string".into());
-                    }
-                };
-                memo = Some(MemoRule { max_bytes, prefix });
-            }
+            Some("memo") if memo.is_none() => memo = Some(parse_memo(a)?),
             Some("memo") => return Err("policy: duplicate memo action".into()),
+            Some("program") => {
+                let p = program_policy::parse_program(a).map_err(|e| format!("policy: {e}"))?;
+                if programs.iter().any(|q| q.program_id == p.program_id) {
+                    return Err(format!("policy: program {} registered twice", p.program_id));
+                }
+                programs.push(p);
+            }
             other => return Err(format!("policy: unknown action type {other:?}")),
         }
     }
-    memo.ok_or_else(|| "policy: no memo action".into())
+    let program = if programs.is_empty() {
+        if v.get("limits").is_some_and(|l| !l.is_null()) {
+            return Err("policy: limits without a program action".into());
+        }
+        None
+    } else {
+        Some(ProgramPolicy {
+            programs,
+            limits: program_policy::parse_limits(v.get("limits"))
+                .map_err(|e| format!("policy: {e}"))?,
+        })
+    };
+    if memo.is_none() && program.is_none() {
+        return Err("policy: no actions".into());
+    }
+    Ok((memo, program))
+}
+
+fn opt_ms(v: Option<f64>, name: &str) -> Result<Option<f64>, String> {
+    match v {
+        None => Ok(None),
+        Some(x) if x.is_finite() && (0.0..=3_600_000.0).contains(&x) => Ok(Some(x)),
+        Some(_) => Err(format!("{name}: must be 0..=3600000 ms")),
+    }
 }
 
 pub fn parse_project(row: &ProjectRow) -> Result<Project, String> {
@@ -163,6 +219,28 @@ pub fn parse_project(row: &ProjectRow) -> Result<Project, String> {
         .fee_payer_pubkey
         .parse()
         .map_err(|_| "fee_payer_pubkey: invalid")?;
+    let (memo, program) = parse_policy(&row.policy)?;
+    let min_balance_lamports: u64 = whole(row.min_balance_lamports, "min_balance_lamports", 0)?;
+    // A payer-slot tx must never pass the breaker without the lamports to pay its rent (§3).
+    if let Some(p) = &program {
+        let max_rent = p.max_rent_per_ix();
+        if max_rent > 0 {
+            let need = (p.limits.max_instructions as u64)
+                .saturating_mul(max_rent)
+                .saturating_add(1_000_000);
+            if min_balance_lamports < need {
+                return Err(format!(
+                    "min_balance_lamports must be >= {need} for payer slots"
+                ));
+            }
+        }
+    }
+    let timing = Timing {
+        cooldown_ms: opt_ms(row.cooldown_ms, "cooldown_ms")?,
+        reject_cooldown_ms: opt_ms(row.reject_cooldown_ms, "reject_cooldown_ms")?,
+        reject_cooldown_max_ms: opt_ms(row.reject_cooldown_max_ms, "reject_cooldown_max_ms")?,
+        retry_cooldown_ms: opt_ms(row.retry_cooldown_ms, "retry_cooldown_ms")?,
+    };
     Ok(Project {
         aud: row.aud.clone(),
         slug: row.slug.clone(),
@@ -171,7 +249,14 @@ pub fn parse_project(row: &ProjectRow) -> Result<Project, String> {
         network,
         allowed_origins,
         fee_payer,
-        memo: parse_policy(&row.policy)?,
+        memo,
+        program,
+        project_daily_rent_budget_lamports: whole(
+            row.project_daily_rent_budget_lamports,
+            "project_daily_rent_budget_lamports",
+            0,
+        )?,
+        timing,
         user_daily_quota: whole(row.user_daily_quota, "user_daily_quota", 1)?,
         project_rpm: whole(row.project_rpm, "project_rpm", 1)?,
         project_daily_budget_lamports: whole(
@@ -179,7 +264,7 @@ pub fn parse_project(row: &ProjectRow) -> Result<Project, String> {
             "project_daily_budget_lamports",
             0,
         )?,
-        min_balance_lamports: whole(row.min_balance_lamports, "min_balance_lamports", 0)?,
+        min_balance_lamports,
     })
 }
 
@@ -290,8 +375,9 @@ async fn load(env: &Env, now: f64) -> Result<Snapshot, String> {
     let rows: Vec<Value> = db
         .prepare(
             "SELECT aud, slug, status, cluster, web3auth_network, allowed_origins, fee_payer_pubkey, \
-             policy, user_daily_quota, project_rpm, project_daily_budget_lamports, min_balance_lamports \
-             FROM projects",
+             policy, user_daily_quota, project_rpm, project_daily_budget_lamports, min_balance_lamports, \
+             project_daily_rent_budget_lamports, cooldown_ms, reject_cooldown_ms, reject_cooldown_max_ms, \
+             retry_cooldown_ms FROM projects",
         )
         .all()
         .await
@@ -329,6 +415,8 @@ mod tests {
             "user_daily_quota": r.user_daily_quota, "project_rpm": r.project_rpm,
             "project_daily_budget_lamports": r.project_daily_budget_lamports,
             "min_balance_lamports": r.min_balance_lamports,
+            "project_daily_rent_budget_lamports": r.project_daily_rent_budget_lamports,
+            "cooldown_ms": r.cooldown_ms,
         })
     }
 
@@ -365,14 +453,66 @@ mod tests {
             project_rpm: 60.0,
             project_daily_budget_lamports: 20_000_000.0,
             min_balance_lamports: 5_000_000.0,
+            project_daily_rent_budget_lamports: 0.0,
+            cooldown_ms: None,
+            reject_cooldown_ms: None,
+            reject_cooldown_max_ms: None,
+            retry_cooldown_ms: None,
         }
+    }
+
+    fn program_policy_json(extra: &str) -> String {
+        format!(
+            r#"{{"actions":[{{"type":"program","program_id":"Bh4GY79ytnEZ4t3ZGf7qUVooaSKYyC8sM1uJpiM2xdCW","deploy_slot":1,
+               "instructions":[{{"name":"create","discriminator":"181ec828051c0777","payer_index":1,"max_rent_lamports":1100000,
+               "min_accounts":4,"max_accounts":4,"max_data_len":8}}]}}]{extra}}}"#
+        )
+    }
+
+    #[test]
+    fn program_policy_parses_with_memo_optional_and_min_balance_rule() {
+        let mut r = row();
+        r.policy = program_policy_json("");
+        // 4 × 1_100_000 + 1_000_000 = 5_400_000 > 5_000_000
+        assert!(
+            parse_project(&r)
+                .unwrap_err()
+                .contains("min_balance_lamports")
+        );
+        r.min_balance_lamports = 5_400_000.0;
+        let p = parse_project(&r).unwrap();
+        assert!(p.memo.is_none());
+        assert_eq!(p.program.as_ref().unwrap().programs.len(), 1);
+        r.policy = program_policy_json(r#","limits":{"max_instructions":2}"#);
+        r.min_balance_lamports = 3_200_000.0; // 2 × 1_100_000 + 1_000_000
+        assert!(parse_project(&r).is_ok());
+        // Same program twice, limits without programs.
+        r.policy = r#"{"actions":[{"type":"memo","max_bytes":8}],"limits":{"max_cu":1}}"#.into();
+        assert!(parse_project(&r).is_err());
+        let twice = program_policy_json("").replace(r#"}]}]"#, r#"}]},{"type":"program","program_id":"Bh4GY79ytnEZ4t3ZGf7qUVooaSKYyC8sM1uJpiM2xdCW","deploy_slot":1,"instructions":[{"name":"x","discriminator":"01","min_accounts":0,"max_accounts":1,"max_data_len":8}]}]"#);
+        r.policy = twice;
+        r.min_balance_lamports = 9_000_000.0;
+        assert!(parse_project(&r).unwrap_err().contains("twice"));
+    }
+
+    #[test]
+    fn timing_overrides_are_bounded() {
+        let mut r = row();
+        r.cooldown_ms = Some(500.0);
+        assert_eq!(parse_project(&r).unwrap().timing.cooldown_ms, Some(500.0));
+        r.cooldown_ms = Some(-1.0);
+        assert!(parse_project(&r).is_err());
+        r.cooldown_ms = None;
+        r.retry_cooldown_ms = Some(f64::NAN);
+        assert!(parse_project(&r).is_err());
     }
 
     #[test]
     fn parses_a_good_row() {
         let p = parse_project(&row()).unwrap();
         assert_eq!(p.cluster, Cluster::Devnet);
-        assert_eq!(p.memo.max_bytes, 128);
+        assert_eq!(p.memo.as_ref().unwrap().max_bytes, 128);
+        assert!(p.program.is_none());
         assert_eq!(p.project_daily_budget_lamports, 20_000_000);
     }
 
@@ -420,9 +560,11 @@ mod tests {
         ] {
             assert!(parse_policy(bad).is_err(), "{bad}");
         }
-        let rule = parse_policy(r#"{"actions":[{"type":"memo","max_bytes":64,"prefix":"app:"}]}"#)
-            .unwrap();
-        assert_eq!(rule.prefix.as_deref(), Some("app:"));
+        let (rule, program) =
+            parse_policy(r#"{"actions":[{"type":"memo","max_bytes":64,"prefix":"app:"}]}"#)
+                .unwrap();
+        assert_eq!(rule.unwrap().prefix.as_deref(), Some("app:"));
+        assert!(program.is_none());
     }
 
     #[test]

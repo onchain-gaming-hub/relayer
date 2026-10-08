@@ -10,7 +10,9 @@ const MOCK = process.env.MOCK_URL || 'http://127.0.0.1:8899';
 const ORIGIN = 'http://localhost:5173';
 const PERSIST = process.env.PERSIST_DIR;
 const WRANGLER_LOG = process.env.WRANGLER_LOG;
-const { PK_A, PK_B, PK_M, PK_X, PK_Y, PK_C, PK_D } = process.env;
+const { PK_A, PK_B, PK_M, PK_X, PK_Y, PK_C, PK_D, PK_G, TESTKIT } = process.env;
+const ORIGIN_G = 'http://localhost:5181';
+const SYSTEM = '11111111111111111111111111111111';
 const ORIGIN_B = 'http://localhost:5174';
 const ORIGIN_M = 'http://localhost:5175';
 const ISS_MAINNET = 'https://issuer-mainnet.test';
@@ -605,10 +607,68 @@ async function suiteE() {
     `C=${JSON.stringify(tc)} D=${JSON.stringify(td)} statuses=${[...c, ...d].map((x) => `${x.status}:${x.json?.code ?? ''}`)}`);
 }
 
+async function suiteF() {
+  // Program actions, v3 Phase 1: the policy engine runs, nothing is relayed yet.
+  const D = { create: '181ec828051c0777', close: 'a75149fabad23e79', noop: '09b20d738123ed66' };
+  const prog = (args, seed = freshSeed()) => JSON.parse(execFileSync('./target/debug/examples/progtx', [PK_G, BLOCKHASH, seed, ...args]).toString());
+  const sendG = async (t, opts = {}) => relay(t, { token: await tokenFor(t.user_hex, { aud: opts.aud ?? 'client-g' }), origin: opts.origin ?? ORIGIN_G });
+  const createIx = `p:${TESTKIT}:${D.create}:u:s,fp:w,new:w,${SYSTEM}:r`;
+  const closeIx = `p:${TESTKIT}:${D.close}:u:s,new:w,fp:w`;
+  const noopIx = `p:${TESTKIT}:${D.noop}:u:s`;
+  const sends0 = (await stats()).sendTransaction;
+
+  const info = await request('/relayer?project=client-g', { method: 'GET' });
+  check('V3 relayer info lists the program action', info.status === 200
+    && info.json?.policy?.actions?.[0]?.type === 'program' && info.json?.policy?.actions?.[0]?.program_id === TESTKIT
+    && info.json?.policy?.actions?.[0]?.instructions?.join() === 'create,close_thing,noop', info.text);
+
+  const gate = (r) => r.status === 503 && r.json?.code === 'program_actions_disabled';
+  let r = await sendG(prog([createIx]));
+  check('V3-2 payer slot passes policy, gated until Phase 2 (503)', gate(r), `${r.status} ${r.json?.code} ${r.json?.reason ?? ''}`);
+  r = await sendG(prog([closeIx]));
+  check('V3-12 refund slot passes policy, gated', gate(r), `${r.status} ${r.json?.code} ${r.json?.reason ?? ''}`);
+  r = await sendG(prog([noopIx]));
+  check('V3-10 crank (user as remaining readonly signer) passes policy, gated', gate(r), `${r.status} ${r.json?.code} ${r.json?.reason ?? ''}`);
+  r = await sendG(prog(['cbl:300000', 'cbp:1000', noopIx]));
+  check('W5 compute budget within ceilings passes, gated', gate(r), `${r.status} ${r.json?.code} ${r.json?.reason ?? ''}`);
+
+  const bad = async (id, args, reason) => {
+    const x = await sendG(prog(args));
+    check(id, x.status === 400 && x.json?.code === 'validation' && x.json?.reason === reason, `${x.status} ${x.json?.reason}`);
+  };
+  await bad('V3-1 unregistered program', [`p:${PK_A}:${D.noop}:u:s`], 'program not allowed');
+  await bad('V3-1 unknown instruction', [`p:${TESTKIT}:0102030405060708:u:s`], 'instruction not allowed');
+  // A top-level CreateAccount needs the new account to sign (3 signers) -> W2 rejects it first.
+  await bad('V3-1 Kora #720: top-level System CreateAccount attached', [noopIx, `p:${SYSTEM}:00000000:fp:w,new:ws`], 'exactly 2 signatures required');
+  // Same attachment without an extra signer: a top-level System Transfer from the relayer to the user.
+  await bad('V3-1 top-level System Transfer from the relayer attached', [noopIx, `p:${SYSTEM}:0200000040420f0000000000:fp:w,u:w`], 'program not allowed');
+  await bad('W3 relayer outside its slot', [`p:${TESTKIT}:${D.noop}:fp:w`, noopIx], 'relayer not allowed in this instruction');
+  await bad('V3-15 payer slot holding the user', [`p:${TESTKIT}:${D.create}:u:s,u:ws,new:w,${SYSTEM}:r`], 'slot must hold the relayer');
+  await bad('W4b refund to someone else', [`p:${TESTKIT}:${D.close}:u:s,new:w,new:w`], 'slot must hold the relayer');
+  await bad('payer + refund slot in one tx', [createIx, closeIx], 'payer and refund slots in one transaction');
+  await bad('W5 CU limit above ceiling', ['cbl:500000', noopIx], 'compute unit limit above ceiling');
+  await bad('W5 CU price without limit', ['cbp:10', noopIx], 'compute unit price needs a compute unit limit');
+  await bad('W5 CU price above ceiling', ['cbl:1000', 'cbp:2000', noopIx], 'compute unit price above ceiling');
+  await bad('max_instructions', [noopIx, noopIx, noopIx, noopIx, noopIx], 'too many instructions');
+
+  // Action routing between projects (W15)
+  const memoToG = mk(freshSeed(), '', PK_G);
+  r = await relay(memoToG, { token: await tokenFor(memoToG.user_hex, { aud: 'client-g' }), origin: ORIGIN_G });
+  check('W15 memo tx to a program-only project', r.status === 400 && r.json?.reason === 'memo action not enabled for this project', `${r.status} ${r.json?.reason}`);
+  const toA = JSON.parse(execFileSync('./target/debug/examples/progtx', [PK_A, BLOCKHASH, freshSeed(), noopIx]).toString());
+  r = await relay(toA, { token: await tokenFor(toA.user_hex), origin: ORIGIN });
+  check('W15 program tx to a memo-only project', r.status === 400 && r.json?.reason === 'program actions not enabled for this project', `${r.status} ${r.json?.reason}`);
+  r = await relayAs(freshSeed());
+  check('memo path unchanged (v2 regression)', r.status === 200, `${r.status} ${r.json?.code}`);
+
+  const sent = (await stats()).sendTransaction - sends0;
+  check('Phase 1: no program tx reached sendTransaction', sent === 1, `sends=${sent} (1 = the memo regression)`);
+}
+
 const info = await request('/relayer?project=test-client', { method: 'GET' });
 relayerPubkey = info.json?.pubkey;
 if (!relayerPubkey) { console.error('relayer not reachable', info); process.exit(2); }
-await { A: suiteA, B: suiteB, C: suiteC, D: suiteD, D2: suiteD2, E: suiteE }[SUITE]();
+await { A: suiteA, B: suiteB, C: suiteC, D: suiteD, D2: suiteD2, E: suiteE, F: suiteF }[SUITE]();
 const failed = results.filter((r) => !r.ok);
 console.log(`\nsuite ${SUITE}: ${results.length - failed.length}/${results.length} passed`);
 process.exit(failed.length ? 1 : 0);
