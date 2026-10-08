@@ -4,7 +4,9 @@
 //   GET  /__token     ?user_hex=&exp=&aud=&aud_array=&iss=&kid=&curve= -> signed JWT
 //   state.balances    { <pubkey>: lamports } overrides state.balance per fee payer
 //   state.simulate    `result.value` for simulateTransaction (null = generic success; `accounts` filled from
-//                     the request with owner state.simOwner when absent) · stats.lastSimulate = its params
+//                     the request with owner state.simOwner when absent; the string "$REQ0" becomes the
+//                     first requested address) · stats.lastSimulate = its params
+//   stats.lastSendSkipPreflight   `skipPreflight` of the last sendTransaction
 //   state.programs    { <programId>: { slot, authority? } } → getAccountInfo returns BPF Upgradeable layouts
 //   POST /__state     merge JSON into state · GET /__stats -> call counters
 import http from 'node:http';
@@ -17,7 +19,7 @@ const jwk = { ...publicKey.export({ format: 'jwk' }), kid: 'test-kid', use: 'sig
 const rsaJwk = { ...crypto.generateKeyPairSync('rsa', { modulusLength: 2048 }).publicKey.export({ format: 'jwk' }), kid: 'rsa-kid', use: 'sig', alg: 'RS256' };
 
 const state = { genesis: DEVNET, genesisMainnet: MAINNET, balances: {}, balance: 10_000_000_000, balanceMode: 'ok', balanceDelayMs: 0, jwksMode: 'ok', send: 'ok', delayMs: 0 };
-const stats = { sendTransaction: 0, getBalance: 0, getGenesisHash: 0, jwks: 0, sendMainnet: 0, simulateTransaction: 0, getAccountInfo: 0, lastSimulate: null };
+const stats = { sendTransaction: 0, getBalance: 0, getGenesisHash: 0, jwks: 0, sendMainnet: 0, simulateTransaction: 0, getAccountInfo: 0, lastSimulate: null, lastSendSkipPreflight: null };
 Object.assign(state, { simulate: null, simOwner: '11111111111111111111111111111111', programs: {} });
 
 // Minimal base58 (pubkeys only) for the fake ProgramData addresses.
@@ -77,7 +79,7 @@ http.createServer(async (req, res) => {
     case 'simulateTransaction': {
       const addresses = rpc.params?.[1]?.accounts?.addresses ?? [];
       stats.lastSimulate = rpc.params?.[1];
-      const v = state.simulate ? structuredClone(state.simulate) : {
+      const v = state.simulate ? JSON.parse(JSON.stringify(state.simulate).replaceAll('$REQ0', addresses[0] ?? '')) : {
         err: null, fee: 10000, preBalances: [10_000_000_000], postBalances: [9_999_990_000], innerInstructions: [] };
       if (!('accounts' in v)) v.accounts = addresses.map(() => ({ owner: state.simOwner, lamports: 1, data: ['', 'base64'] }));
       return ok({ context: { slot: 1 }, value: v });
@@ -106,6 +108,7 @@ http.createServer(async (req, res) => {
       return ok({ context: { slot: 1 }, value: state.balances[rpc.params?.[0]] ?? state.balance });
     case 'sendTransaction': {
       if (mainnet) stats.sendMainnet++;
+      stats.lastSendSkipPreflight = rpc.params?.[1]?.skipPreflight ?? null;
       if (state.delayMs) await new Promise((r) => setTimeout(r, state.delayMs));
       switch (state.send) {
         case 'ok': return ok(crypto.randomBytes(32).toString('hex'));

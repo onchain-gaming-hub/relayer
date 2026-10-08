@@ -615,7 +615,7 @@ async function suiteF() {
   const createIx = `p:${TESTKIT}:${D.create}:u:s,fp:w,new:w,${SYSTEM}:r`;
   const closeIx = `p:${TESTKIT}:${D.close}:u:s,new:w,fp:w`;
   const noopIx = `p:${TESTKIT}:${D.noop}:u:s`;
-  const NEW = 'GXD5K3SHLJvzAKkok3xKJsTZV3THWSmewhUL8CmvD5L'; // any program-owned account
+  const NEW = '$REQ0'; // the mock substitutes the tx's first writable unsigned account (the new Thing)
   const RENT = 1_021_080, FEE = 10_000;
   const sys = (type, info) => ({ program: 'system', programId: SYSTEM, parsed: { type, info }, stackHeight: 2 });
   const sim = (pre, post, inner = [], extra = {}) => ({ err: null, fee: FEE, preBalances: [pre], postBalances: [post],
@@ -636,6 +636,7 @@ async function suiteF() {
   check('V3-2 payer slot: simulate → verify → relayed (200)', r.status === 200 && typeof r.json?.signature === 'string', `${r.status} ${r.json?.code} ${r.json?.reason ?? ''}`);
   check('V3-14 simulate uses commitment confirmed + innerInstructions', st.lastSimulate?.commitment === 'confirmed' && st.lastSimulate?.innerInstructions === true
     && st.lastSimulate?.sigVerify === true && st.lastSimulate?.replaceRecentBlockhash === false, JSON.stringify(st.lastSimulate));
+  check('W7 skip_preflight_after_verify: verified tx sent with skipPreflight', st.lastSendSkipPreflight === true, `skipPreflight=${st.lastSendSkipPreflight}`);
   await setState({ simulate: sim(5_000_000_000, 5_000_000_000 + RENT - FEE) });
   r = await sendG(prog([closeIx]));
   check('V3-12 refund slot: net inflow → relayed', r.status === 200, `${r.status} ${r.json?.code} ${r.json?.reason ?? ''}`);
@@ -646,6 +647,8 @@ async function suiteF() {
   r = await sendG(prog([`p:${NOVERIFY}:${D.noop}:u:s`]));
   const simCalls = (await stats()).simulateTransaction - simBefore;
   check('V3-5 verify_inner_ix=false: no simulation, relayed', r.status === 200 && simCalls === 0, `${r.status} ${r.json?.code} sims=${simCalls}`);
+  const noSimSkip = (await stats()).lastSendSkipPreflight;
+  check('W7 unsimulated tx keeps the RPC preflight', noSimSkip === false, `skipPreflight=${noSimSkip}`);
 
   // ---- §4.3 rejections: nothing is sent ----
   const reject = async (id, simValue, args, code = 'inner_ix_rejected', status = 400) => {
@@ -666,6 +669,7 @@ async function suiteF() {
   }
   await reject('V3-4 outflow above declared rent → 400', sim(5_000_000_000, 5_000_000_000 - 2_000_000), [createIx]);
   await reject('createAccount owned by another program → 400', createSim({ owner: SYSTEM }), [createIx]);
+  await reject('created account reassigned away (post-state owner) → 400', { ...createSim(), accounts: [{ owner: SYSTEM, lamports: RENT }] }, [createIx]);
   await reject('fee payer passed to another program (nested) → 400', sim(5_000_000_000, 5_000_000_000 - FEE,
     [{ program: 'spl-token', programId: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA', parsed: { type: 'transfer', info: { signers: [PK_G] } } }]), [noopIx]);
   await reject('V3-12 fake refund (relayer loses more than the fee) → 400', sim(5_000_000_000, 5_000_000_000 - 500_000), [closeIx]);
@@ -673,6 +677,10 @@ async function suiteF() {
   await reject('simulation missing accounts → 503 (fail-closed)', { ...createSim(), accounts: null }, [createIx], 'upstream', 503);
   const failed = await reject('program error in simulation → 400 simulation_failed', { ...sim(5_000_000_000, 5_000_000_000 - FEE), err: { InstructionError: [0, { Custom: 6000 }] } }, [noopIx], 'simulation_failed');
   check('simulation_failed carries the program error and a backoff', /Custom/.test(failed.json?.reason ?? '') && failed.json?.retry_after_ms > 0, JSON.stringify(failed.json));
+  for (const err of ['InsufficientFundsForFee', 'AccountNotFound']) {
+    const x = await reject(`relayer wallet unfunded (${err}) → 503 low_balance`, { ...sim(0, 0), err }, [noopIx], 'low_balance', 503);
+    check(`${err}: no backoff for the user`, x.json?.retry_after_ms === undefined, JSON.stringify(x.json));
+  }
   await setState({ simulate: null });
 
   // ---- W6 version pin ----
@@ -693,6 +701,9 @@ async function suiteF() {
   await bad('payer + refund slot in one tx', [createIx, closeIx], 'payer and refund slots in one transaction');
   await bad('W5 CU limit above ceiling', ['cbl:500000', noopIx], 'compute unit limit above ceiling');
   await bad('W5 CU price without limit', ['cbp:10', noopIx], 'compute unit price needs a compute unit limit');
+  await bad('W4b refund to someone else', [`p:${TESTKIT}:${D.close}:u:s,new:w,new:w`], 'slot must hold the relayer');
+  await bad('W5 CU price above ceiling', ['cbl:1000', 'cbp:2000', noopIx], 'compute unit price above ceiling');
+  await bad('max_instructions', [noopIx, noopIx, noopIx, noopIx, noopIx], 'too many instructions');
 
   // ---- routing + accounting ----
   const memoToG = mk(freshSeed(), '', PK_G);
@@ -708,6 +719,9 @@ async function suiteF() {
   const rows = d1Query(`SELECT cost_lamports AS c, rent_lamports AS r FROM relay_log WHERE aud = 'client-g' AND status = 'success' ORDER BY id`);
   check('W8 audit: payer-slot tx charged fee + declared rent, simulated rent logged',
     rows[0]?.c === 1_110_000 && rows[0]?.r === RENT && rows.slice(1).every((x) => x.c === FEE), JSON.stringify(rows));
+  const rej = d1Query(`SELECT reason FROM relay_log WHERE aud = 'client-g' AND status = 'rpc_error' ORDER BY id`).map((x) => x.reason ?? '');
+  check('rejections audited as rpc_error with a reason prefix',
+    rej.some((x) => x.startsWith('inner_ix_rejected: ')) && rej.some((x) => x.startsWith('simulation_failed: ')), JSON.stringify(rej).slice(0, 300));
   const sends = (await stats()).sendTransaction - s0.sendTransaction;
   check('sendTransaction only for the 4 relayed program txs + 1 memo', sends === 5, `sends=${sends}`);
 }

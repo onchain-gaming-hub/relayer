@@ -92,12 +92,26 @@ thread_local! {
     static FEE_PAYERS: RefCell<HashMap<String, Keypair>> = RefCell::new(HashMap::new());
     static CLUSTERS_CONFIRMED: RefCell<HashSet<Cluster>> = RefCell::new(HashSet::new());
     /// Version pins (v3 W6): program → (ProgramData slot, upgrade authority, fetched_at).
-    static PINS: RefCell<HashMap<Pubkey, PinState>> = RefCell::new(HashMap::new());
+    /// Keyed by (cluster, program): one program id can be deployed on devnet and mainnet.
+    static PINS: RefCell<HashMap<(Cluster, Pubkey), PinState>> = RefCell::new(HashMap::new());
 }
 
 const PIN_CACHE_MS: f64 = 60_000.0;
 /// (ProgramData slot, upgrade authority, fetched_at).
 type PinState = (u64, Option<Pubkey>, f64);
+
+fn pin_cached(cluster: Cluster, program: &Pubkey, now: f64) -> Option<(u64, Option<Pubkey>)> {
+    PINS.with(|c| c.borrow().get(&(cluster, *program)).copied())
+        .filter(|(_, _, at)| now - at < PIN_CACHE_MS)
+        .map(|(slot, auth, _)| (slot, auth))
+}
+
+fn pin_store(cluster: Cluster, program: &Pubkey, slot: u64, auth: Option<Pubkey>, now: f64) {
+    PINS.with(|c| {
+        c.borrow_mut()
+            .insert((cluster, *program), (slot, auth, now))
+    });
+}
 
 /// Every pinned program in the tx must match its registered version (W6): 503
 /// `program_changed` otherwise. Cached 60 s per isolate; RPC failures are not cached.
@@ -108,10 +122,9 @@ async fn ensure_pins(
     pins: &[(Pubkey, program_policy::Pin)],
 ) -> std::result::Result<(), ApiError> {
     for (program, pin) in pins {
-        let cached = PINS.with(|c| c.borrow().get(program).copied());
-        let (slot, authority) = match cached {
-            Some((slot, auth, at)) if now_ms() - at < PIN_CACHE_MS => (slot, auth),
-            _ => {
+        let (slot, authority) = match pin_cached(cluster, program, now_ms()) {
+            Some(hit) => hit,
+            None => {
                 let url = config::rpc_url(env, cluster).map_err(ApiError::config)?;
                 let (owner, data) =
                     rpc::get_account(&url, cfg.rpc_timeout_ms, &program.to_string(), Some(36))
@@ -133,7 +146,7 @@ async fn ensure_pins(
                 let owner: Pubkey = owner.parse().map_err(|_| ApiError::upstream("bad owner"))?;
                 let (slot, auth) = pin::programdata_state(&owner, &data)
                     .map_err(|e| ApiError::config(format!("program {program}: {e}")))?;
-                PINS.with(|c| c.borrow_mut().insert(*program, (slot, auth, now_ms())));
+                pin_store(cluster, program, slot, auth, now_ms());
                 (slot, auth)
             }
         };
@@ -409,6 +422,7 @@ async fn handle_program_tx(
             "registered": policy.programs.iter().map(|p| p.program_id.to_string()).collect::<Vec<_>>(),
             "static_keys": static_keys,
             "requested": requested,
+            "skip_preflight_after_verify": policy.limits.skip_preflight_after_verify,
         },
     });
     send_job(env, &project.aud, &user, job).await
@@ -792,7 +806,7 @@ async fn ensure_cluster(
 
 #[cfg(test)]
 mod tests {
-    use super::txcore;
+    use super::{Cluster, PIN_CACHE_MS, Pubkey, pin_cached, pin_store, txcore};
     use crate::policy::tests::good_tx;
     use solana_keypair::Keypair;
     use solana_signature::Signature;
@@ -848,5 +862,21 @@ mod tests {
         let mut tx = good_tx(&relayer.pubkey(), &Keypair::new());
         tx.signatures[1] = Signature::default();
         assert!(txcore::cosign_and_verify(&mut tx, &relayer).is_err());
+    }
+
+    #[test]
+    fn pin_cache_is_per_cluster_and_expires() {
+        let program = Pubkey::new_from_array([7; 32]);
+        pin_store(Cluster::Devnet, &program, 5, None, 1_000.0);
+        assert_eq!(
+            pin_cached(Cluster::Devnet, &program, 2_000.0),
+            Some((5, None))
+        );
+        // A devnet entry must never answer for mainnet (an Immutable pin would pass by mistake).
+        assert_eq!(pin_cached(Cluster::Mainnet, &program, 2_000.0), None);
+        assert_eq!(
+            pin_cached(Cluster::Devnet, &program, 1_000.0 + PIN_CACHE_MS),
+            None
+        );
     }
 }

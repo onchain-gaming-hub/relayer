@@ -113,10 +113,17 @@ pub fn classify_send(status: u16, text: &str) -> SendOutcome {
     }
 }
 
-pub async fn send_transaction(url: &str, timeout_ms: u64, tx_base64: &str) -> SendOutcome {
+/// `skip_preflight` only for program txs the relayer has just simulated and verified (v3 W7
+/// `skip_preflight_after_verify`); every other send keeps the RPC's preflight.
+pub async fn send_transaction(
+    url: &str,
+    timeout_ms: u64,
+    tx_base64: &str,
+    skip_preflight: bool,
+) -> SendOutcome {
     let body = rpc_body(
         "sendTransaction",
-        json!([tx_base64, { "encoding": "base64", "skipPreflight": false, "preflightCommitment": "confirmed" }]),
+        json!([tx_base64, { "encoding": "base64", "skipPreflight": skip_preflight, "preflightCommitment": "confirmed" }]),
     );
     match post(url, timeout_ms, &body).await {
         Raw::Http(status, text) => classify_send(status, &text),
@@ -165,7 +172,6 @@ pub async fn get_genesis_hash(url: &str, timeout_ms: u64) -> Result<String, Stri
         .ok_or_else(|| "getGenesisHash: bad result".into())
 }
 
-/// Plain GET with the same timeout semantics (used for the Web3Auth JWKS).
 /// `simulateTransaction` (spec v3 §4.3): returns `result.value`. Always `commitment: confirmed`
 /// (matches the FE blockhash and `preflightCommitment`; the RPC default `finalized` would report
 /// fresh blockhashes as not found).
@@ -220,6 +226,7 @@ pub async fn get_account(
     Ok(Some((owner.to_string(), bytes)))
 }
 
+/// Plain GET with the same timeout semantics (used for the Web3Auth JWKS).
 pub async fn get_text(url: &str, timeout_ms: u64) -> Result<String, String> {
     let call = async {
         let mut resp = Fetch::Url(url.parse().map_err(|_| "bad url".to_string())?)

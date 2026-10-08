@@ -65,6 +65,9 @@ pub struct ProgramJob {
     /// keys whose post-state the simulation returns.
     pub static_keys: Vec<String>,
     pub requested: Vec<String>,
+    /// W7 `skip_preflight_after_verify`: only honored when this tx was simulated.
+    #[serde(default)]
+    pub skip_preflight_after_verify: bool,
 }
 
 #[derive(Deserialize)]
@@ -232,7 +235,12 @@ impl UserController {
             }
         };
 
-        let outcome = rpc::send_transaction(&url, cfg.rpc_timeout_ms, &job.tx).await;
+        let skip_preflight = job
+            .program
+            .as_ref()
+            .is_some_and(|p| p.needs_simulation && p.skip_preflight_after_verify);
+        let outcome =
+            rpc::send_transaction(&url, cfg.rpc_timeout_ms, &job.tx, skip_preflight).await;
         let done = Date::now().as_millis() as f64;
 
         // D17: only a rejection caused by the transaction itself (JSON-RPC error except node-side
@@ -416,9 +424,23 @@ impl UserController {
             );
             match verdict {
                 Verdict::Ok { rent_spent } => rent_simulated = Some(rent_spent),
+                Verdict::FeePayerUnfunded => {
+                    // The relayer's wallet, not the user: no backoff.
+                    self.refund_user(day);
+                    return Err(ApiError::low_balance());
+                }
                 Verdict::ProgramError(reason) => {
                     self.refund_user(day);
                     let wait = self.penalize(&storage, cfg, &job.user).await;
+                    // relay_log's CHECK has no 'rejected' status: rpc_error + reason prefix.
+                    let at = Date::now().as_millis() as f64;
+                    self.audit(
+                        job,
+                        "rpc_error",
+                        Some(format!("simulation_failed: {reason}")),
+                        at,
+                        None,
+                    );
                     return Err(ApiError::simulation_failed(reason, wait));
                 }
                 Verdict::Incomplete(field) => {
@@ -427,6 +449,14 @@ impl UserController {
                 }
                 Verdict::Rejected(reason) => {
                     console_error!("inner_ix_rejected for {} ({}): {reason}", job.user, job.aud);
+                    let at = Date::now().as_millis() as f64;
+                    self.audit(
+                        job,
+                        "rpc_error",
+                        Some(format!("inner_ix_rejected: {reason}")),
+                        at,
+                        None,
+                    );
                     self.refund_user(day);
                     let wait = self.penalize(&storage, cfg, &job.user).await;
                     return Err(ApiError::inner_ix_rejected(reason, wait));

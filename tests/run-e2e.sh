@@ -47,7 +47,7 @@ COMMON=(
 TESTKIT=Bh4GY79ytnEZ4t3ZGf7qUVooaSKYyC8sM1uJpiM2xdCW
 BIG_BUDGET=1000000000
 NOOP_IX='{"name":"noop","discriminator":"09b20d738123ed66","min_accounts":0,"max_accounts":1,"max_data_len":8}'
-PROGRAM_POLICY='{"actions":[{"type":"program","program_id":"'$TESTKIT'","deploy_slot":1,"retryable_errors":[6000],"instructions":[{"name":"create","discriminator":"181ec828051c0777","payer_index":1,"max_rent_lamports":1100000,"min_accounts":4,"max_accounts":4,"max_data_len":8},{"name":"close_thing","discriminator":"a75149fabad23e79","refund_index":2,"min_accounts":3,"max_accounts":3,"max_data_len":8},'$NOOP_IX']},{"type":"program","program_id":"'$NOVERIFY'","deploy_slot":7,"verify_inner_ix":false,"instructions":['$NOOP_IX']},{"type":"program","program_id":"'$PINX'","deploy_slot":5,"instructions":['$NOOP_IX']}],"limits":{"max_instructions":4,"max_cu":400000,"max_cu_price_micro_lamports":1000}}'
+PROGRAM_POLICY='{"actions":[{"type":"program","program_id":"'$TESTKIT'","deploy_slot":1,"retryable_errors":[6000],"instructions":[{"name":"create","discriminator":"181ec828051c0777","payer_index":1,"max_rent_lamports":1100000,"min_accounts":4,"max_accounts":4,"max_data_len":8},{"name":"close_thing","discriminator":"a75149fabad23e79","refund_index":2,"min_accounts":3,"max_accounts":3,"max_data_len":8},'$NOOP_IX']},{"type":"program","program_id":"'$NOVERIFY'","deploy_slot":7,"verify_inner_ix":false,"instructions":['$NOOP_IX']},{"type":"program","program_id":"'$PINX'","deploy_slot":5,"instructions":['$NOOP_IX']}],"limits":{"max_instructions":4,"max_cu":400000,"max_cu_price_micro_lamports":1000,"skip_preflight_after_verify":true}}'
 
 # seed <rpm_a> <rpm_b> <mainnet_enabled> <quota_a> <budget_a> <budget_cd> <budget_b>
 seed() {

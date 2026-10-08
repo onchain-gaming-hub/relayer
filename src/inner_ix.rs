@@ -240,6 +240,9 @@ pub enum Verdict {
     Ok { rent_spent: u64 },
     /// The program failed in simulation (`err != null`): handled by the caller (§4.2).
     ProgramError(String),
+    /// The relayer's own wallet cannot pay (`InsufficientFundsForFee` / `AccountNotFound`):
+    /// not the user's fault — 503 `low_balance`, no backoff.
+    FeePayerUnfunded,
     /// A field §4.3 needs is missing while `err == null`: 503 upstream (fail-closed).
     Incomplete(&'static str),
     /// §4.3 violated: 400 `inner_ix_rejected`.
@@ -247,6 +250,13 @@ pub enum Verdict {
 }
 
 pub fn verify(sim: &Simulation, e: Expect) -> Verdict {
+    // Transaction-level errors about the fee payer itself (not an instruction error).
+    if matches!(
+        sim.err.as_str(),
+        Some("InsufficientFundsForFee" | "AccountNotFound")
+    ) {
+        return Verdict::FeePayerUnfunded;
+    }
     if !sim.err.is_null() {
         return Verdict::ProgramError(sim.err.to_string().chars().take(200).collect());
     }
@@ -296,6 +306,21 @@ pub fn verify(sim: &Simulation, e: Expect) -> Verdict {
                     return Verdict::Rejected(format!(
                         "createAccount owner {owner} is not a registered program"
                     ));
+                }
+                // The post-state owner must still be registered: a CPI `assign` after the create
+                // would hand the fee payer's rent to another program.
+                match owner_of(new_account) {
+                    Some(Some(o)) if e.registered.contains(&o) => {}
+                    Some(_) => {
+                        return Verdict::Rejected(format!(
+                            "created account {new_account} ends up owned by another program"
+                        ));
+                    }
+                    None => {
+                        return Verdict::Rejected(format!(
+                            "created account {new_account} not in simulated accounts"
+                        ));
+                    }
                 }
                 new_account
             }
@@ -442,8 +467,9 @@ mod tests {
         );
         let mut v = create_value();
         v["innerInstructions"][0]["instructions"][0]["parsed"]["info"]["newAccount"] = json!(USER);
+        // Even if the user's account somehow ended up owned by the program, rent may not go there.
         assert!(
-            matches!(verify(&parse_simulation(&v, &[], &[p(THING)]), expect(&fp, &user, &reg)), Verdict::Rejected(m) if m.contains("user"))
+            matches!(verify(&parse_simulation(&v, &[], &[p(USER)]), expect(&fp, &user, &reg)), Verdict::Rejected(m) if m.contains("user"))
         );
     }
 
@@ -549,6 +575,35 @@ mod tests {
             ),
             Verdict::ProgramError(_)
         ));
+    }
+
+    #[test]
+    fn create_then_reassigned_or_unfunded_fee_payer() {
+        let (fp, user, reg) = (p(FP), p(USER), [p(TESTKIT)]);
+        // Created as a testkit account, then assigned away inside the same tx.
+        let mut v = create_value();
+        v["accounts"] = json!([{ "owner": SYS }]);
+        let sim = parse_simulation(&v, &[], &[p(THING)]);
+        assert!(
+            matches!(verify(&sim, expect(&fp, &user, &reg)), Verdict::Rejected(m) if m.contains("ends up owned"))
+        );
+        // Created account missing from the simulated accounts.
+        let mut v = create_value();
+        v["accounts"] = json!([]);
+        let sim = parse_simulation(&v, &[], &[]);
+        assert!(
+            matches!(verify(&sim, expect(&fp, &user, &reg)), Verdict::Rejected(m) if m.contains("not in simulated"))
+        );
+        // The relayer's own wallet is empty: not the user's program error.
+        for err in ["InsufficientFundsForFee", "AccountNotFound"] {
+            let mut v = create_value();
+            v["err"] = json!(err);
+            let sim = parse_simulation(&v, &[], &[p(THING)]);
+            assert_eq!(
+                verify(&sim, expect(&fp, &user, &reg)),
+                Verdict::FeePayerUnfunded
+            );
+        }
     }
 
     #[test]
