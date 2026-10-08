@@ -18,8 +18,14 @@ use crate::policy::{LAMPORTS_PER_SIGNATURE, MEMO_V2};
 pub const COMPUTE_BUDGET: Pubkey =
     Pubkey::from_str_const("ComputeBudget111111111111111111111111111111");
 pub const SYSTEM_PROGRAM: Pubkey = Pubkey::from_str_const("11111111111111111111111111111111");
-/// Programs a project may never register directly in v3 (spec §3).
-const FORBIDDEN_PROGRAMS: [Pubkey; 9] = [
+/// Programs a project may never register directly in v3 (spec §3). Precompiles are listed
+/// because their signatures are part of the base fee, which W8 assumes is 2 × 5000.
+const FORBIDDEN_PROGRAMS: [Pubkey; 14] = [
+    Pubkey::from_str_const("Ed25519SigVerify111111111111111111111111111"),
+    Pubkey::from_str_const("KeccakSecp256k11111111111111111111111111111"),
+    Pubkey::from_str_const("Secp256r1SigVerify1111111111111111111111111"),
+    Pubkey::from_str_const("AddressLookupTab1e1111111111111111111111111"),
+    Pubkey::from_str_const("Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo"),
     SYSTEM_PROGRAM,
     COMPUTE_BUDGET,
     MEMO_V2,
@@ -148,7 +154,8 @@ fn hex_bytes(v: Option<&Value>, what: &str, max: usize) -> Result<Vec<u8>, Strin
     let s = v
         .and_then(Value::as_str)
         .ok_or_else(|| format!("{what}: hex string required"))?;
-    if s.is_empty() || s.len() % 2 != 0 || s.len() / 2 > max {
+    // ASCII first: byte-slicing a multi-byte char would panic and take the whole registry down.
+    if !s.is_ascii() || s.is_empty() || s.len() % 2 != 0 || s.len() / 2 > max {
         return Err(format!("{what}: 1..={max} bytes of hex"));
     }
     (0..s.len())
@@ -454,7 +461,10 @@ pub fn structural(tx: &VersionedTransaction) -> Result<Pubkey, &'static str> {
     }
     let keys = tx.message.static_account_keys();
     let n = tx.message.instructions().len();
-    if n == 0 || n > MAX_INSTRUCTIONS_CAP as usize {
+    if n == 0 {
+        return Err("no instructions");
+    }
+    if n > MAX_INSTRUCTIONS_CAP as usize {
         return Err("too many instructions");
     }
     // No account key may appear twice (the runtime rejects it too; the policy does not rely on it).
@@ -916,6 +926,13 @@ mod tests {
         assert!(
             with(&|v| v["instructions"][0]["discriminator"] = json!("1830c828")).is_err(),
             "slot needs 8 bytes"
+        );
+        // Non-ASCII must be an error, not a panic (a panic would take the whole registry down).
+        assert!(with(&|v| v["instructions"][2]["discriminator"] = json!("€a")).is_err());
+        assert!(
+            with(&|v| v["program_id"] = json!("Ed25519SigVerify111111111111111111111111111"))
+                .is_err(),
+            "precompile"
         );
         assert!(with(&|v| v["instructions"][0]["max_rent_lamports"] = json!(0)).is_err());
         assert!(

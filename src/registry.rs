@@ -273,6 +273,8 @@ pub struct Snapshot {
     projects: HashMap<String, Result<Project, String>>,
     /// Union of `allowed_origins` of active projects (CORS preflight, V9).
     pub origins: HashSet<String>,
+    /// Union of programs registered by active projects: checked before the idToken verify (v3 §4.1).
+    pub program_ids: HashSet<Pubkey>,
     pub mainnet_enabled: bool,
     pub loaded_at: f64,
 }
@@ -284,6 +286,7 @@ impl Snapshot {
     pub fn build(rows: Vec<Value>, settings: &[(String, String)], loaded_at: f64) -> Self {
         let mut projects = HashMap::new();
         let mut origins = HashSet::new();
+        let mut program_ids = HashSet::new();
         for raw in rows {
             let Some(aud) = raw.get("aud").and_then(Value::as_str).map(str::to_string) else {
                 console_warn_native("registry: skipping a projects row without a text aud");
@@ -296,6 +299,9 @@ impl Snapshot {
                 && p.status == Status::Active
             {
                 origins.extend(p.allowed_origins.iter().cloned());
+                if let Some(pp) = &p.program {
+                    program_ids.extend(pp.programs.iter().map(|r| r.program_id));
+                }
             }
             projects.insert(aud, parsed);
         }
@@ -305,6 +311,7 @@ impl Snapshot {
         Self {
             projects,
             origins,
+            program_ids,
             mainnet_enabled,
             loaded_at,
         }

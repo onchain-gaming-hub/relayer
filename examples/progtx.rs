@@ -13,10 +13,14 @@ use solana_signature::Signature;
 use solana_signer::Signer;
 use solana_transaction::versioned::VersionedTransaction;
 
-const COMPUTE_BUDGET: Pubkey = Pubkey::from_str_const("ComputeBudget111111111111111111111111111111");
+const COMPUTE_BUDGET: Pubkey =
+    Pubkey::from_str_const("ComputeBudget111111111111111111111111111111");
 
 fn hex(s: &str) -> Vec<u8> {
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex")).collect()
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+        .collect()
 }
 
 fn main() {
@@ -68,15 +72,31 @@ fn main() {
             Instruction::new_with_bytes(program, &data, accounts)
         })
         .collect();
-    let message = VersionedMessage::Legacy(Message::new_with_blockhash(&ixs, Some(&fee_payer), &blockhash));
+    let message = VersionedMessage::Legacy(Message::new_with_blockhash(
+        &ixs,
+        Some(&fee_payer),
+        &blockhash,
+    ));
     let keys = message.static_account_keys();
     let n = message.header().num_required_signatures as usize;
     let mut signatures = vec![Signature::default(); n];
-    if let Some(i) = keys.iter().position(|k| *k == user.pubkey()).filter(|i| *i < n) {
+    if let Some(i) = keys
+        .iter()
+        .position(|k| *k == user.pubkey())
+        .filter(|i| *i < n)
+    {
         signatures[i] = user.sign_message(&message.serialize());
     }
-    let tx = VersionedTransaction { signatures, message };
-    let user_hex: String = user.pubkey().to_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    let tx = VersionedTransaction {
+        signatures,
+        message,
+    };
+    let user_hex: String = user
+        .pubkey()
+        .to_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     println!(
         "{{\"tx\":\"{}\",\"user\":\"{}\",\"user_hex\":\"{}\"}}",
         B64.encode(wincode::serialize(&tx).unwrap()),

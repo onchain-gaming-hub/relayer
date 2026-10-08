@@ -282,6 +282,17 @@ async fn handle_program_tx(
     origin: &str,
 ) -> std::result::Result<Response, ApiError> {
     let user = program_policy::structural(tx).map_err(ApiError::validation)?;
+    // §4.1 step 2: a program no active project registered cannot pass anywhere — reject it
+    // before spending an ES256 verify.
+    let keys = tx.message.static_account_keys();
+    for ix in tx.message.instructions() {
+        let program = keys
+            .get(ix.program_id_index as usize)
+            .ok_or_else(|| ApiError::validation("bad program index"))?;
+        if *program != program_policy::COMPUTE_BUDGET && !snap.program_ids.contains(program) {
+            return Err(ApiError::validation("program not allowed"));
+        }
+    }
     let project = token_project(token, cfg, snap, &user, Some(origin)).await?;
     let policy = project
         .program

@@ -86,6 +86,11 @@ key sets.
 
 See spec v2 §7 (Phase 4) and §10. Never deploy or run remote D1 migrations without approval.
 
+**Order for v3:** apply `migrations/0003` on the remote D1 **before** `wrangler deploy` of a v3 Worker (the v3
+registry reads the new columns; a v2 Worker keeps working on the 0003 schema). Program-action discriminators:
+use the full 8-byte Anchor discriminator even when not required (a shorter prefix allows every instruction that
+starts with the same bytes).
+
 ⚠️ **One fee payer per project, one cluster per fee payer, for life** (`fee_payer_history` enforces it in D1). A 504
 `rpc_unknown` returns the fee payer's slot-0 signature, so a user holds a fully signed transaction; the relayer cannot
 tell which cluster its blockhash came from. Mainnet keys never go on a machine the Oracle can read.

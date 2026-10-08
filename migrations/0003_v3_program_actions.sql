@@ -1,5 +1,8 @@
--- Program actions (spec v3 §3, W9, W10, V14). Run on remote while the affected projects are
--- paused: relay_log is rebuilt (audit inserts are best-effort, so only a few rows may be lost).
+-- Program actions (spec v3 §3, W9, W10, V14).
+-- ORDER: apply this BEFORE deploying the v3 Worker. The v3 registry SELECTs these columns, so a v3
+-- Worker on a v2 schema cannot load the registry (every project 503s). A v2 Worker runs fine on this
+-- schema (its INSERTs name their columns). Run while the affected projects are paused: relay_log is
+-- rebuilt (audit inserts are best-effort, so only a few rows may be lost).
 
 ALTER TABLE projects ADD COLUMN project_daily_rent_budget_lamports INTEGER NOT NULL DEFAULT 0
   CHECK (project_daily_rent_budget_lamports >= 0);

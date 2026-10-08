@@ -44,5 +44,5 @@ new_sqlite_classes = ["UserController", "ProjectThrottle", "ClusterThrottle"]
 [[d1_databases]]
 binding = "DB"
 database_name = "gasless-relayer-audit"
-database_id = "e3bf7ce9-6c44-43a6-b6cb-398c04068d9f" # local only — replace via runbook (`wrangler d1 create`)
+database_id = "e3bf7ce9-6c44-43a6-b6cb-398c04068d9f" # remote D1 (staging, created 2026-10-08 via runbook); local dev keeps its own copy under .wrangler/
 migrations_dir = "migrations"
