@@ -503,6 +503,22 @@ fn compute_budget(data: &[u8], accounts: &[u8]) -> Result<(u8, u64), &'static st
     }
 }
 
+/// W11: per top-level ix index, the custom error codes its program registered as retryable
+/// (empty for ComputeBudget and programs without any). Indexes match `InstructionError[i, ..]`.
+pub fn retryable_by_ix(tx: &VersionedTransaction, policy: &ProgramPolicy) -> Vec<Vec<u32>> {
+    let keys = tx.message.static_account_keys();
+    tx.message
+        .instructions()
+        .iter()
+        .map(|ix| {
+            keys.get(ix.program_id_index as usize)
+                .and_then(|id| policy.programs.iter().find(|p| p.program_id == *id))
+                .map(|p| p.retryable_errors.clone())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
 /// Checks a program-action tx against a project's policy (W2–W5) and returns its declared cost (W8).
 pub fn check(
     tx: &VersionedTransaction,
@@ -966,5 +982,12 @@ mod tests {
                 .max_cu,
             200_000
         );
+    }
+
+    #[test]
+    fn retryable_codes_follow_top_level_ix_index() {
+        let (relayer, user) = (Pubkey::new_unique(), Keypair::new());
+        let t = tx(&relayer, &user, &[cu_limit(1_000), noop(&user.pubkey())]);
+        assert_eq!(retryable_by_ix(&t, &policy()), vec![vec![], vec![6000]]);
     }
 }

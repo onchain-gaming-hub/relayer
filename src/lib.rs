@@ -337,8 +337,8 @@ fn relayer_info(
         "pubkey": project.fee_payer.to_string(),
         "cluster": project.cluster.as_str(),
         "policy": { "actions": actions },
-        // Whole milliseconds; ceil like retry_after_ms.
-        "cooldown_ms": cfg.cooldown_ms.ceil() as u64,
+        // Whole milliseconds; ceil like retry_after_ms. The project's own value (v3 W10).
+        "cooldown_ms": project.timing.resolve(cfg.timing()).cooldown_ms.ceil() as u64,
         "user_daily_quota": project.user_daily_quota,
         "wallet_binding": match cfg.wallet_binding {
             WalletBinding::Wallets => "wallets",
@@ -407,16 +407,19 @@ async fn handle_program_tx(
         "signature": signature,
         "aud": project.aud,
         "cluster": project.cluster.as_str(),
-        // Fee + declared rent: rent shares the fee budget until v3 Phase 3 splits them.
+        // Total the relayer fronts (audit); the budgets are charged fee and rent separately (W9).
         "cost": checked.fee_cost.saturating_add(checked.declared_rent),
         "project_rpm": project.project_rpm,
         "project_daily_budget": project.project_daily_budget_lamports,
         "user_daily_quota": project.user_daily_quota,
         "fee_payer": project.fee_payer.to_string(),
         "min_balance": project.min_balance_lamports,
+        "timing": project.timing.resolve(cfg.timing()),
         "program": {
             "fee_cost": checked.fee_cost,
             "declared_rent": checked.declared_rent,
+            "rent_budget": project.project_daily_rent_budget_lamports,
+            "retryable": program_policy::retryable_by_ix(tx, policy),
             "needs_simulation": checked.needs_simulation,
             "refund_only": !checked.has_payer_slot,
             "registered": policy.programs.iter().map(|p| p.program_id.to_string()).collect::<Vec<_>>(),
@@ -587,6 +590,7 @@ async fn handle_relay(
         "user_daily_quota": project.user_daily_quota,
         "fee_payer": project.fee_payer.to_string(),
         "min_balance": project.min_balance_lamports,
+        "timing": project.timing.resolve(cfg.timing()),
     });
     let stub = env
         .durable_object("USER_CONTROLLER")

@@ -25,6 +25,7 @@ read -r SK_P PK_P <<<"$(./target/debug/examples/genkey)"
 read -r SK_C PK_C <<<"$(./target/debug/examples/genkey)"
 read -r SK_D PK_D <<<"$(./target/debug/examples/genkey)"
 read -r SK_G PK_G <<<"$(./target/debug/examples/genkey)"
+read -r SK_H PK_H <<<"$(./target/debug/examples/genkey)"
 read -r _ NOVERIFY <<<"$(./target/debug/examples/genkey)"   # program id: verify_inner_ix=false (W7)
 read -r _ PINX <<<"$(./target/debug/examples/genkey)"       # program id: pinned slot never matches (W6)
 read -r _ PK_X <<<"$(./target/debug/examples/genkey)"
@@ -41,13 +42,13 @@ COMMON=(
   --var "RPC_TIMEOUT_MS:2000"
   --var "FEE_PAYER_PA:$SK_A" --var "FEE_PAYER_PB:$SK_B" --var "FEE_PAYER_PM:$SK_M"
   --var "FEE_PAYER_PP:$SK_P" --var "FEE_PAYER_PY:$SK_Y"
-  --var "FEE_PAYER_PC:$SK_C" --var "FEE_PAYER_PD:$SK_D" --var "FEE_PAYER_PG:$SK_G"
+  --var "FEE_PAYER_PC:$SK_C" --var "FEE_PAYER_PD:$SK_D" --var "FEE_PAYER_PG:$SK_G" --var "FEE_PAYER_PH:$SK_H"
 )
 
 TESTKIT=Bh4GY79ytnEZ4t3ZGf7qUVooaSKYyC8sM1uJpiM2xdCW
 BIG_BUDGET=1000000000
 NOOP_IX='{"name":"noop","discriminator":"09b20d738123ed66","min_accounts":0,"max_accounts":1,"max_data_len":8}'
-PROGRAM_POLICY='{"actions":[{"type":"program","program_id":"'$TESTKIT'","deploy_slot":1,"retryable_errors":[6000],"instructions":[{"name":"create","discriminator":"181ec828051c0777","payer_index":1,"max_rent_lamports":1100000,"min_accounts":4,"max_accounts":4,"max_data_len":8},{"name":"close_thing","discriminator":"a75149fabad23e79","refund_index":2,"min_accounts":3,"max_accounts":3,"max_data_len":8},'$NOOP_IX']},{"type":"program","program_id":"'$NOVERIFY'","deploy_slot":7,"verify_inner_ix":false,"instructions":['$NOOP_IX']},{"type":"program","program_id":"'$PINX'","deploy_slot":5,"instructions":['$NOOP_IX']}],"limits":{"max_instructions":4,"max_cu":400000,"max_cu_price_micro_lamports":1000,"skip_preflight_after_verify":true}}'
+PROGRAM_POLICY='{"actions":[{"type":"program","program_id":"'$TESTKIT'","deploy_slot":1,"retryable_errors":[6000],"instructions":[{"name":"create","discriminator":"181ec828051c0777","payer_index":1,"max_rent_lamports":1100000,"min_accounts":4,"max_accounts":4,"max_data_len":8},{"name":"close_thing","discriminator":"a75149fabad23e79","refund_index":2,"min_accounts":3,"max_accounts":3,"max_data_len":8},'$NOOP_IX']},{"type":"program","program_id":"'$NOVERIFY'","deploy_slot":7,"verify_inner_ix":false,"retryable_errors":[6000],"instructions":['$NOOP_IX']},{"type":"program","program_id":"'$PINX'","deploy_slot":5,"instructions":['$NOOP_IX']}],"limits":{"max_instructions":4,"max_cu":400000,"max_cu_price_micro_lamports":1000,"skip_preflight_after_verify":true}}'
 
 # seed <rpm_a> <rpm_b> <mainnet_enabled> <quota_a> <budget_a> <budget_cd> <budget_b>
 seed() {
@@ -68,6 +69,12 @@ seed() {
     row client-d PD active devnet sapphire_devnet http://localhost:5180 "$PK_D" 1000 100 "$6"
     # Program actions only (spec v3): testkit-shaped program, no memo action.
     row client-g PG active devnet sapphire_devnet http://localhost:5181 "$PK_G" 1000 100 "$BIG_BUDGET" "$PROGRAM_POLICY"
+    # v3 W9/W10: rent budget = one declared create (1_100_000) but two simulated ones (2 × 1_021_080);
+    # cooldown 0 (Worker default here: 300), retry cooldown 300 ms.
+    echo "UPDATE projects SET project_daily_rent_budget_lamports = 2100000, cooldown_ms = 0, retry_cooldown_ms = 300 WHERE aud = 'client-g';"
+    # W9 accounting: fee budget = 3 noop fees, rent budget = one declared create.
+    row client-h PH active devnet sapphire_devnet http://localhost:5182 "$PK_H" 1000 100 30000 "$PROGRAM_POLICY"
+    echo "UPDATE projects SET project_daily_rent_budget_lamports = 1100000 WHERE aud = 'client-h';"
     echo "INSERT INTO settings (key, value) VALUES ('mainnet_enabled', '$3');"
   } > "$WORK/seed.sql"
 }
@@ -83,13 +90,14 @@ run_suite() {
   fi
   shift 7
   local log="$WORK/wrangler-$suite.log"
-  npx wrangler dev --port $PORT --ip 127.0.0.1 --persist-to "$persist" "${COMMON[@]}" "$@" \
+  # WORKER_DIR: run another checkout of the Worker on the same state (suite M).
+  (cd "${WORKER_DIR:-.}" && exec npx wrangler dev --port $PORT --ip 127.0.0.1 --persist-to "$persist" "${COMMON[@]}" "$@") \
     > "$log" 2>&1 &
   local pid=$!
   until grep -qE "Ready on|ERROR" "$log"; do sleep 0.3; done
   local rc=0
   PERSIST_DIR="$persist" WRANGLER_LOG="$log" RELAYER_URL="http://127.0.0.1:$PORT" MOCK_URL="$MOCK" \
-    PK_A="$PK_A" PK_B="$PK_B" PK_M="$PK_M" PK_X="$PK_X" PK_Y="$PK_Y" PK_C="$PK_C" PK_D="$PK_D" PK_G="$PK_G" TESTKIT="$TESTKIT" NOVERIFY="$NOVERIFY" PINX="$PINX" \
+    PK_A="$PK_A" PK_B="$PK_B" PK_M="$PK_M" PK_X="$PK_X" PK_Y="$PK_Y" PK_C="$PK_C" PK_D="$PK_D" PK_G="$PK_G" PK_H="$PK_H" TESTKIT="$TESTKIT" NOVERIFY="$NOVERIFY" PINX="$PINX" \
     node tests/e2e.mjs "$suite" || rc=$?
   kill $pid 2>/dev/null; wait $pid 2>/dev/null || true
   # Reset mock behavior between suites.
@@ -98,7 +106,9 @@ run_suite() {
   return $rc
 }
 
-# Usage: ./tests/run-e2e.sh [A] [B] [C] [D] [E] [F]   (default: all; D also runs D2 = restart check)
+# Usage: ./tests/run-e2e.sh [A] [B] [C] [D] [E] [F] [M]   (default: A–F; D also runs D2 = restart check)
+# M (v3 W9 counter migration): D on an older Worker checkout (OLD_WORKER_DIR, e.g. a git worktree
+#   of the previous commit), then D2 on this one over the same state: quota and budgets must hold.
 SUITES=${*:-A B C D E F}
 BIG=1000000000
 status=0
@@ -116,7 +126,13 @@ for s in $SUITES; do
        run_suite D D yes 1000 1000 false 2 30000 $BIG 40000 "${D_ARGS[@]}" || status=1
        run_suite D2 D no 0 0 0 0 0 0 0 "${D_ARGS[@]}" || status=1 ;;
     E) run_suite E E yes 1000 1000 false 100 $BIG 30000 $BIG --var COOLDOWN_MS:300 || status=1 ;;
-    F) run_suite F F yes 1000 1000 false 100 $BIG $BIG $BIG --var COOLDOWN_MS:300 || status=1 ;;
+    M) [ -d "${OLD_WORKER_DIR:-}" ] || { echo "M needs OLD_WORKER_DIR"; status=1; continue; }
+       D_ARGS=(--var COOLDOWN_MS:300 --var REJECT_COOLDOWN_MS:300 --var CLUSTER_DAILY_BUDGET_DEVNET:60000)
+       WORKER_DIR="$OLD_WORKER_DIR" run_suite D M yes 1000 1000 false 2 30000 $BIG 40000 "${D_ARGS[@]}" || status=1
+       run_suite D2 M no 0 0 0 0 0 0 0 "${D_ARGS[@]}" || status=1 ;;
+    # Cluster rent budget = one declared create (client-g's V3-2), so client-h's create is refused
+    # by the cluster after its own project admitted it.
+    F) run_suite F F yes 1000 1000 false 100 $BIG $BIG $BIG --var COOLDOWN_MS:300 --var CLUSTER_DAILY_RENT_BUDGET_DEVNET:1100000 || status=1 ;;
     *) echo "unknown suite $s"; status=1 ;;
   esac
 done

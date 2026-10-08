@@ -14,7 +14,10 @@ use wasm_bindgen::JsValue;
 use worker::*;
 
 use crate::{
-    config::{ADMIT_MARGIN_MS, Cluster, Config, REFUND_TIMEOUT_MS, reject_backoff_ms, rpc_url},
+    config::{
+        ADMIT_MARGIN_MS, Cluster, Config, EffectiveTiming, REFUND_TIMEOUT_MS, reject_backoff_ms,
+        rpc_url,
+    },
     daily,
     error::ApiError,
     inner_ix::{self, Expect, Verdict},
@@ -46,6 +49,9 @@ pub struct RelayJob {
     pub fee_payer: String,
     pub min_balance: u64,
     pub user_daily_quota: u32,
+    /// The project's cooldowns (v3 W10). Absent only in jobs from an older Worker.
+    #[serde(default)]
+    pub timing: Option<EffectiveTiming>,
     /// Present for program actions (spec v3): two-step admission + simulation (W14, §4.3).
     #[serde(default)]
     pub program: Option<ProgramJob>,
@@ -56,6 +62,12 @@ pub struct RelayJob {
 pub struct ProgramJob {
     pub fee_cost: u64,
     pub declared_rent: u64,
+    /// project_daily_rent_budget_lamports (W9). Defaults to 0 (no rent) like every v3 field.
+    #[serde(default)]
+    pub rent_budget: u64,
+    /// Per top-level ix index: the custom error codes its program registered as retryable (W11).
+    #[serde(default)]
+    pub retryable: Vec<Vec<u32>>,
     pub needs_simulation: bool,
     /// No payer slot: the fee payer may not lose more than the fee (W4b).
     pub refund_only: bool,
@@ -68,6 +80,25 @@ pub struct ProgramJob {
     /// W7 `skip_preflight_after_verify`: only honored when this tx was simulated.
     #[serde(default)]
     pub skip_preflight_after_verify: bool,
+}
+
+impl RelayJob {
+    /// (fee, declared rent) this job is charged against the two budgets (W9).
+    fn budget_costs(&self) -> (u64, u64) {
+        match &self.program {
+            Some(p) => (p.fee_cost, p.declared_rent),
+            None => (self.cost, 0),
+        }
+    }
+
+    /// `InstructionError[i, {Custom: c}]` where the program of top-level ix `i` registered `c`
+    /// as retryable (W11). An error raised by a CPI'd program is attributed to ix `i`'s program.
+    fn is_retryable(&self, custom: Option<(usize, u32)>) -> bool {
+        match (&self.program, custom) {
+            (Some(p), Some((i, c))) => p.retryable.get(i).is_some_and(|codes| codes.contains(&c)),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -157,13 +188,20 @@ impl DurableObject for UserController {
 impl UserController {
     /// `{ used, limit, resets_at }` for today (UTC).
     fn quota(&self, limit: u32, now: f64) -> std::result::Result<serde_json::Value, ApiError> {
-        let used = daily::used(&self.state.storage().sql(), daily::day_of(now))
+        let sql = self.state.storage().sql();
+        let used = daily::used(&sql, daily::COUNT, daily::day_of(now), daily::COUNT)
             .map_err(|e| ApiError::internal(format!("quota read: {e}")))?;
         Ok(json!({ "used": used, "limit": limit, "resets_at": daily::next_day_start(now) as u64 }))
     }
 
     fn refund_user(&self, day: i64) {
-        if let Err(e) = daily::refund(&self.state.storage().sql(), day, 1) {
+        if let Err(e) = daily::refund(
+            &self.state.storage().sql(),
+            daily::COUNT,
+            day,
+            daily::COUNT,
+            1,
+        ) {
             console_error!("user quota refund failed: {e}");
         }
     }
@@ -183,6 +221,7 @@ impl UserController {
             Cluster::parse(&job.cluster).ok_or_else(|| ApiError::internal("job: bad cluster"))?;
         // Before admit: a missing RPC URL must not consume any slot.
         let url = rpc_url(&self.env, cluster).map_err(ApiError::config)?;
+        let t = job.timing.unwrap_or_else(|| cfg.timing());
 
         let cooldown_until: f64 = storage
             .get(COOLDOWN_KEY)
@@ -196,7 +235,14 @@ impl UserController {
         // User daily quota (V6/V8): counted before asking any other DO, so a user at quota
         // never consumes project or cluster capacity.
         let day = daily::day_of(now);
-        match daily::try_add(&storage.sql(), day, 1, job.user_daily_quota as i64) {
+        match daily::try_add(
+            &storage.sql(),
+            daily::COUNT,
+            day,
+            daily::COUNT,
+            1,
+            job.user_daily_quota as i64,
+        ) {
             Ok(Some(_)) => {}
             Ok(None) => return Err(ApiError::user_quota(daily::ms_until_next_day(now))),
             Err(e) => return Err(ApiError::internal(format!("user quota: {e}"))),
@@ -206,7 +252,7 @@ impl UserController {
         let admitted = if let Some(p) = &job.program {
             // Program action (v3 W14): RPM → simulate + verify → budget. Refunds the user's
             // count itself on every refusal.
-            let (a, rent) = self.admit_program(&job, p, &url, cfg, day).await?;
+            let (a, rent) = self.admit_program(&job, p, &url, cfg, &t, day).await?;
             rent_simulated = rent;
             a
         } else {
@@ -223,7 +269,7 @@ impl UserController {
                     // The throttles may still count this request (slots held until the window
                     // ends, R9 / R-v2-5), so the user's count is kept too (fail-closed). A short
                     // cooldown stops retries from leaking more slots.
-                    let until = Date::now().as_millis() as f64 + cfg.reject_cooldown_ms;
+                    let until = Date::now().as_millis() as f64 + t.reject_cooldown_ms;
                     if let Err(e) = storage.put(COOLDOWN_KEY, until).await {
                         console_error!(
                             "cooldown put after admit timeout failed for {}: {e}",
@@ -248,17 +294,31 @@ impl UserController {
         // returns the global slot and grows this wallet's backoff. An overloaded RPC (429, other
         // 4xx) is not the user's fault and must not free capacity to hit it again.
         let tx_fault = matches!(outcome, SendOutcome::Rejected { tx_fault: true, .. });
-        let streak = if tx_fault {
+        // W11: a registered retryable error at preflight is the chain state, not abuse: no
+        // streak, a short cooldown, user count + budgets back but the RPM slots kept.
+        let retryable = match &outcome {
+            SendOutcome::Rejected {
+                tx_fault: true,
+                custom,
+                ..
+            } => job.is_retryable(*custom),
+            _ => false,
+        };
+        let streak = if tx_fault && !retryable {
             self.next_reject_streak(&job.user).await
         } else {
             None
         };
         let (cooldown_ms, audit) = match &outcome {
-            SendOutcome::Accepted(_) => (cfg.cooldown_ms, ("success", None)),
+            SendOutcome::Accepted(_) => (t.cooldown_ms, ("success", None)),
             // Replays of a landed tx: keep them distinguishable from real sends in the audit log.
             SendOutcome::AlreadyProcessed => (
-                cfg.cooldown_ms,
+                t.cooldown_ms,
                 ("success", Some("already processed".to_string())),
+            ),
+            SendOutcome::Rejected { reason, .. } if retryable => (
+                t.retry_cooldown_ms,
+                ("rpc_error", Some(format!("retryable: {reason}"))),
             ),
             SendOutcome::Rejected {
                 reason, http_429, ..
@@ -268,15 +328,15 @@ impl UserController {
                 }
                 (
                     reject_backoff_ms(
-                        cfg.reject_cooldown_ms,
+                        t.reject_cooldown_ms,
                         streak.unwrap_or(1),
-                        cfg.reject_cooldown_max_ms,
+                        t.reject_cooldown_max_ms,
                     ),
                     ("rpc_error", Some(format!("rejected: {reason}"))),
                 )
             }
             SendOutcome::Unknown(reason) => (
-                cfg.cooldown_ms,
+                t.cooldown_ms,
                 ("rpc_error", Some(format!("unknown: {reason}"))),
             ),
         };
@@ -311,7 +371,7 @@ impl UserController {
         if tx_fault {
             // Nothing was sent: the user's count, the project and the cluster budgets go back.
             self.refund_user(day);
-            self.refund(&job, &admitted).await;
+            self.refund(&job, &admitted, retryable).await;
         }
         self.audit(&job, audit.0, audit.1, done, rent_simulated);
         // `done`, not `now`: a request that crosses UTC midnight reports the new day.
@@ -327,6 +387,9 @@ impl UserController {
                 Response::from_json(&json!({ "signature": job.signature, "quota": quota }))
                     .map_err(|e| ApiError::internal(e.to_string()))
             }
+            SendOutcome::Rejected { reason, .. } if retryable => {
+                Err(ApiError::retryable(reason, cooldown_ms))
+            }
             SendOutcome::Rejected { reason, .. } => {
                 Err(ApiError::rpc_rejected(reason, cooldown_ms))
             }
@@ -335,8 +398,7 @@ impl UserController {
     }
 
     /// Program-action admission (spec v3 W14): RPM first (every RPC call is counted), then
-    /// simulation + inner-ix verification (§4.3), then the budget (fee + declared rent; rent
-    /// shares the fee budget until Phase 3 splits it). Returns where it was counted and the
+    /// simulation + inner-ix verification (§4.3), then the fee and rent budgets (W9). Returns where it was counted and the
     /// rent the simulation saw. On every refusal the user's daily count is given back; the RPM
     /// slot is kept (1 call = 1 slot).
     async fn admit_program(
@@ -345,6 +407,7 @@ impl UserController {
         p: &ProgramJob,
         url: &str,
         cfg: &Config,
+        t: &EffectiveTiming,
         day: i64,
     ) -> std::result::Result<(Admitted, Option<u64>), ApiError> {
         let storage = self.state.storage();
@@ -375,7 +438,7 @@ impl UserController {
                 return Err(ApiError::upstream(format!("admit_rpm: {e}")));
             }
             None => {
-                self.short_cooldown(cfg, &job.user).await;
+                self.short_cooldown(t, &job.user).await;
                 return Err(ApiError::upstream("admit_rpm timeout"));
             }
         };
@@ -411,6 +474,23 @@ impl UserController {
                 }
             };
             let sim = inner_ix::parse_simulation(&value, &keys, &requested);
+            // W11: a registered retryable program error — no streak, short cooldown, 409.
+            if job.is_retryable(rpc::custom_error(&sim.err)) {
+                self.refund_user(day);
+                let reason: String = sim.err.to_string().chars().take(200).collect();
+                let at = Date::now().as_millis() as f64;
+                if let Err(e) = storage.put(COOLDOWN_KEY, at + t.retry_cooldown_ms).await {
+                    console_error!("retry cooldown put failed for {}: {e}", job.user);
+                }
+                self.audit(
+                    job,
+                    "rpc_error",
+                    Some(format!("retryable: {reason}")),
+                    at,
+                    None,
+                );
+                return Err(ApiError::retryable(reason, t.retry_cooldown_ms));
+            }
             let verdict = inner_ix::verify(
                 &sim,
                 Expect {
@@ -431,7 +511,7 @@ impl UserController {
                 }
                 Verdict::ProgramError(reason) => {
                     self.refund_user(day);
-                    let wait = self.penalize(&storage, cfg, &job.user).await;
+                    let wait = self.penalize(&storage, t, &job.user).await;
                     // relay_log's CHECK has no 'rejected' status: rpc_error + reason prefix.
                     let at = Date::now().as_millis() as f64;
                     self.audit(
@@ -458,17 +538,20 @@ impl UserController {
                         None,
                     );
                     self.refund_user(day);
-                    let wait = self.penalize(&storage, cfg, &job.user).await;
+                    let wait = self.penalize(&storage, t, &job.user).await;
                     return Err(ApiError::inner_ix_rejected(reason, wait));
                 }
             }
         }
 
-        // Step 3: budget + balance (bounded like the memo admit: getBalance + cluster hop).
+        // Step 3: fee + rent budgets and balance (bounded like the memo admit: getBalance +
+        // cluster hop). Rent is charged at the declared ceiling, not the simulated amount (W8).
         let budget = json!({
             "cluster": job.cluster,
-            "cost": job.cost,
+            "cost": p.fee_cost,
+            "rent": p.declared_rent,
             "budget": job.project_daily_budget,
+            "rent_budget": p.rent_budget,
             "fee_payer": job.fee_payer,
             "min_balance": job.min_balance,
         });
@@ -494,7 +577,7 @@ impl UserController {
                     return Err(ApiError::upstream(format!("admit_budget: {e}")));
                 }
                 None => {
-                    self.short_cooldown(cfg, &job.user).await;
+                    self.short_cooldown(t, &job.user).await;
                     return Err(ApiError::upstream("admit_budget timeout"));
                 }
             };
@@ -511,12 +594,12 @@ impl UserController {
 
     /// Grows the reject streak and sets the backoff cooldown (D17) — for simulation failures,
     /// which cost the relayer an RPC call but no fee. Returns the cooldown in ms.
-    async fn penalize(&self, storage: &Storage, cfg: &Config, user: &str) -> f64 {
+    async fn penalize(&self, storage: &Storage, t: &EffectiveTiming, user: &str) -> f64 {
         let streak = self.next_reject_streak(user).await;
         let wait = reject_backoff_ms(
-            cfg.reject_cooldown_ms,
+            t.reject_cooldown_ms,
             streak.unwrap_or(1),
-            cfg.reject_cooldown_max_ms,
+            t.reject_cooldown_max_ms,
         );
         let until = Date::now().as_millis() as f64 + wait;
         let stored = match streak {
@@ -537,8 +620,8 @@ impl UserController {
     }
 
     /// After an admit timeout: the throttles may have counted it; stop immediate retries.
-    async fn short_cooldown(&self, cfg: &Config, user: &str) {
-        let until = Date::now().as_millis() as f64 + cfg.reject_cooldown_ms;
+    async fn short_cooldown(&self, t: &EffectiveTiming, user: &str) {
+        let until = Date::now().as_millis() as f64 + t.reject_cooldown_ms;
         if let Err(e) = self.state.storage().put(COOLDOWN_KEY, until).await {
             console_error!("cooldown put after admit timeout failed for {user}: {e}");
         }
@@ -557,10 +640,14 @@ impl UserController {
     }
 
     /// Best-effort, bounded: a failed refund only means the slots stay used until the window ends.
-    async fn refund(&self, job: &RelayJob, admitted: &Admitted) {
+    /// `keep_rpm`: a retryable failure (W11) gives back budgets only.
+    async fn refund(&self, job: &RelayJob, admitted: &Admitted, keep_rpm: bool) {
+        let (fee, rent) = job.budget_costs();
         let body = json!({
             "cluster": job.cluster,
-            "cost": job.cost,
+            "cost": fee,
+            "rent": rent,
+            "keep_rpm": keep_rpm,
             "window": admitted.window,
             "day": admitted.day,
             "cluster_window": admitted.cluster_window,

@@ -18,6 +18,8 @@ pub enum SendOutcome {
         reason: String,
         http_429: bool,
         tx_fault: bool,
+        /// Preflight `InstructionError[i, {Custom: c}]` from `error.data.err` (v3 W11).
+        custom: Option<(usize, u32)>,
     },
     /// Timeout, transport error, HTTP 5xx, or unparseable 200: it may have been forwarded.
     Unknown(String),
@@ -76,12 +78,22 @@ fn rpc_body(method: &str, params: Value) -> Value {
 /// -32603 internal error, -32005 node unhealthy, -32004 block not available.
 const NODE_SIDE_ERROR_CODES: [i64; 3] = [-32603, -32005, -32004];
 
+/// `{"InstructionError":[i,{"Custom":c}]}` → `(i, c)`: the shape both `simulateTransaction`
+/// (`value.err`) and a failed preflight (`error.data.err`) return (Phase 0 spike 0.2).
+pub fn custom_error(err: &Value) -> Option<(usize, u32)> {
+    let ie = err.get("InstructionError")?.as_array()?;
+    let index = usize::try_from(ie.first()?.as_u64()?).ok()?;
+    let code = u32::try_from(ie.get(1)?.get("Custom")?.as_u64()?).ok()?;
+    Some((index, code))
+}
+
 pub fn classify_send(status: u16, text: &str) -> SendOutcome {
     if (400..500).contains(&status) {
         return SendOutcome::Rejected {
             reason: format!("http {status}"),
             http_429: status == 429,
             tx_fault: matches!(status, 400 | 413),
+            custom: None,
         };
     }
     if status != 200 {
@@ -105,6 +117,10 @@ pub fn classify_send(status: u16, text: &str) -> SendOutcome {
             // Node-side failures say nothing about the transaction (D17: treat like 429).
             // An error without a code cannot be attributed to the tx either -> not tx-fault.
             tx_fault: code.is_some_and(|c| !NODE_SIDE_ERROR_CODES.contains(&c)),
+            custom: err
+                .get("data")
+                .and_then(|d| d.get("err"))
+                .and_then(custom_error),
         };
     }
     match v.get("result").and_then(Value::as_str) {
@@ -250,6 +266,32 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_custom_instruction_errors() {
+        // Real preflight body from the Phase 0 spike (testkit fail_retryable, 6000 = 0x1770).
+        let body = r#"{"error":{"code":-32002,"message":"Transaction simulation failed: Error processing Instruction 0: custom program error: 0x1770","data":{"err":{"InstructionError":[0,{"Custom":6000}]}}}}"#;
+        assert!(matches!(
+            classify_send(200, body),
+            SendOutcome::Rejected {
+                tx_fault: true,
+                custom: Some((0, 6000)),
+                ..
+            }
+        ));
+        assert_eq!(
+            custom_error(&serde_json::json!({"InstructionError":[2,{"Custom":7}]})),
+            Some((2, 7))
+        );
+        for other in [
+            serde_json::json!({"InstructionError":[0,"InvalidAccountData"]}),
+            serde_json::json!("InsufficientFundsForFee"),
+            serde_json::json!({"InstructionError":[0,{"Custom":-1}]}),
+            serde_json::Value::Null,
+        ] {
+            assert_eq!(custom_error(&other), None, "{other}");
+        }
+    }
 
     #[test]
     fn classifies_send_outcomes() {

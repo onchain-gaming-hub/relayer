@@ -23,6 +23,20 @@ pub const JWKS_FAILURE_BACKOFF_MS: f64 = 30_000.0;
 pub const JWT_LEEWAY_SECS: f64 = 30.0;
 pub const JWKS_UNKNOWN_KID_REFETCH_MS: f64 = 5.0 * 60_000.0;
 
+/// Default of `RETRY_COOLDOWN_MS` / `retry_cooldown_ms` (v3 W10).
+pub const DEFAULT_RETRY_COOLDOWN_MS: f64 = 1_000.0;
+
+/// The cooldowns one request runs under (v3 W10): the project's overrides over the Worker's.
+/// Resolved in the Worker and carried in the job, so a UserController never needs the registry.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EffectiveTiming {
+    pub cooldown_ms: f64,
+    pub reject_cooldown_ms: f64,
+    /// Never below `reject_cooldown_ms` (an override of only one of the pair stays ordered).
+    pub reject_cooldown_max_ms: f64,
+    pub retry_cooldown_ms: f64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Cluster {
     Devnet,
@@ -95,11 +109,17 @@ pub struct Config {
     pub cooldown_ms: f64,
     pub reject_cooldown_ms: f64,
     pub reject_cooldown_max_ms: f64,
+    /// Cooldown after a registered retryable error (v3 W11), for projects without an override.
+    pub retry_cooldown_ms: f64,
     pub cluster_rpm_devnet: u32,
     pub cluster_rpm_mainnet: u32,
     /// Lamports per UTC day across every project on the cluster (V12 catastrophic stop).
     pub cluster_daily_budget_devnet: u64,
     pub cluster_daily_budget_mainnet: u64,
+    /// Lamports of rent per UTC day across the cluster (v3 W9). Mainnet defaults to 0: no
+    /// rent sponsorship until it is set on purpose.
+    pub cluster_daily_rent_budget_devnet: u64,
+    pub cluster_daily_rent_budget_mainnet: u64,
     pub cluster_hop_timeout_ms: u64,
     pub registry_cache_ms: f64,
     pub registry_max_stale_ms: f64,
@@ -158,6 +178,11 @@ impl Config {
                 "REJECT_COOLDOWN_MAX_MS",
                 60_000.0,
             )?,
+            retry_cooldown_ms: num(
+                var("RETRY_COOLDOWN_MS"),
+                "RETRY_COOLDOWN_MS",
+                DEFAULT_RETRY_COOLDOWN_MS,
+            )?,
             cluster_rpm_devnet: num(var("CLUSTER_RPM_DEVNET"), "CLUSTER_RPM_DEVNET", 300)?,
             cluster_rpm_mainnet: num(var("CLUSTER_RPM_MAINNET"), "CLUSTER_RPM_MAINNET", 300)?,
             // Spec v2 §5: 10 SOL on devnet, 0.2 SOL on mainnet.
@@ -170,6 +195,16 @@ impl Config {
                 var("CLUSTER_DAILY_BUDGET_MAINNET"),
                 "CLUSTER_DAILY_BUDGET_MAINNET",
                 200_000_000,
+            )?,
+            cluster_daily_rent_budget_devnet: num(
+                var("CLUSTER_DAILY_RENT_BUDGET_DEVNET"),
+                "CLUSTER_DAILY_RENT_BUDGET_DEVNET",
+                10_000_000_000,
+            )?,
+            cluster_daily_rent_budget_mainnet: num(
+                var("CLUSTER_DAILY_RENT_BUDGET_MAINNET"),
+                "CLUSTER_DAILY_RENT_BUDGET_MAINNET",
+                0,
             )?,
             cluster_hop_timeout_ms: num(
                 var("CLUSTER_HOP_TIMEOUT_MS"),
@@ -201,6 +236,7 @@ impl Config {
             ("COOLDOWN_MS", self.cooldown_ms),
             ("REJECT_COOLDOWN_MS", self.reject_cooldown_ms),
             ("REJECT_COOLDOWN_MAX_MS", self.reject_cooldown_max_ms),
+            ("RETRY_COOLDOWN_MS", self.retry_cooldown_ms),
             ("REGISTRY_CACHE_MS", self.registry_cache_ms),
             ("REGISTRY_MAX_STALE_MS", self.registry_max_stale_ms),
         ] {
@@ -229,10 +265,16 @@ impl Config {
             );
         }
         // Bound like registry numbers: SQLite integers cross into JS as f64 (exact to 2^53 - 1).
-        if self.cluster_daily_budget_devnet > MAX_SAFE_INTEGER
-            || self.cluster_daily_budget_mainnet > MAX_SAFE_INTEGER
+        if [
+            self.cluster_daily_budget_devnet,
+            self.cluster_daily_budget_mainnet,
+            self.cluster_daily_rent_budget_devnet,
+            self.cluster_daily_rent_budget_mainnet,
+        ]
+        .iter()
+        .any(|b| *b > MAX_SAFE_INTEGER)
         {
-            return Err("invalid config CLUSTER_DAILY_BUDGET_*: must be <= 2^53 - 1".into());
+            return Err("invalid config CLUSTER_DAILY_(RENT_)BUDGET_*: must be <= 2^53 - 1".into());
         }
         if self.registry_max_stale_ms < self.registry_cache_ms {
             return Err(
@@ -253,6 +295,23 @@ impl Config {
         match cluster {
             Cluster::Devnet => self.cluster_daily_budget_devnet,
             Cluster::Mainnet => self.cluster_daily_budget_mainnet,
+        }
+    }
+
+    /// Worker-wide timing (projects without overrides, and jobs from before v3 Phase 3).
+    pub fn timing(&self) -> EffectiveTiming {
+        EffectiveTiming {
+            cooldown_ms: self.cooldown_ms,
+            reject_cooldown_ms: self.reject_cooldown_ms,
+            reject_cooldown_max_ms: self.reject_cooldown_max_ms,
+            retry_cooldown_ms: self.retry_cooldown_ms,
+        }
+    }
+
+    pub fn cluster_daily_rent_budget(&self, cluster: Cluster) -> u64 {
+        match cluster {
+            Cluster::Devnet => self.cluster_daily_rent_budget_devnet,
+            Cluster::Mainnet => self.cluster_daily_rent_budget_mainnet,
         }
     }
 
@@ -300,10 +359,13 @@ mod tests {
             cooldown_ms: cooldown,
             reject_cooldown_ms: reject,
             reject_cooldown_max_ms: reject_max,
+            retry_cooldown_ms: 1_000.0,
             cluster_rpm_devnet: 300,
             cluster_rpm_mainnet: 300,
             cluster_daily_budget_devnet: 10_000_000_000,
             cluster_daily_budget_mainnet: 200_000_000,
+            cluster_daily_rent_budget_devnet: 10_000_000_000,
+            cluster_daily_rent_budget_mainnet: 0,
             cluster_hop_timeout_ms: 2_000,
             registry_cache_ms: 60_000.0,
             registry_max_stale_ms: 600_000.0,
@@ -340,6 +402,9 @@ mod tests {
         assert!(c.validated().is_err());
         let mut c = cfg(10_000.0, 3_000.0, 60_000.0);
         c.cluster_daily_budget_mainnet = u64::MAX;
+        assert!(c.validated().is_err());
+        let mut c = cfg(10_000.0, 3_000.0, 60_000.0);
+        c.cluster_daily_rent_budget_devnet = u64::MAX;
         assert!(c.validated().is_err());
     }
 

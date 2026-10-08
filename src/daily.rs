@@ -3,7 +3,8 @@
 //! `SqlStorage::exec` is synchronous (worker 0.8.7 `sql.rs`), so `try_add` is one atomic
 //! check-and-increment: no input-gate or microtask-ordering argument is needed, and the value
 //! survives eviction. Each DO has its own database, so one table name serves every DO class.
-//! Used for: user tx count (cost 1), project and cluster fee budgets (cost in lamports).
+//! Used for: user tx count (kind `count`, cost 1), project and cluster fee / rent budgets
+//! (kinds `fee` / `rent`, cost in lamports; spec v3 W9).
 
 use worker::{SqlStorage, SqlStorageValue};
 
@@ -24,74 +25,132 @@ pub fn next_day_start(now_ms: f64) -> f64 {
     (day_of(now_ms) + 1) as f64 * DAY_MS
 }
 
+/// Counter kinds (spec v3 W9): the user's tx count, and lamports of fee / rent.
+pub const COUNT: &str = "count";
+pub const FEE: &str = "fee";
+pub const RENT: &str = "rent";
+
 #[derive(serde::Deserialize)]
 struct Spent {
     spent: i64,
+}
+
+#[derive(serde::Deserialize)]
+struct Count {
+    n: i64,
 }
 
 fn int(v: i64) -> SqlStorageValue {
     SqlStorageValue::Integer(v)
 }
 
-pub fn ensure_table(sql: &SqlStorage) -> worker::Result<()> {
-    sql.exec(
-        "CREATE TABLE IF NOT EXISTS daily_counter (day INTEGER PRIMARY KEY, spent INTEGER NOT NULL)",
-        None,
-    )
-    .map(|_| ())
+fn text(v: &str) -> SqlStorageValue {
+    SqlStorageValue::String(v.to_string())
 }
 
-/// Adds `cost` to `day` if the total stays within `limit`. `Ok(Some(total))` = counted,
-/// `Ok(None)` = over the limit (nothing changed).
-pub fn try_add(sql: &SqlStorage, day: i64, cost: i64, limit: i64) -> worker::Result<Option<i64>> {
-    ensure_table(sql)?;
+fn table_exists(sql: &SqlStorage, name: &str) -> worker::Result<bool> {
+    let rows: Vec<Count> = sql
+        .exec(
+            "SELECT count(*) AS n FROM sqlite_master WHERE type = 'table' AND name = ?",
+            vec![text(name)],
+        )?
+        .to_array()?;
+    Ok(rows.first().map(|c| c.n).unwrap_or(0) > 0)
+}
+
+/// Creates `daily_counter_v2` on first use. A DO from before v3 (staging) already has
+/// `daily_counter (day, spent)` made with CREATE TABLE IF NOT EXISTS, which cannot gain a
+/// column: its rows are copied once as `legacy_kind` (UserController: count, throttles: fee)
+/// so the deploy day's quota and budget do not reset. The old table is left as it was.
+pub fn ensure_table(sql: &SqlStorage, legacy_kind: &str) -> worker::Result<()> {
+    if table_exists(sql, "daily_counter_v2")? {
+        return Ok(());
+    }
     sql.exec(
-        "INSERT INTO daily_counter (day, spent) VALUES (?, 0) ON CONFLICT(day) DO NOTHING",
-        vec![int(day)],
+        "CREATE TABLE daily_counter_v2 (day INTEGER NOT NULL, kind TEXT NOT NULL, spent INTEGER NOT NULL, PRIMARY KEY (day, kind))",
+        None,
+    )?;
+    if table_exists(sql, "daily_counter")? {
+        let copied = sql.exec(
+            "INSERT OR IGNORE INTO daily_counter_v2 (day, kind, spent) SELECT day, ?, spent FROM daily_counter",
+            vec![text(legacy_kind)],
+        );
+        if let Err(e) = copied {
+            // Never leave an empty v2 table behind: its existence would skip the copy forever
+            // and reset the deploy day's counters. The next call retries the whole migration.
+            if let Err(d) = sql.exec("DROP TABLE daily_counter_v2", None) {
+                worker::console_error!("daily_counter_v2 rollback failed: {d}");
+            }
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// Adds `cost` to (`day`, `kind`) if the total stays within `limit`. `Ok(Some(total))` =
+/// counted, `Ok(None)` = over the limit (nothing changed).
+pub fn try_add(
+    sql: &SqlStorage,
+    legacy_kind: &str,
+    day: i64,
+    kind: &str,
+    cost: i64,
+    limit: i64,
+) -> worker::Result<Option<i64>> {
+    ensure_table(sql, legacy_kind)?;
+    sql.exec(
+        "INSERT INTO daily_counter_v2 (day, kind, spent) VALUES (?, ?, 0) ON CONFLICT(day, kind) DO NOTHING",
+        vec![int(day), text(kind)],
     )?;
     // Old days are only history (relay_log keeps the real record).
-    sql.exec("DELETE FROM daily_counter WHERE day < ?", vec![int(day)])?;
+    sql.exec("DELETE FROM daily_counter_v2 WHERE day < ?", vec![int(day)])?;
     let rows: Vec<Spent> = sql
         .exec(
-            "UPDATE daily_counter SET spent = spent + ? WHERE day = ? AND spent + ? <= ? RETURNING spent",
-            vec![int(cost), int(day), int(cost), int(limit)],
+            "UPDATE daily_counter_v2 SET spent = spent + ? WHERE day = ? AND kind = ? AND spent + ? <= ? RETURNING spent",
+            vec![int(cost), int(day), text(kind), int(cost), int(limit)],
         )?
         .to_array()?;
     Ok(rows.first().map(|r| r.spent))
 }
 
-/// Gives `cost` back to `day` (never below zero). A refund for a past day is a no-op.
-pub fn refund(sql: &SqlStorage, day: i64, cost: i64) -> worker::Result<()> {
-    ensure_table(sql)?;
+/// Gives `cost` back to (`day`, `kind`) (never below zero). A refund for a past day is a no-op.
+pub fn refund(
+    sql: &SqlStorage,
+    legacy_kind: &str,
+    day: i64,
+    kind: &str,
+    cost: i64,
+) -> worker::Result<()> {
+    if cost == 0 {
+        return Ok(());
+    }
+    ensure_table(sql, legacy_kind)?;
     sql.exec(
-        "UPDATE daily_counter SET spent = MAX(0, spent - ?) WHERE day = ?",
-        vec![int(cost), int(day)],
+        "UPDATE daily_counter_v2 SET spent = MAX(0, spent - ?) WHERE day = ? AND kind = ?",
+        vec![int(cost), int(day), text(kind)],
     )
     .map(|_| ())
 }
 
-/// What `day` has used so far. Read-only: a DO that never counted anything stays empty
-/// (no CREATE TABLE), so GET /quota never writes state (spec v2 §4.2).
-pub fn used(sql: &SqlStorage, day: i64) -> worker::Result<i64> {
-    #[derive(serde::Deserialize)]
-    struct Count {
-        n: i64,
-    }
-    let exists: Vec<Count> = sql
-        .exec(
-            "SELECT count(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'daily_counter'",
-            None,
+/// What (`day`, `kind`) has used so far. Read-only: a DO that never counted anything stays
+/// empty (no CREATE TABLE), so GET /quota never writes state (spec v2 §4.2). A DO not yet
+/// migrated to v2 answers from the legacy table for `legacy_kind`.
+pub fn used(sql: &SqlStorage, legacy_kind: &str, day: i64, kind: &str) -> worker::Result<i64> {
+    let rows: Vec<Spent> = if table_exists(sql, "daily_counter_v2")? {
+        sql.exec(
+            "SELECT spent FROM daily_counter_v2 WHERE day = ? AND kind = ?",
+            vec![int(day), text(kind)],
         )?
-        .to_array()?;
-    if exists.first().map(|c| c.n).unwrap_or(0) == 0 {
-        return Ok(0);
-    }
-    let rows: Vec<Spent> = sql
-        .exec(
+        .to_array()?
+    } else if kind == legacy_kind && table_exists(sql, "daily_counter")? {
+        sql.exec(
             "SELECT spent FROM daily_counter WHERE day = ?",
             vec![int(day)],
         )?
-        .to_array()?;
+        .to_array()?
+    } else {
+        Vec::new()
+    };
     Ok(rows.first().map(|r| r.spent).unwrap_or(0))
 }
 

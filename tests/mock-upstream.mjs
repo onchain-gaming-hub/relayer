@@ -113,6 +113,9 @@ http.createServer(async (req, res) => {
       switch (state.send) {
         case 'ok': return ok(crypto.randomBytes(32).toString('hex'));
         case 'reject': return json(res, 200, { jsonrpc: '2.0', id: rpc.id, error: { code: -32002, message: 'Transaction simulation failed: Blockhash not found' } });
+        case 'custom6000': return json(res, 200, { jsonrpc: '2.0', id: rpc.id, error: { code: -32002,
+          message: 'Transaction simulation failed: Error processing Instruction 0: custom program error: 0x1770',
+          data: { err: { InstructionError: [0, { Custom: 6000 }] } } } });
         case 'already': return json(res, 200, { jsonrpc: '2.0', id: rpc.id, error: { code: -32002, message: 'Transaction simulation failed: This transaction has already been processed' } });
         case 'http429': return json(res, 429, { error: 'Too many requests' });
         case 'http400': return json(res, 400, { error: 'Bad request' });

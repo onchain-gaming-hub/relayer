@@ -10,7 +10,7 @@ const MOCK = process.env.MOCK_URL || 'http://127.0.0.1:8899';
 const ORIGIN = 'http://localhost:5173';
 const PERSIST = process.env.PERSIST_DIR;
 const WRANGLER_LOG = process.env.WRANGLER_LOG;
-const { PK_A, PK_B, PK_M, PK_X, PK_Y, PK_C, PK_D, PK_G, TESTKIT, NOVERIFY, PINX } = process.env;
+const { PK_A, PK_B, PK_M, PK_X, PK_Y, PK_C, PK_D, PK_G, PK_H, TESTKIT, NOVERIFY, PINX } = process.env;
 const ORIGIN_G = 'http://localhost:5181';
 const SYSTEM = '11111111111111111111111111111111';
 const ORIGIN_B = 'http://localhost:5174';
@@ -610,8 +610,11 @@ async function suiteE() {
 async function suiteF() {
   // Program actions (spec v3 Phase 1 policy + Phase 2 simulation / pin / two-step admission).
   const D = { create: '181ec828051c0777', close: 'a75149fabad23e79', noop: '09b20d738123ed66' };
-  const prog = (args, seed = freshSeed()) => JSON.parse(execFileSync('./target/debug/examples/progtx', [PK_G, BLOCKHASH, seed, ...args]).toString());
+  const prog = (args, seed = freshSeed(), fp = PK_G) => JSON.parse(execFileSync('./target/debug/examples/progtx', [fp, BLOCKHASH, seed, ...args]).toString());
   const sendG = async (t, opts = {}) => relay(t, { token: await tokenFor(t.user_hex, { aud: opts.aud ?? 'client-g' }), origin: opts.origin ?? ORIGIN_G });
+  const sendH = (t) => sendG(t, { aud: 'client-h', origin: 'http://localhost:5182' });
+  const quotaG = async (t) => request(`/quota?wallet=${t.user}`, { method: 'GET',
+    headers: { origin: ORIGIN_G, authorization: `Bearer ${await tokenFor(t.user_hex, { aud: 'client-g' })}` } });
   const createIx = `p:${TESTKIT}:${D.create}:u:s,fp:w,new:w,${SYSTEM}:r`;
   const closeIx = `p:${TESTKIT}:${D.close}:u:s,new:w,fp:w`;
   const noopIx = `p:${TESTKIT}:${D.noop}:u:s`;
@@ -628,8 +631,21 @@ async function suiteF() {
   const info = await request('/relayer?project=client-g', { method: 'GET' });
   check('V3 relayer info lists the program actions', info.status === 200 && info.json?.policy?.actions?.length === 3
     && info.json?.policy?.actions?.[0]?.program_id === TESTKIT, info.text.slice(0, 200));
+  check('W10 relayer info reports the project cooldown (0), not the Worker default (300)', info.json?.cooldown_ms === 0, `cooldown_ms=${info.json?.cooldown_ms}`);
+
+  // ---- W11 at preflight, with rent: fee + rent go back to project AND cluster (keep_rpm) ----
+  // (Mock only: client-g skips preflight after verify, but the mock fails the send regardless.)
+  await setState({ simulate: createSim(), send: 'custom6000' });
+  const pr = prog([createIx]);
+  const prr = await sendG(pr);
+  check('W11 preflight retryable on a rent tx → 409', prr.status === 409 && prr.json?.code === 'retryable', JSON.stringify(prr.json));
+  const prq = await quotaG(pr);
+  check('W11 preflight retryable gives the user count back', prq.status === 200 && prq.json?.used === 0, JSON.stringify(prq.json));
+  await setState({ send: 'ok' });
 
   // ---- happy paths ----
+  // Passing only if the 409 above refunded the declared rent: project rent budget 2_100_000 and
+  // cluster rent budget 1_100_000 both hold exactly one more create.
   await setState({ simulate: createSim() });
   let r = await sendG(prog([createIx]));
   const st = await stats();
@@ -675,7 +691,7 @@ async function suiteF() {
   await reject('V3-12 fake refund (relayer loses more than the fee) → 400', sim(5_000_000_000, 5_000_000_000 - 500_000), [closeIx]);
   await reject('unknown inner-ix shape → 503 (fail-closed)', sim(5_000_000_000, 5_000_000_000 - FEE, [{ weird: true }]), [noopIx], 'upstream', 503);
   await reject('simulation missing accounts → 503 (fail-closed)', { ...createSim(), accounts: null }, [createIx], 'upstream', 503);
-  const failed = await reject('program error in simulation → 400 simulation_failed', { ...sim(5_000_000_000, 5_000_000_000 - FEE), err: { InstructionError: [0, { Custom: 6000 }] } }, [noopIx], 'simulation_failed');
+  const failed = await reject('program error in simulation → 400 simulation_failed', { ...sim(5_000_000_000, 5_000_000_000 - FEE), err: { InstructionError: [0, { Custom: 6001 }] } }, [noopIx], 'simulation_failed');
   check('simulation_failed carries the program error and a backoff', /Custom/.test(failed.json?.reason ?? '') && failed.json?.retry_after_ms > 0, JSON.stringify(failed.json));
   for (const err of ['InsufficientFundsForFee', 'AccountNotFound']) {
     const x = await reject(`relayer wallet unfunded (${err}) → 503 low_balance`, { ...sim(0, 0), err }, [noopIx], 'low_balance', 503);
@@ -705,6 +721,62 @@ async function suiteF() {
   await bad('W5 CU price above ceiling', ['cbl:1000', 'cbp:2000', noopIx], 'compute unit price above ceiling');
   await bad('max_instructions', [noopIx, noopIx, noopIx, noopIx, noopIx], 'too many instructions');
 
+  // ---- Phase 3: rent budget (W9), per-project timing (W10), retryable errors (W11) ----
+  // client-g rent budget 2_100_000: V3-2 used one declared create (1_100_000); the simulated rent
+  // (1_021_080 each) would still fit a second one.
+  await setState({ simulate: createSim() });
+  r = await sendG(prog([createIx]));
+  check('V3-9 / V3-16 rent budget is charged at declared rent → 503 project_budget reason rent',
+    r.status === 503 && r.json?.code === 'project_budget' && r.json?.reason === 'rent' && r.json?.retry_after_ms > 0, `${r.status} ${JSON.stringify(r.json)}`);
+  await setState({ simulate: null });
+  r = await sendG(prog([noopIx]));
+  check('V3-9 tx without rent still relayed while the rent budget is exhausted', r.status === 200, `${r.status} ${r.json?.code} ${r.json?.reason ?? ''}`);
+
+  const seedC = freshSeed();
+  const c1 = await sendG(prog([noopIx], seedC));
+  const c2 = await sendG(prog(['cbl:1000', noopIx], seedC));
+  check('V3-8 project cooldown 0: same wallet relayed twice back-to-back', c1.status === 200 && c2.status === 200,
+    `${c1.status} ${c1.json?.code} / ${c2.status} ${c2.json?.code} ${c2.json?.retry_after_ms ?? ''}`);
+
+  const retrySim = (code, ix = 0) => ({ ...sim(5_000_000_000, 5_000_000_000 - FEE), err: { InstructionError: [ix, { Custom: code }] } });
+  const seedR = freshSeed();
+  await setState({ simulate: retrySim(6000) });
+  const r1 = await sendG(prog([noopIx], seedR));
+  check('V3-7 registered retryable error in simulation → 409 retryable, retry_after = retry_cooldown_ms',
+    r1.status === 409 && r1.json?.code === 'retryable' && r1.json?.retry_after_ms === 300 && /6000/.test(r1.json?.reason ?? ''), JSON.stringify(r1.json));
+  await sleep(350);
+  const r2 = await sendG(prog([noopIx], seedR));
+  check('V3-13 repeated retryable: same short cooldown, no backoff growth', r2.status === 409 && r2.json?.retry_after_ms === 300, JSON.stringify(r2.json));
+  await sleep(350);
+  await setState({ simulate: retrySim(6001) });
+  const r3 = await sendG(prog([noopIx], seedR));
+  check('V3-7 unregistered custom error → 400 simulation_failed with the first backoff (retryables built no streak)',
+    r3.status === 400 && r3.json?.code === 'simulation_failed' && r3.json?.retry_after_ms === 3000, JSON.stringify(r3.json));
+  await setState({ simulate: retrySim(6000, 0) });
+  const r4 = await sendG(prog(['cbl:1000', noopIx]));
+  check('W11 retryable code attributed by top-level ix index (ix 0 = ComputeBudget) → 400', r4.status === 400 && r4.json?.code === 'simulation_failed', JSON.stringify(r4.json));
+  await setState({ simulate: null, send: 'custom6000' });
+  const p1 = await sendG(prog([`p:${NOVERIFY}:${D.noop}:u:s`]));
+  check('W11 registered retryable error at preflight → 409 retryable (short cooldown)', p1.status === 409 && p1.json?.code === 'retryable' && p1.json?.retry_after_ms === 300, JSON.stringify(p1.json));
+  await setState({ send: 'ok' });
+
+  // ---- W9 accounting on client-h (fee budget 30_000 = 3 noops, rent budget 1_100_000) ----
+  const progH = (args) => prog(args, freshSeed(), PK_H);
+  const createH = `p:${TESTKIT}:${D.create}:u:s,fp:w,new:w,${SYSTEM}:r`;
+  await setState({ simulate: sim(5_000_000_000, 5_000_000_000 - RENT - FEE,
+    [sys('createAccount', { source: PK_H, newAccount: NEW, owner: TESTKIT, lamports: RENT, space: 73 })]) });
+  const h1 = await sendH(progH([createH]));
+  check('W9 cluster rent budget exhausted → 503 cluster_budget reason rent', h1.status === 503 && h1.json?.code === 'cluster_budget' && h1.json?.reason === 'rent', JSON.stringify(h1.json));
+  const h2 = await sendH(progH([createH]));
+  check('W9 project refunded fee + rent on the cluster refusal (still cluster_budget, not project_budget)',
+    h2.status === 503 && h2.json?.code === 'cluster_budget' && h2.json?.reason === 'rent', JSON.stringify(h2.json));
+  await setState({ simulate: null });
+  const hs = [];
+  for (let i = 0; i < 4; i++) hs.push(await sendH(progH([noopIx])));
+  check('W9 rent refusals leaked no fee: 3 noops fit the fee budget, the 4th → project_budget reason fee',
+    hs.slice(0, 3).every((x) => x.status === 200) && hs[3].status === 503 && hs[3].json?.code === 'project_budget' && hs[3].json?.reason === 'fee',
+    hs.map((x) => `${x.status}:${x.json?.code ?? ''}:${x.json?.reason ?? ''}`).join(','));
+
   // ---- routing + accounting ----
   const memoToG = mk(freshSeed(), '', PK_G);
   r = await relay(memoToG, { token: await tokenFor(memoToG.user_hex, { aud: 'client-g' }), origin: ORIGIN_G });
@@ -721,9 +793,10 @@ async function suiteF() {
     rows[0]?.c === 1_110_000 && rows[0]?.r === RENT && rows.slice(1).every((x) => x.c === FEE), JSON.stringify(rows));
   const rej = d1Query(`SELECT reason FROM relay_log WHERE aud = 'client-g' AND status = 'rpc_error' ORDER BY id`).map((x) => x.reason ?? '');
   check('rejections audited as rpc_error with a reason prefix',
-    rej.some((x) => x.startsWith('inner_ix_rejected: ')) && rej.some((x) => x.startsWith('simulation_failed: ')), JSON.stringify(rej).slice(0, 300));
+    rej.some((x) => x.startsWith('inner_ix_rejected: ')) && rej.some((x) => x.startsWith('simulation_failed: ')) && rej.some((x) => x.startsWith('retryable: ')),
+    JSON.stringify(rej).slice(0, 300));
   const sends = (await stats()).sendTransaction - s0.sendTransaction;
-  check('sendTransaction only for the 4 relayed program txs + 1 memo', sends === 5, `sends=${sends}`);
+  check('sendTransaction only for the 10 relayed program txs + 1 memo + 2 preflight-retryable', sends === 13, `sends=${sends}`);
 }
 
 const info = await request('/relayer?project=test-client', { method: 'GET' });

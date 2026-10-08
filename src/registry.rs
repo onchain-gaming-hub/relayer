@@ -20,7 +20,7 @@ use solana_pubkey::Pubkey;
 use worker::{Env, console_log, console_warn};
 
 use crate::{
-    config::{Cluster, Config, Web3AuthNetwork},
+    config::{Cluster, Config, EffectiveTiming, Web3AuthNetwork},
     error::ApiError,
     policy::{MAX_MEMO_BYTES_CAP, MemoRule},
     program_policy::{self, ProgramPolicy},
@@ -49,11 +49,9 @@ pub struct Project {
     pub user_daily_quota: u32,
     pub project_rpm: u32,
     pub project_daily_budget_lamports: u64,
-    /// Rent the fee payer may front per UTC day (v3 W9; enforced from Phase 3). 0 = none.
-    #[allow(dead_code)]
+    /// Rent the fee payer may front per UTC day (v3 W9). 0 = none.
     pub project_daily_rent_budget_lamports: u64,
-    /// Per-project timing overrides (v3 W10; enforced from Phase 3). `None` = Worker default.
-    #[allow(dead_code)]
+    /// Per-project timing overrides (v3 W10). `None` = Worker default.
     pub timing: Timing,
     pub min_balance_lamports: u64,
 }
@@ -64,6 +62,22 @@ pub struct Timing {
     pub reject_cooldown_ms: Option<f64>,
     pub reject_cooldown_max_ms: Option<f64>,
     pub retry_cooldown_ms: Option<f64>,
+}
+
+impl Timing {
+    /// `base` = the Worker's timing (`Config::timing`).
+    pub fn resolve(&self, base: EffectiveTiming) -> EffectiveTiming {
+        let reject = self.reject_cooldown_ms.unwrap_or(base.reject_cooldown_ms);
+        EffectiveTiming {
+            cooldown_ms: self.cooldown_ms.unwrap_or(base.cooldown_ms),
+            reject_cooldown_ms: reject,
+            reject_cooldown_max_ms: self
+                .reject_cooldown_max_ms
+                .unwrap_or(base.reject_cooldown_max_ms)
+                .max(reject),
+            retry_cooldown_ms: self.retry_cooldown_ms.unwrap_or(base.retry_cooldown_ms),
+        }
+    }
 }
 
 /// One `projects` row as D1 returns it (numbers arrive as JS numbers).
@@ -512,6 +526,34 @@ mod tests {
         r.cooldown_ms = None;
         r.retry_cooldown_ms = Some(f64::NAN);
         assert!(parse_project(&r).is_err());
+    }
+
+    #[test]
+    fn timing_resolves_over_the_worker_defaults() {
+        let base = EffectiveTiming {
+            cooldown_ms: 10_000.0,
+            reject_cooldown_ms: 3_000.0,
+            reject_cooldown_max_ms: 60_000.0,
+            retry_cooldown_ms: 1_000.0,
+        };
+        assert_eq!(Timing::default().resolve(base), base);
+        let t = Timing {
+            cooldown_ms: Some(0.0),
+            retry_cooldown_ms: Some(250.0),
+            ..Timing::default()
+        }
+        .resolve(base);
+        assert_eq!(
+            (t.cooldown_ms, t.retry_cooldown_ms, t.reject_cooldown_ms),
+            (0.0, 250.0, 3_000.0)
+        );
+        // Only the base raised above the Worker's max: the cap follows it.
+        let t = Timing {
+            reject_cooldown_ms: Some(90_000.0),
+            ..Timing::default()
+        }
+        .resolve(base);
+        assert_eq!(t.reject_cooldown_max_ms, 90_000.0);
     }
 
     #[test]

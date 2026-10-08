@@ -1,5 +1,6 @@
 //! `ProjectThrottle` — one DO per project (`id_from_name(aud)`, spec v2 §4.4).
-//! Project requests per minute (memory) + daily fee budget (SQLite, `daily.rs`) + a 30 s cached
+//! Project requests per minute (memory) + daily fee and rent budgets (SQLite, `daily.rs`,
+//! v3 W9) + a 30 s cached
 //! balance of the project's fee payer (circuit breaker), then the cluster-wide admit.
 //! Limits arrive with each admit (from the registry snapshot, ≤ REGISTRY_CACHE_MS old).
 
@@ -43,9 +44,11 @@ struct AdmitRpm {
 #[derive(Deserialize)]
 struct AdmitBudget {
     cluster: String,
-    /// fee + declared rent (rent shares the fee budget until v3 Phase 3 splits them).
+    /// Fee lamports (W8) against `budget`, declared rent against `rent_budget` (W9).
     cost: u64,
+    rent: u64,
     budget: u64,
+    rent_budget: u64,
     fee_payer: String,
     min_balance: u64,
 }
@@ -54,6 +57,11 @@ struct AdmitBudget {
 struct Refund {
     cluster: String,
     cost: u64,
+    #[serde(default)]
+    rent: u64,
+    /// Retryable preflight failure (W11): budgets go back, RPM slots stay (1 call = 1 slot).
+    #[serde(default)]
+    keep_rpm: bool,
     window: f64,
     day: i64,
     cluster_window: f64,
@@ -150,11 +158,15 @@ impl ProjectThrottle {
             .map_err(ApiError::project_throttle)?;
         let day = daily::day_of(now);
         let cost = lamports(a.cost);
-        match daily::try_add(&self.state.storage().sql(), day, cost, lamports(a.budget)) {
+        let sql = self.state.storage().sql();
+        match daily::try_add(&sql, daily::FEE, day, daily::FEE, cost, lamports(a.budget)) {
             Ok(Some(_)) => {}
             Ok(None) => {
                 self.rpm.release(window);
-                return Err(ApiError::project_budget(daily::ms_until_next_day(now)));
+                return Err(ApiError::project_budget(
+                    daily::ms_until_next_day(now),
+                    daily::FEE,
+                ));
             }
             Err(e) => {
                 self.rpm.release(window);
@@ -163,7 +175,7 @@ impl ProjectThrottle {
         }
         let undo = || {
             self.rpm.release(window);
-            self.refund_budget(day, cost);
+            self.refund_budget(day, cost, 0);
         };
 
         match self.balance(&a.fee_payer, &url, cfg, now).await {
@@ -265,19 +277,48 @@ impl ProjectThrottle {
             Cluster::parse(&a.cluster).ok_or_else(|| ApiError::internal("bad cluster"))?;
         let url = rpc_url(&self.env, cluster).map_err(ApiError::config)?;
         let day = daily::day_of(now);
-        let cost = lamports(a.cost);
-        match daily::try_add(&self.state.storage().sql(), day, cost, lamports(a.budget)) {
+        let (cost, rent) = (lamports(a.cost), lamports(a.rent));
+        // Fee, then rent: synchronous statements (atomic within this DO); a rent refusal gives
+        // the fee back. Rent recovered by closing accounts never returns to the budget (W9).
+        let sql = self.state.storage().sql();
+        match daily::try_add(&sql, daily::FEE, day, daily::FEE, cost, lamports(a.budget)) {
             Ok(Some(_)) => {}
-            Ok(None) => return Err(ApiError::project_budget(daily::ms_until_next_day(now))),
+            Ok(None) => {
+                return Err(ApiError::project_budget(
+                    daily::ms_until_next_day(now),
+                    daily::FEE,
+                ));
+            }
             Err(e) => return Err(ApiError::internal(format!("project budget: {e}"))),
+        }
+        if rent > 0 {
+            let refused = match daily::try_add(
+                &sql,
+                daily::FEE,
+                day,
+                daily::RENT,
+                rent,
+                lamports(a.rent_budget),
+            ) {
+                Ok(Some(_)) => None,
+                Ok(None) => Some(ApiError::project_budget(
+                    daily::ms_until_next_day(now),
+                    daily::RENT,
+                )),
+                Err(e) => Some(ApiError::internal(format!("project rent budget: {e}"))),
+            };
+            if let Some(err) = refused {
+                self.refund_budget(day, cost, 0);
+                return Err(err);
+            }
         }
         match self.balance(&a.fee_payer, &url, cfg, now).await {
             Err(e) => {
-                self.refund_budget(day, cost);
+                self.refund_budget(day, cost, rent);
                 return Err(ApiError::upstream(e));
             }
             Ok(balance) if balance < a.min_balance => {
-                self.refund_budget(day, cost);
+                self.refund_budget(day, cost, rent);
                 return Err(ApiError::low_balance());
             }
             Ok(_) => {}
@@ -285,7 +326,7 @@ impl ProjectThrottle {
         let call = cluster_call(
             &self.env,
             "admit_budget",
-            json!({ "cluster": cluster.as_str(), "cost": a.cost }),
+            json!({ "cluster": cluster.as_str(), "cost": a.cost, "rent": a.rent }),
         );
         match rpc::with_timeout(call, cfg.cluster_hop_timeout_ms).await {
             Some(Ok((200, body))) => {
@@ -296,35 +337,40 @@ impl ProjectThrottle {
                     .map_err(|e| ApiError::internal(e.to_string()))
             }
             Some(Ok((status, body))) => {
-                self.refund_budget(day, cost);
+                self.refund_budget(day, cost, rent);
                 Err(ApiError::relayed(status, &body))
             }
             Some(Err(e)) => {
-                self.refund_budget(day, cost);
+                self.refund_budget(day, cost, rent);
                 Err(ApiError::upstream(format!("cluster admit_budget: {e}")))
             }
             None => Err(ApiError::upstream("cluster admit_budget timeout")),
         }
     }
 
-    fn refund_budget(&self, day: i64, cost: i64) {
-        if let Err(e) = daily::refund(&self.state.storage().sql(), day, cost) {
-            console_error!("project budget refund failed: {e}");
+    fn refund_budget(&self, day: i64, fee: i64, rent: i64) {
+        let sql = self.state.storage().sql();
+        for (kind, amount) in [(daily::FEE, fee), (daily::RENT, rent)] {
+            if let Err(e) = daily::refund(&sql, daily::FEE, day, kind, amount) {
+                console_error!("project {kind} budget refund failed: {e}");
+            }
         }
     }
 
     /// Best-effort: gives back this project's slot and budget (same window / day only) and
     /// forwards the refund to the cluster.
     async fn refund(&self, r: Refund, cfg: &Config) -> std::result::Result<Response, ApiError> {
-        let refunded = self.rpm.release(r.window);
-        self.refund_budget(r.day, lamports(r.cost));
+        let refunded = !r.keep_rpm && self.rpm.release(r.window);
+        self.refund_budget(r.day, lamports(r.cost), lamports(r.rent));
         let call = cluster_call(
             &self.env,
             "refund",
             json!({
                 "cluster": r.cluster,
                 "cost": r.cost,
-                "window": r.cluster_window,
+                "rent": r.rent,
+                // No window: the cluster keeps its RPM slot too.
+                "window": if r.keep_rpm { None } else { Some(r.cluster_window) },
                 "day": r.cluster_day,
             }),
         );

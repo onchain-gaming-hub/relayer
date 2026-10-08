@@ -17,6 +17,14 @@ pub struct ApiError {
     pub signature: Option<String>,
 }
 
+/// `fee` / `rent` from a relayed budget error (anything else is reported as `fee`).
+fn budget_kind(body: &serde_json::Value) -> &'static str {
+    match body.get("reason").and_then(serde_json::Value::as_str) {
+        Some("rent") => "rent",
+        _ => "fee",
+    }
+}
+
 impl ApiError {
     fn new(status: u16, code: &'static str, message: impl Into<String>) -> Self {
         Self {
@@ -87,12 +95,21 @@ impl ApiError {
         Self::new(429, "user_quota", "daily quota reached for this wallet")
             .with_retry_after(retry_after_ms)
     }
-    pub fn project_budget(retry_after_ms: f64) -> Self {
+    /// `kind`: which budget ran out, `fee` or `rent` (v3 §6).
+    pub fn project_budget(retry_after_ms: f64, kind: &str) -> Self {
         Self::new(503, "project_budget", "project daily budget exhausted")
             .with_retry_after(retry_after_ms)
+            .with_reason(kind)
     }
-    pub fn cluster_budget(retry_after_ms: f64) -> Self {
+    pub fn cluster_budget(retry_after_ms: f64, kind: &str) -> Self {
         Self::new(503, "cluster_budget", "relayer daily budget exhausted")
+            .with_retry_after(retry_after_ms)
+            .with_reason(kind)
+    }
+    /// A custom error the program registered as retryable (v3 W11): re-read chain, resend.
+    pub fn retryable(reason: impl Into<String>, retry_after_ms: f64) -> Self {
+        Self::new(409, "retryable", "the program asked for a retry")
+            .with_reason(reason)
             .with_retry_after(retry_after_ms)
     }
     /// The program failed in simulation (v3 §4.2): nothing was sent; backoff like a reject.
@@ -181,8 +198,8 @@ impl ApiError {
             (429, Some("project_throttle")) => Self::project_throttle(retry),
             (429, Some("cluster_throttle")) => Self::cluster_throttle(retry),
             (503, Some("low_balance")) => Self::low_balance(),
-            (503, Some("project_budget")) => Self::project_budget(retry),
-            (503, Some("cluster_budget")) => Self::cluster_budget(retry),
+            (503, Some("project_budget")) => Self::project_budget(retry, budget_kind(body)),
+            (503, Some("cluster_budget")) => Self::cluster_budget(retry, budget_kind(body)),
             // The other DO already logged its own detail; don't log it twice.
             (503, Some("upstream")) => Self::upstream_relayed(),
             (500, Some("internal")) => Self::config("throttle DO returned 500"),
