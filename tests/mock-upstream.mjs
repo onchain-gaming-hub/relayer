@@ -106,7 +106,7 @@ http.createServer(async (req, res) => {
       return ok((state.gpa[program] ?? []).map((pubkey) => ({ pubkey, account: { data: ['', 'base64'], lamports: 1, owner: program } })));
     }
     case 'getLatestBlockhash': return ok({ context: { slot: 1 }, value: { blockhash: state.genesis, lastValidBlockHeight: 1000 } });
-    case 'getMinimumBalanceForRentExemption': return ok(890_880);
+    case 'getMinimumBalanceForRentExemption': return ok(650_240); // devnet, size 0 (2026-10-09)
     case 'getAccountInfo': {
       const [addr, cfg] = rpc.params;
       const len = cfg?.dataSlice?.length;

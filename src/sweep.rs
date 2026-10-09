@@ -238,7 +238,7 @@ mod tests {
     #[test]
     fn rent_must_come_back() {
         // Phase 0 spike: closing a 73-byte account returned rent − fee.
-        let (pre, rent, fee, min0) = (5_000_000_000u64, 1_021_080, 5_000, 890_880);
+        let (pre, rent, fee, min0) = (5_000_000_000u64, 1_021_080, 5_000, 650_240);
         assert!(rent_came_back(pre, pre + rent - fee, fee, min0));
         assert_eq!(rent_returned(pre, pre + rent - fee, fee), rent);
         assert!(

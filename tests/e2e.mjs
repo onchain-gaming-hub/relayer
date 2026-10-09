@@ -803,6 +803,9 @@ async function suiteF() {
   check('rejections audited as rpc_error with a reason prefix',
     rej.some((x) => x.startsWith('inner_ix_rejected: ')) && rej.some((x) => x.startsWith('simulation_failed: ')) && rej.some((x) => x.startsWith('retryable: ')),
     JSON.stringify(rej).slice(0, 300));
+  const errCost = d1Query(`SELECT reason, cost_lamports AS c FROM relay_log WHERE aud IN ('client-g', 'client-h') AND status = 'rpc_error' ORDER BY id`);
+  check('audit cost_lamports = 0 for unsent / refunded rows (simulation_failed, inner_ix_rejected, retryable incl. preflight)',
+    errCost.length >= 5 && errCost.every((x) => x.c === 0), JSON.stringify(errCost).slice(0, 400));
   const sends = (await stats()).sendTransaction - s0.sendTransaction;
   check('sendTransaction only for the 10 relayed program txs + 1 memo + 2 preflight-retryable', sends === 13, `sends=${sends}`);
 }

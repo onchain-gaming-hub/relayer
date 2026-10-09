@@ -373,7 +373,9 @@ impl UserController {
             self.refund_user(day);
             self.refund(&job, &admitted, retryable).await;
         }
-        self.audit(&job, audit.0, audit.1, done, rent_simulated);
+        // cost_lamports = what the budgets keep: a tx-fault reject (incl. retryable) was refunded.
+        let charged = if tx_fault { 0 } else { job.cost };
+        self.audit(&job, audit.0, audit.1, done, charged, rent_simulated);
         // `done`, not `now`: a request that crosses UTC midnight reports the new day.
         let quota = self.quota(job.user_daily_quota, done).ok();
 
@@ -487,6 +489,7 @@ impl UserController {
                     "rpc_error",
                     Some(format!("retryable: {reason}")),
                     at,
+                    0,
                     None,
                 );
                 return Err(ApiError::retryable(reason, t.retry_cooldown_ms));
@@ -519,6 +522,7 @@ impl UserController {
                         "rpc_error",
                         Some(format!("simulation_failed: {reason}")),
                         at,
+                        0,
                         None,
                     );
                     return Err(ApiError::simulation_failed(reason, wait));
@@ -535,6 +539,7 @@ impl UserController {
                         "rpc_error",
                         Some(format!("inner_ix_rejected: {reason}")),
                         at,
+                        0,
                         None,
                     );
                     self.refund_user(day);
@@ -732,6 +737,9 @@ impl UserController {
         status: &'static str,
         reason: Option<String>,
         at: f64,
+        // Lamports the budgets keep for this row: 0 when nothing was sent or the budgets were
+        // refunded (a failed best-effort refund is logged separately).
+        cost: u64,
         rent_simulated: Option<u64>,
     ) {
         let db = match self.env.d1("DB") {
@@ -746,7 +754,7 @@ impl UserController {
             job.signature.clone(),
             job.aud.clone(),
             job.cluster.clone(),
-            job.cost as f64,
+            cost as f64,
         );
         self.state.wait_until(async move {
             let reason = reason.map(JsValue::from).unwrap_or(JsValue::NULL);
