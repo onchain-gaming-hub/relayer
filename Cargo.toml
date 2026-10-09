@@ -29,6 +29,8 @@ solana-instruction = "4"
 solana-hash = "4"
 
 [dev-dependencies]
+# PDA derivation in examples/progtx (live devnet tests); not part of the Wasm build.
+solana-pubkey = { version = "4", features = ["curve25519"] }
 
 [profile.release]
 opt-level = "z"
