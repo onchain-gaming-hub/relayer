@@ -14,7 +14,8 @@ description: Best practices for designing a Solana program and frontend that use
 - **1 โปรเจค = 1 Web3Auth clientId (`aud`) = 1 กระเป๋า fee payer = 1 cluster** แต่ละโปรเจคมี quota, budget และกระเป๋าของตัวเอง ความเสียหายของโปรเจคหนึ่งไม่ลามไปโปรเจคอื่น
 - ผู้ใช้ login ผ่าน Web3Auth (social) → sign tx → `POST /relay` พร้อม idToken → relayer ตรวจ policy, sign เป็น fee payer (slot 0), (ถ้าต้อง) simulate แล้วตรวจผล → broadcast
 - relayer **ไม่ cache state ของ program** chain คือ source of truth เดียว
-- ทุก program ที่จะให้ sponsor ต้อง **ลงทะเบียนในโปรเจคของตัวเอง** (program ที่หลายโปรเจคใช้ร่วมกัน เช่น lobby กลาง ก็ลงทะเบียนแยกในแต่ละโปรเจค)
+- ทุก program ที่จะให้ sponsor ต้อง **ลงทะเบียนในโปรเจคที่ผู้เล่น login** (program ที่หลายโปรเจคใช้ร่วมกันก็ลงทะเบียนแยกในแต่ละโปรเจค)
+- **blockchain-games-hub (H-3, maintainer 2026-10-10):** hub มี **โปรเจคเดียว** = Web3Auth clientId ของ hub-web · ทุก program ของ hub (lobby, rewards-pool, เกมต่างๆ) ลงทะเบียนเป็น program action ในโปรเจคนี้ ไม่แยกโปรเจคหรือ clientId ต่อเกม · ปิดทีละเกม = ถอด program ออกจาก policy (ห้ามถอดจน policy ว่าง) · quota / budget / RPM / cooldown / `max_instructions` / กระเป๋า fee payer ใช้ร่วมทุกเกม
 
 ## 1. สถานะการรองรับ
 
