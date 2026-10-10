@@ -48,7 +48,7 @@ relayer ยอมให้ fee payer อยู่ใน instruction **เฉพ�
 1. **แยก `user: Signer` กับ `payer: Signer` (`mut`)** ในทุก ix ที่สร้าง account · ix ที่ไม่สร้าง account **ห้ามรับ `payer`**
 2. **ใช้ `payer` เป็นแหล่งเงินของ `init` / `init_if_needed` เท่านั้น** (System `createAccount`, หรือ `transfer` → `allocate` → `assign` ของ Anchor เมื่อ account มี lamports อยู่ก่อน) · ห้าม transfer ไปที่อื่น · **ห้ามส่ง `payer` ผ่าน CPI ไป program อื่น** นอกจาก System · relayer simulate แล้ว reject ทุก inner ix ที่มี fee payer นอกเหนือจากนี้ (`inner_ix_rejected`)
 3. **account ที่ `payer` จ่ายต้องเก็บ `rent_payer: Pubkey`** และ **ปิดแล้วคืนให้ `rent_payer` เท่านั้น** (`close = rent_payer` + `has_one = rent_payer`) · ห้ามให้ผู้เรียกเลือกปลายทาง (ปิด rent farming)
-4. **มีทางคืน rent เสมอ:** account ที่จบแล้ว/หมดอายุต้องปิดได้โดยไม่ต้องรอผู้ใช้ (social user ส่วนใหญ่ไม่กลับมากด) → ออกแบบให้ **cron sweep ของ relayer ปิดได้** (§2.1)
+4. **มีทางคืน rent เสมอ:** account ที่จบแล้ว/หมดอายุต้องปิดได้โดยไม่ต้องรอผู้ใช้ (social user ส่วนใหญ่ไม่กลับมากด) → ix ปิดแบบ **permissionless** ที่คืนเงินให้ `rent_payer` (ปลายทางตรึงไว้ ใครกดก็ไม่มีใครขโมยได้) แล้วเลือกคนกด 1 ใน 2 ทาง: (a) **worker ของโปรเจคเอง** ใช้ wallet ของตัวเอง (เช่น lobby → Lobby Worker ตาม L14, 2026-10-10) หรือ (b) **cron sweep ของ relayer** (§2.1)
 5. **ขนาด account กำหนดตอน `init` และมีเพดาน** · TTL ที่ทำให้ rent ค้างต้องมีเพดานระดับ program (const)
 6. **Upgrade = ต้องแจ้ง relayer:** relayer pin `deploy_slot` ของ ProgramData (หรือ `immutable`) ถ้า upgrade โดยไม่แจ้ง ทุก ix ของ program นั้นจะตอบ **503 `program_changed`** จนกว่า maintainer จะ review code ใหม่แล้วอัปเดต `deploy_slot` · upgrade authority ควรเป็น multisig หรือ freeze ก่อน mainnet
 7. `emit!` event ที่มี `rent_payer` ตอนสร้างและตอนปิด (ไว้ตรวจย้อนหลัง)
@@ -61,7 +61,7 @@ relayer ยอมให้ fee payer อยู่ใน instruction **เฉพ�
 - ใช้ได้ **เฉพาะ account ที่ fee payer ของโปรเจคเป็น `rent_payer`** · account ที่ผู้ใช้จ่าย rent เองต้องปิดด้วย wallet ของผู้ใช้ (ส่งผ่าน relayer จะ fail `has_one`)
 - **ห้ามมี payer slot กับ refund slot ใน tx เดียวกัน**
 
-### 2.1 Account ที่ cron sweep ปิดได้ (SHOULD สำหรับทุก account ที่ relayer ออก rent)
+### 2.1 ถ้าเลือกให้ cron sweep ของ relayer ปิด (ทางเลือก (b) ของ §2 P ข้อ 4)
 cron ของ relayer (ทุก 5 นาที) ค้น account ด้วย `getProgramAccounts` แล้วสร้าง tx ปิดเอง **โดยมี signer แค่ fee payer** · ออกแบบตามนี้ (ตัวอย่าง: testkit `Room` + `sweep_close`):
 1. account มี discriminator ของตัวเอง (Anchor `account:<Name>`) และ **`rent_payer` อยู่ที่ offset คงที่** (เช่น เป็น field แรกหลัง discriminator = offset 8)
 2. ix ปิดมี data = **discriminator 8 bytes เท่านั้น** (ไม่มี argument) และ accounts ตาม template ที่ลงทะเบียน เช่น `[account (mut), rent_payer (mut, Signer)]` (+ account คงที่ได้ เช่น config PDA)
@@ -151,7 +151,7 @@ cron ของ relayer (ทุก 5 นาที) ค้น account ด้วย
 ## 6. Checklist ก่อนขอลงทะเบียน
 - [ ] เลือก rent model แล้ว (ไม่สร้าง account / P / V) และเขียนเหตุผลไว้
 - [ ] (P) ข้อ 1–9 ของ §2 ครบ และมี test ข้อ 8
-- [ ] ทุก account ที่ relayer ออก rent มีทางคืน: refund slot และ/หรือ ix ที่ cron sweep ปิดได้ตาม §2.1 (signer = `rent_payer` คนเดียว, error เมื่อยังปิดไม่ได้)
+- [ ] ทุก account ที่ relayer ออก rent มีทางคืน: refund slot และ/หรือ ix ปิดแบบ permissionless ที่ worker ของโปรเจคกด หรือที่ cron sweep ของ relayer ปิดได้ตาม §2.1 (signer = `rent_payer` คนเดียว, error เมื่อยังปิดไม่ได้)
 - [ ] (V) griefing มีทางจำกัดแล้ว และกำหนดคนเติม vault แล้ว
 - [ ] ไม่มี ix ไหนส่ง fee payer / payer ผ่าน CPI ไป program อื่น (นอกจาก System)
 - [ ] crank ix ไม่อ่าน `remaining_accounts` (หรือข้าม signer ท้ายสุด)
