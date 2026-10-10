@@ -7,6 +7,8 @@
 #   except the 1-hour Room (≈ 0.00106 SOL), which stays locked until a later run's sweep closes it.
 # - Identity: the mock JWKS stands in for Web3Auth (identity is not under test here; the browser
 #   flow is tested on staging). Local D1 / DO state lives in a temp dir.
+# Other projects: LIVE_POLICY=<policy JSON file> LIVE_SCRIPT=<test script> ./tests/run-live.sh
+#   (default: the testkit policy below + tests/live-v3.mjs).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -50,6 +52,9 @@ POLICY='{"actions":[{"type":"program","program_id":"'$TESTKIT'","deploy_slot":'$
 '"sweeps":[{"name":"close_room","account_discriminator":"9cc7431bde17b95e","rent_payer_offset":8,"ix_discriminator":"f1ed4afddfe936dc","accounts":[{"kind":"swept","writable":true},{"kind":"fee_payer","writable":true}],"max_sends_per_run":5,"max_simulations_per_run":20}]}],'\
 '"limits":{"max_instructions":4,"max_cu":400000,"max_cu_price_micro_lamports":0}}'
 
+if [ -n "${LIVE_POLICY:-}" ]; then
+  POLICY=$(node -e 'process.stdout.write(JSON.stringify(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))))' "$LIVE_POLICY")
+fi
 NOW=$(($(date +%s) * 1000))
 cat > "$WORK/seed.sql" <<SQL
 INSERT INTO fee_payer_history (pubkey, aud, cluster, created_at) VALUES ('$PK_LIVE', 'live-v3', 'devnet', $NOW);
@@ -70,6 +75,6 @@ until grep -qE "Ready on|ERROR" "$WORK/wrangler.log"; do sleep 0.3; done
 
 rc=0
 PERSIST_DIR="$WORK/state" RELAYER_LOG="$WORK/wrangler.log" RELAYER_URL="http://127.0.0.1:$PORT" MOCK_URL="$MOCK" \
-  PK_LIVE="$PK_LIVE" TESTKIT="$TESTKIT" node tests/live-v3.mjs || rc=$?
+  PK_LIVE="$PK_LIVE" TESTKIT="$TESTKIT" node "${LIVE_SCRIPT:-tests/live-v3.mjs}" || rc=$?
 if [ $rc -ne 0 ]; then grep -E "sweep|error|Error" "$WORK/wrangler.log" | sed -E 's#https?://[^ "]+#<url>#g' | tail -20 || true; fi
 exit $rc
