@@ -1,6 +1,6 @@
 ---
 name: gasless-relayer-integration
-description: Best practices for designing a Solana program and frontend that use maintainer's gasless relayer (relayer pays fees, can front rent through a registered payer slot, closes accounts with a cron sweep). Use when designing or reviewing a Solana program's accounts/instructions, deciding who pays rent, building transactions in a frontend that sends them to the relayer, writing the relayer policy for a project, or preparing a project to register on the relayer.
+description: Best practices for designing a Solana program and frontend that use the hub's gasless relayer (relayer pays fees, can front rent through a registered payer slot, closes accounts with a cron sweep). Use when designing or reviewing a Solana program's accounts/instructions, deciding who pays rent, building transactions in a frontend that sends them to the relayer, writing the relayer policy for a project, or preparing a project to register on the relayer.
 ---
 
 # Gasless Relayer Integration — Best Practices
@@ -9,7 +9,7 @@ description: Best practices for designing a Solana program and frontend that use
 > References: relayer spec v3 (`solana-poc/docs/plans/2026-10-08_program-actions-v3-spec.md`) · v2 (`2026-10-06_multi-project-relayer-v2-spec.md`) · rent research (`2026-10-08_rent-sponsorship-research.md`) · lobby compat (`2026-10-08_lobby-relayer-compat.md`)
 > Working examples: program `solana-poc/testkit` (Anchor 1.2.1) · FE `solana-poc/frontend/src/lib/testkit.ts` · policy in `docs/plans/2026-10-09_v3-phase5-staging-runbook.md` step 3
 > Deployed ids, URLs and wallets: `solana-poc/relayer/SKILL.md`
-> Version: 2026-10-09 (v3) · maintainer: maintainer
+> Version: 2026-10-09 (v3) · maintained by the hub maintainers
 
 ## 0. Relayer overview
 - **1 project = 1 Web3Auth clientId (`aud`) = 1 fee payer wallet = 1 cluster.** Each project has its own quota, budget and wallet, so damage in one project does not spread to another.
@@ -21,7 +21,7 @@ description: Best practices for designing a Solana program and frontend that use
   5. It broadcasts the tx.
 - The relayer **does not cache program state**. The chain is the only source of truth.
 - Every program to be sponsored must be **registered in the project the player logs in with**. A program shared by several projects is registered separately in each one.
-- **blockchain-games-hub (H-3, maintainer 2026-10-10):** the hub has **one project**, the Web3Auth clientId of hub-web.
+- **blockchain-games-hub (H-3, 2026-10-10):** the hub has **one project**, the Web3Auth clientId of hub-web.
   - Every hub program (lobby, rewards-pool, games) is registered as a program action in that project. There is no separate project or clientId per game.
   - To disable one game, remove its program from the policy (never leave the policy empty).
   - Quota, budget, RPM, cooldown, `max_instructions` and the fee payer wallet are shared by all games.
@@ -37,7 +37,7 @@ description: Best practices for designing a Solana program and frontend that use
 | Simulation + inner-instruction check before sending (can be turned off per program) · program version pin | ✅ v3 |
 | ComputeBudget with ceilings · separate fee and rent budgets · per-project cooldown/backoff · retryable custom errors | ✅ v3 |
 | User-signed crank · **cron sweep** that closes accounts and returns rent every 5 minutes | ✅ v3 |
-| Mainnet | 🔜 needs maintainer's separate approval |
+| Mainnet | 🔜 needs separate approval |
 | Address Lookup Tables · Loader-v4 | ❌ not supported |
 | Registering System / ComputeBudget / BPF loaders / Token / Token-2022 / ATA / Memo v1-v2 / ALT program / **precompiles (Ed25519, Secp256k1, Secp256r1)** as program actions | ❌ not supported. Precompiles would make the declared fee wrong, so precompile signature verification cannot be used in txs sent through the relayer |
 
@@ -76,7 +76,7 @@ The relayer allows the fee payer inside an instruction **only** at the `payer_in
      - (b) **the relayer's cron sweep** (§2.1)
 5. **Account size is fixed at `init` and capped.** Any TTL that keeps rent locked must have a program-level cap (a const).
 6. **Upgrades must be announced to the relayer.** The relayer pins the ProgramData `deploy_slot` (or `immutable`).
-   - If you upgrade without notice, every ix of that program returns **503 `program_changed`** until maintainer reviews the new code and updates `deploy_slot`.
+   - If you upgrade without notice, every ix of that program returns **503 `program_changed`** until a hub admin reviews the new code and updates `deploy_slot`.
    - The upgrade authority should be a multisig, or frozen, before mainnet.
 7. `emit!` an event carrying `rent_payer` on create and on close (for later audits).
 8. Write a test asserting that `payer`'s lamports drop by **exactly the rent of the created account**. Set the ix's `max_rent_lamports` ≥ the real rent: the relayer charges the rent budget by this declared value, not the actual amount, and rejects the tx if the simulated amount exceeds it.
@@ -183,7 +183,7 @@ Every 5 minutes, the relayer cron finds accounts with `getProgramAccounts` and b
    - **Sweeps consume the project's resources too.** Every sweep RPC call (list, blockhash, simulate, send) takes 1 project + cluster RPM slot, and every sent tx takes 5,000 lamports of the fee budget.
    - For example, `max_simulations_per_run` 20 means up to ~25 RPM per 5-minute cycle.
 8. Fee payer wallet:
-   - maintainer creates it following the runbook and stores it as a Worker secret. The project owner never holds the key.
+   - A hub admin creates it following the runbook and stores it as a Worker secret. The project owner never holds the key.
    - Agree who funds it with SOL.
    - With payer slots: `min_balance_lamports` ≥ `max_instructions × max(max_rent_lamports) + 1,000,000`.
 

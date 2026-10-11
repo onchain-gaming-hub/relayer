@@ -1,6 +1,6 @@
 ---
 name: gasless-relayer
-description: Operator and onboarding guide for maintainer's gasless Solana relayer (Cloudflare Worker + Durable Objects + D1, devnet staging). Lists everything already deployed on devnet (Worker URL, D1, registered projects, fee payer wallets, test program ids, slots), the HTTP API, how to register a new app or program, how to test it (local e2e, live devnet), and how to operate it safely. Use when a team wants to use the relayer, when registering or changing a project/policy, or when you need an id/address/URL of the relayer's devnet deployment.
+description: Operator and onboarding guide for the blockchain-games-hub gasless Solana relayer (Cloudflare Worker + Durable Objects + D1, devnet staging). Lists everything already deployed on devnet (Worker URL, D1, registered projects, fee payer wallets, test program ids, slots), the HTTP API, how to register a new app or program, how to test it (local e2e, live devnet), and how to operate it safely. Use when a team wants to use the relayer, when registering or changing a project/policy, or when you need an id/address/URL of the relayer's devnet deployment.
 ---
 
 # Gasless Relayer: User and Operator Guide
@@ -9,7 +9,7 @@ description: Operator and onboarding guide for maintainer's gasless Solana relay
 > Values that change over time (balances, Worker version, policy) must be re-checked before use. Each part of section 2 gives the command to do that.
 > Design rules for programs and frontends (payer slot, crank, sweep, FE error handling) are in **`relayer/skills/gasless-relayer-integration/SKILL.md`**. This file links there and does not repeat them.
 > Specs: `docs/plans/2026-10-08_program-actions-v3-spec.md` (v3) · v2: `docs/plans/2026-10-06_multi-project-relayer-v2-spec.md`
-> Maintainer: maintainer · approves and runs all remote changes: **maintainer**
+> Maintained by the hub maintainers · all remote changes are approved and run by a **hub admin**
 
 ## 1. What the relayer is
 - A user who logs in with Web3Auth (social login) has a wallet but no SOL.
@@ -68,7 +68,7 @@ description: Operator and onboarding guide for maintainer's gasless Solana relay
 | **testkit** (the relayer's own · Anchor 1.2.1 · repo `solana-poc/testkit`) | `Bh4GY79ytnEZ4t3ZGf7qUVooaSKYyC8sM1uJpiM2xdCW` | `Bx4QouRTySJqMCPDhBStWY5EPzvkk5iFQrkvkU9Nq6YU` · slot **509032443** · authority `Ej77KM…` | Registered in `STG_POC` (pinned) |
 | platform-core (platform-core team) | `AJnPSYsn7J2muHfKztRtpZz5kBP94dWkNZLr9aMhu18G` | `4HDMqVpFQQLwrSXrzR4yEPpBTPk5ZZ864gGGsumjdadk` · slot 509128032 · authority `HRstpEJNgPzXUPMQmDFef4HzAfydbqK6KorqFuzMsTvy` | **Not registered.** It is never sponsored, and it must not be a top-level ix in a tx sent through the relayer |
 | rewards-pool (rewards-pool team) | `HgApfwjAg1L2FJL3fX7A4WX5yfhrVV8k9Ahii5Pn8HVW` | `CnmWkV6B1uXQ8fSiPtDBodeBWu6CfoqXhvAqgTZmL9Dk` · slot 509454201 · authority `HRstpE…` (same) | **Waiting to be registered** in the hub project once hub-web is deployed. Its policy has passed testing on devnet (`tests/live/rewards-pool-policy.json`) |
-| lobby (lobby team) | `5zdBSvep3yV6v1SVD67uw9N5Wb3eT9Hp9D3eg4YSRqRu` | `5uWN3vjanUhyhQzpa4oVhjhp1otjaWq85FeNV9SporKu` · slot **509795184** · authority `HRstpE…` (same) | **Waiting to be registered** in the hub project. Open request (not yet answered) for a per-user rent cap in the relayer: `maintainer/<internal-note>`. Latest registration data: `<internal-note>`. Per L14, lobby closes its accounts with its own Lobby Worker and does not use the relayer's sweep |
+| lobby (lobby team) | `5zdBSvep3yV6v1SVD67uw9N5Wb3eT9Hp9D3eg4YSRqRu` | `5uWN3vjanUhyhQzpa4oVhjhp1otjaWq85FeNV9SporKu` · slot **509795184** · authority `HRstpE…` (same) | **Waiting to be registered** in the hub project. Open request for a per-user daily rent cap in the relayer (not implemented yet; required before real players). Per L14, lobby closes its accounts with its own Lobby Worker and does not use the relayer's sweep |
 
 testkit instructions (discriminator · accounts):
 - `create` `181ec828051c0777` · [user s, payer w s (payer slot 1), thing PDA `["thing", user]` w, system]
@@ -108,7 +108,7 @@ Genesis hashes: devnet `EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG` · mainnet
 4. **Always check it locally first.** A policy that fails to parse makes the **whole project unusable** (for the hub, every game).
    - Test on devnet through the real relayer: `LIVE_POLICY=<file> LIVE_SCRIPT=<script> ./tests/run-live.sh` (see section 5).
    - At minimum, load it into `wrangler dev` with a local D1; `GET /relayer` must return 200 with every action.
-5. **maintainer registers it on staging.** The Oracle never writes to remote D1 itself.
+5. **A hub admin registers it on staging.** Automated agents never write to remote D1.
    1. Save the current policy.
    2. Run `UPDATE projects SET policy = …` via `--file`.
    3. Wait 65 s, then call `GET /relayer`.
@@ -156,7 +156,7 @@ Genesis hashes: devnet `EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG` · mainnet
   - The relayer does not check tx size itself (the RPC rejects txs over 1232 bytes).
 
 ## 7. Rules that must not be broken
-- **Devnet only** until maintainer separately approves mainnet. Do not set `RPC_URL_MAINNET`, and do not set `mainnet_enabled = true`.
+- **Devnet only** until mainnet is separately approved. Do not set `RPC_URL_MAINNET`, and do not set `mainnet_enabled = true`.
 - **Never** put a private key or an RPC URL containing an API key in git, `wrangler.toml`, the command line or docs. Pass secrets via stdin only.
-- `wrangler deploy`, remote D1 writes, `secret put` and testkit upgrades are **approved and run by maintainer**.
+- `wrangler deploy`, remote D1 writes, `secret put` and testkit upgrades are **approved and run by a hub admin**.
 - Never DELETE rows from `projects` / `fee_payer_history` (use `status='retired'`).

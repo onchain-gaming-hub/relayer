@@ -93,4 +93,4 @@ starts with the same bytes).
 
 ⚠️ **One fee payer per project, one cluster per fee payer, for life** (`fee_payer_history` enforces it in D1). A 504
 `rpc_unknown` returns the fee payer's slot-0 signature, so a user holds a fully signed transaction; the relayer cannot
-tell which cluster its blockhash came from. Mainnet keys never go on a machine the Oracle can read.
+tell which cluster its blockhash came from. Mainnet keys never go on a machine an automated agent can read.
