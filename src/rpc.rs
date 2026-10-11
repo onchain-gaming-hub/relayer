@@ -1,0 +1,438 @@
+//! Solana JSON-RPC over HTTP with a hard timeout (spec §4.4, §4.5).
+//! Cloudflare `fetch` has no default timeout, so every call races a `Delay`.
+
+use std::time::Duration;
+
+use futures_util::future::{Either, select};
+use serde_json::{Value, json};
+use worker::{Delay, Fetch, Headers, Method, Request, RequestInit};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendOutcome {
+    /// RPC returned a signature: the tx was forwarded.
+    Accepted(String),
+    /// JSON-RPC error or HTTP 4xx: the tx was definitely not forwarded.
+    /// `tx_fault`: the rejection is about the transaction/request itself (JSON-RPC error,
+    /// HTTP 400/413) rather than the RPC being unavailable (429, 403, 408, ...).
+    Rejected {
+        reason: String,
+        http_429: bool,
+        tx_fault: bool,
+        /// Preflight `InstructionError[i, {Custom: c}]` from `error.data.err` (v3 W11).
+        custom: Option<(usize, u32)>,
+    },
+    /// Timeout, transport error, HTTP 5xx, or unparseable 200: it may have been forwarded.
+    Unknown(String),
+    /// The exact same signed tx already landed (resubmission).
+    AlreadyProcessed,
+}
+
+enum Raw {
+    Http(u16, String),
+    Transport(String),
+    Timeout,
+}
+
+async fn post(url: &str, timeout_ms: u64, body: &Value) -> Raw {
+    let call = async {
+        let headers = Headers::new();
+        headers
+            .set("content-type", "application/json")
+            .map_err(|e| e.to_string())?;
+        let mut init = RequestInit::new();
+        init.with_method(Method::Post)
+            .with_headers(headers)
+            .with_body(Some(body.to_string().into()));
+        let req = Request::new_with_init(url, &init).map_err(|e| e.to_string())?;
+        let mut resp = Fetch::Request(req)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = resp.status_code();
+        let text = resp.text().await.map_err(|e| e.to_string())?;
+        Ok::<_, String>((status, text))
+    };
+    match with_timeout(call, timeout_ms).await {
+        Some(Ok((status, text))) => Raw::Http(status, text),
+        Some(Err(e)) => Raw::Transport(e),
+        None => Raw::Timeout,
+    }
+}
+
+/// Races `fut` against a `Delay`; `None` means the timeout won. The losing side is dropped:
+/// `worker::Delay` clears its `setTimeout` on drop (worker 0.8.7 `delay.rs` `PinnedDrop`),
+/// so a fast call leaves no timer behind.
+pub async fn with_timeout<F: Future>(fut: F, timeout_ms: u64) -> Option<F::Output> {
+    let timeout = Delay::from(Duration::from_millis(timeout_ms));
+    match select(Box::pin(fut), Box::pin(timeout)).await {
+        Either::Left((out, _)) => Some(out),
+        Either::Right(_) => None,
+    }
+}
+
+fn rpc_body(method: &str, params: Value) -> Value {
+    json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params })
+}
+
+/// JSON-RPC errors raised by the node itself rather than by the transaction:
+/// -32603 internal error, -32005 node unhealthy, -32004 block not available.
+const NODE_SIDE_ERROR_CODES: [i64; 3] = [-32603, -32005, -32004];
+
+/// `{"InstructionError":[i,{"Custom":c}]}` → `(i, c)`: the shape both `simulateTransaction`
+/// (`value.err`) and a failed preflight (`error.data.err`) return (Phase 0 spike 0.2).
+pub fn custom_error(err: &Value) -> Option<(usize, u32)> {
+    let ie = err.get("InstructionError")?.as_array()?;
+    let index = usize::try_from(ie.first()?.as_u64()?).ok()?;
+    let code = u32::try_from(ie.get(1)?.get("Custom")?.as_u64()?).ok()?;
+    Some((index, code))
+}
+
+pub fn classify_send(status: u16, text: &str) -> SendOutcome {
+    if (400..500).contains(&status) {
+        return SendOutcome::Rejected {
+            reason: format!("http {status}"),
+            http_429: status == 429,
+            tx_fault: matches!(status, 400 | 413),
+            custom: None,
+        };
+    }
+    if status != 200 {
+        return SendOutcome::Unknown(format!("http {status}"));
+    }
+    let Ok(v) = serde_json::from_str::<Value>(text) else {
+        return SendOutcome::Unknown("unparseable response".into());
+    };
+    if let Some(err) = v.get("error") {
+        let msg = err
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("rpc error");
+        if msg.contains("already been processed") || msg.contains("AlreadyProcessed") {
+            return SendOutcome::AlreadyProcessed;
+        }
+        let code = err.get("code").and_then(Value::as_i64);
+        return SendOutcome::Rejected {
+            reason: truncate(msg, 200),
+            http_429: false,
+            // Node-side failures say nothing about the transaction (D17: treat like 429).
+            // An error without a code cannot be attributed to the tx either -> not tx-fault.
+            tx_fault: code.is_some_and(|c| !NODE_SIDE_ERROR_CODES.contains(&c)),
+            custom: err
+                .get("data")
+                .and_then(|d| d.get("err"))
+                .and_then(custom_error),
+        };
+    }
+    match v.get("result").and_then(Value::as_str) {
+        Some(sig) => SendOutcome::Accepted(sig.to_string()),
+        None => SendOutcome::Unknown("missing result".into()),
+    }
+}
+
+/// `skip_preflight` only for program txs the relayer has just simulated and verified (v3 W7
+/// `skip_preflight_after_verify`); every other send keeps the RPC's preflight.
+pub async fn send_transaction(
+    url: &str,
+    timeout_ms: u64,
+    tx_base64: &str,
+    skip_preflight: bool,
+) -> SendOutcome {
+    let body = rpc_body(
+        "sendTransaction",
+        json!([tx_base64, { "encoding": "base64", "skipPreflight": skip_preflight, "preflightCommitment": "confirmed" }]),
+    );
+    match post(url, timeout_ms, &body).await {
+        Raw::Http(status, text) => classify_send(status, &text),
+        Raw::Transport(e) => SendOutcome::Unknown(format!("transport: {}", truncate(&e, 200))),
+        Raw::Timeout => SendOutcome::Unknown("timeout".into()),
+    }
+}
+
+async fn call_result(
+    url: &str,
+    timeout_ms: u64,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
+    match post(url, timeout_ms, &rpc_body(method, params)).await {
+        Raw::Http(200, text) => {
+            let v: Value =
+                serde_json::from_str(&text).map_err(|_| format!("{method}: unparseable"))?;
+            v.get("result")
+                .cloned()
+                .ok_or_else(|| format!("{method}: rpc error"))
+        }
+        Raw::Http(status, _) => Err(format!("{method}: http {status}")),
+        Raw::Transport(e) => Err(format!("{method}: transport: {}", truncate(&e, 120))),
+        Raw::Timeout => Err(format!("{method}: timeout")),
+    }
+}
+
+pub async fn get_balance(url: &str, timeout_ms: u64, pubkey: &str) -> Result<u64, String> {
+    let r = call_result(
+        url,
+        timeout_ms,
+        "getBalance",
+        json!([pubkey, { "commitment": "confirmed" }]),
+    )
+    .await?;
+    r.get("value")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "getBalance: bad result".into())
+}
+
+pub async fn get_genesis_hash(url: &str, timeout_ms: u64) -> Result<String, String> {
+    let r = call_result(url, timeout_ms, "getGenesisHash", json!([])).await?;
+    r.as_str()
+        .map(str::to_string)
+        .ok_or_else(|| "getGenesisHash: bad result".into())
+}
+
+/// `simulateTransaction` (spec v3 §4.3): returns `result.value`. Always `commitment: confirmed`
+/// (matches the FE blockhash and `preflightCommitment`; the RPC default `finalized` would report
+/// fresh blockhashes as not found).
+pub async fn simulate(
+    url: &str,
+    timeout_ms: u64,
+    tx_base64: &str,
+    addresses: &[String],
+) -> Result<Value, String> {
+    let params = json!([tx_base64, {
+        "encoding": "base64",
+        "commitment": "confirmed",
+        "sigVerify": true,
+        "replaceRecentBlockhash": false,
+        "innerInstructions": true,
+        "accounts": { "encoding": "base64", "addresses": addresses },
+    }]);
+    let r = call_result(url, timeout_ms, "simulateTransaction", params).await?;
+    r.get("value")
+        .cloned()
+        .ok_or_else(|| "simulateTransaction: missing value".into())
+}
+
+/// `getProgramAccounts` with memcmp filters and an empty data slice (v3 §5 step 3; verified on
+/// Alchemy devnet, Phase 0 spike 0.3): only the addresses, as returned.
+pub async fn get_program_accounts(
+    url: &str,
+    timeout_ms: u64,
+    program: &str,
+    memcmp: &[(u64, String)],
+) -> Result<Vec<String>, String> {
+    let filters: Vec<Value> = memcmp
+        .iter()
+        .map(|(offset, bytes)| json!({ "memcmp": { "offset": offset, "bytes": bytes } }))
+        .collect();
+    let cfg = json!({
+        "encoding": "base64",
+        "commitment": "confirmed",
+        "dataSlice": { "offset": 0, "length": 0 },
+        "filters": filters,
+    });
+    let r = call_result(url, timeout_ms, "getProgramAccounts", json!([program, cfg])).await?;
+    r.as_array()
+        .ok_or("getProgramAccounts: bad result")?
+        .iter()
+        .map(|a| {
+            a.get("pubkey")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| "getProgramAccounts: missing pubkey".to_string())
+        })
+        .collect()
+}
+
+pub async fn get_latest_blockhash(url: &str, timeout_ms: u64) -> Result<String, String> {
+    let r = call_result(
+        url,
+        timeout_ms,
+        "getLatestBlockhash",
+        json!([{ "commitment": "confirmed" }]),
+    )
+    .await?;
+    r.get("value")
+        .and_then(|v| v.get("blockhash"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| "getLatestBlockhash: bad result".into())
+}
+
+/// Rent-exempt minimum for `size` bytes, from the cluster (never a hardcoded rate).
+pub async fn get_minimum_balance_for_rent_exemption(
+    url: &str,
+    timeout_ms: u64,
+    size: u64,
+) -> Result<u64, String> {
+    let r = call_result(
+        url,
+        timeout_ms,
+        "getMinimumBalanceForRentExemption",
+        json!([size, { "commitment": "confirmed" }]),
+    )
+    .await?;
+    r.as_u64()
+        .ok_or_else(|| "getMinimumBalanceForRentExemption: bad result".into())
+}
+
+/// `getAccountInfo` → `(owner, data)`; `None` when the account does not exist.
+pub async fn get_account(
+    url: &str,
+    timeout_ms: u64,
+    pubkey: &str,
+    slice_len: Option<usize>,
+) -> Result<Option<(String, Vec<u8>)>, String> {
+    use base64::{Engine, engine::general_purpose::STANDARD as B64};
+    let mut cfg = json!({ "encoding": "base64", "commitment": "confirmed" });
+    if let Some(len) = slice_len {
+        cfg["dataSlice"] = json!({ "offset": 0, "length": len });
+    }
+    let r = call_result(url, timeout_ms, "getAccountInfo", json!([pubkey, cfg])).await?;
+    let Some(v) = r.get("value").filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let owner = v
+        .get("owner")
+        .and_then(Value::as_str)
+        .ok_or("getAccountInfo: missing owner")?;
+    let data = v
+        .get("data")
+        .and_then(|d| d.get(0))
+        .and_then(Value::as_str)
+        .ok_or("getAccountInfo: missing data")?;
+    let bytes = B64
+        .decode(data)
+        .map_err(|_| "getAccountInfo: bad base64".to_string())?;
+    Ok(Some((owner.to_string(), bytes)))
+}
+
+/// Plain GET with the same timeout semantics (used for the Web3Auth JWKS).
+pub async fn get_text(url: &str, timeout_ms: u64) -> Result<String, String> {
+    let call = async {
+        let mut resp = Fetch::Url(url.parse().map_err(|_| "bad url".to_string())?)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if resp.status_code() != 200 {
+            return Err(format!("http {}", resp.status_code()));
+        }
+        resp.text().await.map_err(|e| e.to_string())
+    };
+    with_timeout(call, timeout_ms)
+        .await
+        .unwrap_or_else(|| Err("timeout".into()))
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_custom_instruction_errors() {
+        // Real preflight body from the Phase 0 spike (testkit fail_retryable, 6000 = 0x1770).
+        let body = r#"{"error":{"code":-32002,"message":"Transaction simulation failed: Error processing Instruction 0: custom program error: 0x1770","data":{"err":{"InstructionError":[0,{"Custom":6000}]}}}}"#;
+        assert!(matches!(
+            classify_send(200, body),
+            SendOutcome::Rejected {
+                tx_fault: true,
+                custom: Some((0, 6000)),
+                ..
+            }
+        ));
+        assert_eq!(
+            custom_error(&serde_json::json!({"InstructionError":[2,{"Custom":7}]})),
+            Some((2, 7))
+        );
+        for other in [
+            serde_json::json!({"InstructionError":[0,"InvalidAccountData"]}),
+            serde_json::json!("InsufficientFundsForFee"),
+            serde_json::json!({"InstructionError":[0,{"Custom":-1}]}),
+            serde_json::Value::Null,
+        ] {
+            assert_eq!(custom_error(&other), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn classifies_send_outcomes() {
+        assert_eq!(
+            classify_send(200, r#"{"result":"sig1"}"#),
+            SendOutcome::Accepted("sig1".into())
+        );
+        assert!(matches!(
+            classify_send(
+                200,
+                r#"{"error":{"code":-32002,"message":"Blockhash not found"}}"#
+            ),
+            SendOutcome::Rejected {
+                http_429: false,
+                tx_fault: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            classify_send(
+                200,
+                r#"{"error":{"code":-32002,"message":"Transaction simulation failed: This transaction has already been processed"}}"#
+            ),
+            SendOutcome::AlreadyProcessed
+        );
+        assert!(matches!(
+            classify_send(429, "Too many requests"),
+            SendOutcome::Rejected {
+                http_429: true,
+                tx_fault: false,
+                ..
+            }
+        ));
+        for code in [-32603, -32005, -32004] {
+            let body = format!(r#"{{"error":{{"code":{code},"message":"Node is unhealthy"}}}}"#);
+            assert!(matches!(
+                classify_send(200, &body),
+                SendOutcome::Rejected {
+                    tx_fault: false,
+                    http_429: false,
+                    ..
+                }
+            ));
+        }
+        assert!(matches!(
+            classify_send(200, r#"{"error":{"message":"overloaded"}}"#),
+            SendOutcome::Rejected {
+                tx_fault: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify_send(400, ""),
+            SendOutcome::Rejected { tx_fault: true, .. }
+        ));
+        assert!(matches!(
+            classify_send(408, ""),
+            SendOutcome::Rejected {
+                tx_fault: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify_send(403, ""),
+            SendOutcome::Rejected {
+                http_429: false,
+                tx_fault: false,
+                ..
+            }
+        ));
+        assert!(matches!(classify_send(503, ""), SendOutcome::Unknown(_)));
+        assert!(matches!(
+            classify_send(200, "<html>"),
+            SendOutcome::Unknown(_)
+        ));
+        assert!(matches!(
+            classify_send(200, r#"{"result":null}"#),
+            SendOutcome::Unknown(_)
+        ));
+    }
+}

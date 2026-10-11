@@ -1,0 +1,13 @@
+# secrets — never commit
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+*.keypair.json
+*.key
+
+# build
+target/
+build/
+node_modules/
+.wrangler/
+.DS_Store

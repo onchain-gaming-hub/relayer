@@ -1,0 +1,7 @@
+{"actions":[
+ {"type":"program","program_id":"HgApfwjAg1L2FJL3fX7A4WX5yfhrVV8k9Ahii5Pn8HVW","deploy_slot":509454201,"retryable_errors":[6015],
+  "instructions":[
+   {"name":"claim_sol","discriminator":"8b71b3bdbe1e84c3","min_accounts":3,"max_accounts":3,"max_data_len":9},
+   {"name":"claim_token","discriminator":"74ce1bbfa6130049","min_accounts":7,"max_accounts":7,"max_data_len":9},
+   {"name":"claim_token_with_ata","discriminator":"a37264d84003848a","min_accounts":10,"max_accounts":10,"max_data_len":9}]}],
+ "limits":{"max_instructions":8,"max_cu":400000,"max_cu_price_micro_lamports":0}}

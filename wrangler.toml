@@ -1,0 +1,63 @@
+name = "gasless-relayer"
+main = "build/index.js"
+compatibility_date = "2026-10-01"
+
+[build]
+command = "worker-build --release"
+
+# Worker-level config (spec v2 §4.1). Per-project settings live in the D1 `projects` table.
+# Secrets (.dev.vars locally, `wrangler secret put` when deployed — never here):
+#   FEE_PAYER_<SLUG>   one Base58 keypair per project
+#   RPC_URL_DEVNET / RPC_URL_MAINNET   keyed RPC (public RPCs return 403 to Workers)
+[vars]
+WALLET_BINDING = "wallets"
+RPC_TIMEOUT_MS = "15000"
+COOLDOWN_MS = "10000"
+REJECT_COOLDOWN_MS = "3000"
+REJECT_COOLDOWN_MAX_MS = "60000"
+CLUSTER_RPM_DEVNET = "300"
+CLUSTER_RPM_MAINNET = "300"
+# Daily fee budget across every project on the cluster, lamports (spec v2 §5): 10 SOL / 0.2 SOL.
+CLUSTER_DAILY_BUDGET_DEVNET = "10000000000"
+CLUSTER_DAILY_BUDGET_MAINNET = "200000000"
+# v3 W9: daily rent the fee payers may front, per cluster (rent returns when accounts close): 10 SOL.
+CLUSTER_DAILY_RENT_BUDGET_DEVNET = "10000000000"
+CLUSTER_DAILY_RENT_BUDGET_MAINNET = "10000000000"
+# v3 W11: cooldown after a registered retryable error, projects without an override (>= 100).
+RETRY_COOLDOWN_MS = "1000"
+CLUSTER_HOP_TIMEOUT_MS = "2000"
+REGISTRY_CACHE_MS = "60000"
+REGISTRY_MAX_STALE_MS = "600000"
+# Sapphire Devnet defaults are built in (iss "web3auth.io", citadel JWKS). Sapphire Mainnet has
+# no default until verified (spec v2 spike 0.2): set both or mainnet projects answer 500.
+# WEB3AUTH_MAINNET_ISSUER = ""
+# WEB3AUTH_MAINNET_JWKS_URL = ""
+
+[durable_objects]
+bindings = [
+  { name = "USER_CONTROLLER", class_name = "UserController" },
+  { name = "PROJECT_THROTTLE", class_name = "ProjectThrottle" },
+  { name = "CLUSTER_THROTTLE", class_name = "ClusterThrottle" },
+  { name = "SWEEP_CONTROLLER", class_name = "SweepController" },
+]
+
+# The v1 POC never reached a remote deploy (local `wrangler dev` only), so the first remote
+# deploy starts from this single migration (spec V15); no unexported v1 classes are referenced.
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["UserController", "ProjectThrottle", "ClusterThrottle"]
+
+# v3 Phase 4: cron sweep (W13), one SweepController per project.
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["SweepController"]
+
+# v3 W13 §5: the sweep runs every 5 minutes for active projects whose policy has `sweeps`.
+[triggers]
+crons = ["*/5 * * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "gasless-relayer-audit"
+database_id = "e3bf7ce9-6c44-43a6-b6cb-398c04068d9f" # remote D1 (staging, created 2026-10-08 via runbook); local dev keeps its own copy under .wrangler/
+migrations_dir = "migrations"

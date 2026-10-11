@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# Runs the local e2e suites (spec v1 §7 + v2 §8) against wrangler dev + mock upstream.
+# No network access needed; never touches devnet, mainnet, or any remote Cloudflare resource.
+# Fee payer keys are throwaway keys generated per run (never funded anywhere).
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+WORK=$(mktemp -d)
+PORT=8788
+MOCK_PORT=8899
+MOCK="http://127.0.0.1:$MOCK_PORT"
+trap 'kill $(jobs -p) 2>/dev/null || true; rm -rf "$WORK"' EXIT
+
+cargo build -q --example mktx --example genkey --example progtx
+worker-build --release >/dev/null
+
+MOCK_PORT=$MOCK_PORT node tests/mock-upstream.mjs > "$WORK/mock.log" 2>&1 &
+until grep -q ready "$WORK/mock.log"; do sleep 0.2; done
+
+# Projects (spec v2 §8): A, B devnet · M mainnet · P paused · X secret missing · Y key mismatch
+read -r SK_A PK_A <<<"$(./target/debug/examples/genkey)"
+read -r SK_B PK_B <<<"$(./target/debug/examples/genkey)"
+read -r SK_M PK_M <<<"$(./target/debug/examples/genkey)"
+read -r SK_P PK_P <<<"$(./target/debug/examples/genkey)"
+read -r SK_C PK_C <<<"$(./target/debug/examples/genkey)"
+read -r SK_D PK_D <<<"$(./target/debug/examples/genkey)"
+read -r SK_G PK_G <<<"$(./target/debug/examples/genkey)"
+read -r SK_H PK_H <<<"$(./target/debug/examples/genkey)"
+read -r SK_S PK_S <<<"$(./target/debug/examples/genkey)"
+read -r SK_T PK_T <<<"$(./target/debug/examples/genkey)"
+read -r SK_U PK_U <<<"$(./target/debug/examples/genkey)"
+read -r _ NOVERIFY <<<"$(./target/debug/examples/genkey)"   # program id: verify_inner_ix=false (W7)
+read -r _ PINX <<<"$(./target/debug/examples/genkey)"       # program id: pinned slot never matches (W6)
+read -r _ PK_X <<<"$(./target/debug/examples/genkey)"
+read -r SK_Y _ <<<"$(./target/debug/examples/genkey)"
+read -r _ PK_Y <<<"$(./target/debug/examples/genkey)"
+
+COMMON=(
+  --var "RPC_URL_DEVNET:$MOCK"
+  --var "RPC_URL_MAINNET:$MOCK/mainnet"
+  --var "WEB3AUTH_DEVNET_JWKS_URL:$MOCK/jwks"
+  --var "WEB3AUTH_DEVNET_ISSUER:https://issuer.test"
+  --var "WEB3AUTH_MAINNET_JWKS_URL:$MOCK/jwks"
+  --var "WEB3AUTH_MAINNET_ISSUER:https://issuer-mainnet.test"
+  --var "RPC_TIMEOUT_MS:2000"
+  --var "FEE_PAYER_PA:$SK_A" --var "FEE_PAYER_PB:$SK_B" --var "FEE_PAYER_PM:$SK_M"
+  --var "FEE_PAYER_PP:$SK_P" --var "FEE_PAYER_PY:$SK_Y"
+  --var "FEE_PAYER_PC:$SK_C" --var "FEE_PAYER_PD:$SK_D" --var "FEE_PAYER_PG:$SK_G" --var "FEE_PAYER_PH:$SK_H" --var "FEE_PAYER_PS:$SK_S" --var "FEE_PAYER_PT:$SK_T" --var "FEE_PAYER_PU:$SK_U"
+)
+
+TESTKIT=Bh4GY79ytnEZ4t3ZGf7qUVooaSKYyC8sM1uJpiM2xdCW
+BIG_BUDGET=1000000000
+NOOP_IX='{"name":"noop","discriminator":"09b20d738123ed66","min_accounts":0,"max_accounts":1,"max_data_len":8}'
+PROGRAM_POLICY='{"actions":[{"type":"program","program_id":"'$TESTKIT'","deploy_slot":1,"retryable_errors":[6000],"instructions":[{"name":"create","discriminator":"181ec828051c0777","payer_index":1,"max_rent_lamports":1100000,"min_accounts":4,"max_accounts":4,"max_data_len":8},{"name":"close_thing","discriminator":"a75149fabad23e79","refund_index":2,"min_accounts":3,"max_accounts":3,"max_data_len":8},'$NOOP_IX']},{"type":"program","program_id":"'$NOVERIFY'","deploy_slot":7,"verify_inner_ix":false,"retryable_errors":[6000],"instructions":['$NOOP_IX']},{"type":"program","program_id":"'$PINX'","deploy_slot":5,"instructions":['$NOOP_IX']}],"limits":{"max_instructions":4,"max_cu":400000,"max_cu_price_micro_lamports":1000,"skip_preflight_after_verify":true}}'
+
+SWEEP_RULE='{"name":"close_room","account_discriminator":"9cc7431bde17b95e","rent_payer_offset":8,"ix_discriminator":"f1ed4afddfe936dc","accounts":[{"kind":"swept","writable":true},{"kind":"fee_payer","writable":true}],"max_sends_per_run":5,"max_simulations_per_run":2}'
+SWEEP_POLICY='{"actions":[{"type":"program","program_id":"'$TESTKIT'","deploy_slot":1,"instructions":['$NOOP_IX'],"sweeps":['$SWEEP_RULE']}]}'
+SWEEP_POLICY_U='{"actions":[{"type":"program","program_id":"'$NOVERIFY'","deploy_slot":7,"instructions":['$NOOP_IX'],"sweeps":['${SWEEP_RULE/\"max_simulations_per_run\":2/\"max_simulations_per_run\":10}']}]}'
+SWEEP_POLICY_PINX='{"actions":[{"type":"program","program_id":"'$PINX'","deploy_slot":5,"instructions":['$NOOP_IX'],"sweeps":['$SWEEP_RULE']}]}'
+
+# seed <rpm_a> <rpm_b> <mainnet_enabled> <quota_a> <budget_a> <budget_cd> <budget_b>
+seed() {
+  local memo='{"actions":[{"type":"memo","max_bytes":128,"prefix":"gasless-poc:"}]}'
+  local cols="aud, slug, name, status, cluster, web3auth_network, allowed_origins, fee_payer_pubkey, policy, user_daily_quota, project_rpm, project_daily_budget_lamports, min_balance_lamports, created_at, updated_at"
+  row() { # aud slug status cluster network origin pubkey rpm [quota] [budget] [policy]
+    echo "INSERT INTO projects ($cols) VALUES ('$1','$2','$2','$3','$4','$5','[\"$6\"]','$7','${11:-$memo}',${9:-100},$8,${10:-1000000000},50000000,0,0);"
+    echo "INSERT INTO fee_payer_history (pubkey, aud, cluster, created_at) VALUES ('$7','$1','$4',0);"
+  }
+  {
+    row test-client PA active devnet sapphire_devnet http://localhost:5173 "$PK_A" "$1" "$4" "$5"
+    row client-b PB active devnet sapphire_devnet http://localhost:5174 "$PK_B" "$2" 100 "$7"
+    row client-m PM active mainnet sapphire_mainnet http://localhost:5175 "$PK_M" 1000
+    row client-p PP paused devnet sapphire_devnet http://localhost:5176 "$PK_P" 1000
+    row client-x PX active devnet sapphire_devnet http://localhost:5177 "$PK_X" 1000
+    row client-y PY active devnet sapphire_devnet http://localhost:5178 "$PK_Y" 1000
+    row client-c PC active devnet sapphire_devnet http://localhost:5179 "$PK_C" 1000 100 "$6"
+    row client-d PD active devnet sapphire_devnet http://localhost:5180 "$PK_D" 1000 100 "$6"
+    # Program actions only (spec v3): testkit-shaped program, no memo action.
+    row client-g PG active devnet sapphire_devnet http://localhost:5181 "$PK_G" 1000 100 "$BIG_BUDGET" "$PROGRAM_POLICY"
+    # v3 W9/W10: rent budget = one declared create (1_100_000) but two simulated ones (2 × 1_021_080);
+    # cooldown 0 (Worker default here: 300), retry cooldown 300 ms.
+    echo "UPDATE projects SET project_daily_rent_budget_lamports = 2100000, cooldown_ms = 0, retry_cooldown_ms = 300 WHERE aud = 'client-g';"
+    # W9 accounting: fee budget = 3 noop fees, rent budget = one declared create.
+    row client-h PH active devnet sapphire_devnet http://localhost:5182 "$PK_H" 1000 100 30000 "$PROGRAM_POLICY"
+    echo "UPDATE projects SET project_daily_rent_budget_lamports = 1100000 WHERE aud = 'client-h';"
+    # v3 W13 cron sweep: testkit Room close (2 simulations / run), and one on a program whose pin never matches.
+    row client-s PS active devnet sapphire_devnet http://localhost:5183 "$PK_S" 1000 100 "$BIG_BUDGET" "$SWEEP_POLICY"
+    row client-t PT active devnet sapphire_devnet http://localhost:5184 "$PK_T" 1000 100 "$BIG_BUDGET" "$SWEEP_POLICY_PINX"
+    # Fee budget = one sweep send (5000): refund on rejected sends, budget stop.
+    row client-u PU active devnet sapphire_devnet http://localhost:5185 "$PK_U" 1000 100 5000 "$SWEEP_POLICY_U"
+    echo "INSERT INTO settings (key, value) VALUES ('mainnet_enabled', '$3');"
+  } > "$WORK/seed.sql"
+}
+
+# run_suite <suite> <state dir> <reseed yes|no> <rpm_a> <rpm_b> <mainnet> <quota_a> <budget_a> <budget_cd> <budget_b> [wrangler args]
+run_suite() {
+  local suite=$1 state=$2 reseed=$3; shift 3
+  local persist="$WORK/state-$state"
+  if [ "$reseed" = yes ]; then
+    npx wrangler d1 migrations apply gasless-relayer-audit --local --persist-to "$persist" >/dev/null 2>&1
+    seed "$1" "$2" "$3" "$4" "$5" "$6" "$7"
+    npx wrangler d1 execute gasless-relayer-audit --local --persist-to "$persist" --file "$WORK/seed.sql" >/dev/null 2>&1
+  fi
+  shift 7
+  local log="$WORK/wrangler-$suite.log"
+  # WORKER_DIR: run another checkout of the Worker on the same state (suite M).
+  (cd "${WORKER_DIR:-.}" && exec npx wrangler dev --port $PORT --ip 127.0.0.1 --persist-to "$persist" "${COMMON[@]}" "$@") \
+    > "$log" 2>&1 &
+  local pid=$!
+  until grep -qE "Ready on|ERROR" "$log"; do sleep 0.3; done
+  local rc=0
+  PERSIST_DIR="$persist" WRANGLER_LOG="$log" RELAYER_URL="http://127.0.0.1:$PORT" MOCK_URL="$MOCK" \
+    PK_A="$PK_A" PK_B="$PK_B" PK_M="$PK_M" PK_X="$PK_X" PK_Y="$PK_Y" PK_C="$PK_C" PK_D="$PK_D" PK_G="$PK_G" PK_H="$PK_H" PK_S="$PK_S" PK_U="$PK_U" TESTKIT="$TESTKIT" NOVERIFY="$NOVERIFY" PINX="$PINX" \
+    node tests/e2e.mjs "$suite" || rc=$?
+  kill $pid 2>/dev/null; wait $pid 2>/dev/null || true
+  # Reset mock behavior between suites.
+  curl -s -X POST "$MOCK/__state" \
+    -d '{"genesis":"EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG","genesisMainnet":"5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d","balances":{},"balance":10000000000,"balanceMode":"ok","balanceDelayMs":0,"jwksMode":"ok","send":"ok","delayMs":0,"simulate":null,"simOwner":"11111111111111111111111111111111","programs":{},"gpa":{},"gpaDelayMs":0,"simByAddr":{},"simOnce":{}}' >/dev/null
+  return $rc
+}
+
+# Usage: ./tests/run-e2e.sh [A] [B] [C] [D] [E] [F] [S] [M]   (default: A–F + S; D also runs D2 = restart check)
+# M (v3 W9 counter migration): D on an older Worker checkout (OLD_WORKER_DIR, e.g. a git worktree
+#   of the previous commit), then D2 on this one over the same state: quota and budgets must hold.
+SUITES=${*:-A B C D E F S}
+BIG=1000000000
+status=0
+for s in $SUITES; do
+  case $s in
+    A) run_suite A A yes 1000 1000 false 100 $BIG $BIG $BIG --var COOLDOWN_MS:2000 --var REJECT_COOLDOWN_MS:1000 || status=1 ;;
+    B) run_suite B B yes 3 3 false 100 $BIG $BIG $BIG --var COOLDOWN_MS:5000 --var CLUSTER_RPM_DEVNET:5 || status=1 ;;
+    C) run_suite C C yes 1000 1000 false 100 $BIG $BIG $BIG --var COOLDOWN_MS:2000 \
+         --var REGISTRY_CACHE_MS:1000 --var REGISTRY_MAX_STALE_MS:4000 || status=1 ;;
+    # Phase 2: user quota 2 (A), project budget 3 tx (A) / 4 tx (B), cluster budget 6 tx;
+    # D2 restarts on the same state. Daily counters reset at 00:00 UTC: don't straddle it.
+    D) left=$(( 86400 - $(date -u +%s) % 86400 ))
+       if [ $left -lt 120 ]; then echo "… waiting ${left}s for UTC midnight (daily counters reset)"; sleep $((left + 2)); fi
+       D_ARGS=(--var COOLDOWN_MS:300 --var REJECT_COOLDOWN_MS:300 --var CLUSTER_DAILY_BUDGET_DEVNET:60000)
+       run_suite D D yes 1000 1000 false 2 30000 $BIG 40000 "${D_ARGS[@]}" || status=1
+       run_suite D2 D no 0 0 0 0 0 0 0 "${D_ARGS[@]}" || status=1 ;;
+    E) run_suite E E yes 1000 1000 false 100 $BIG 30000 $BIG --var COOLDOWN_MS:300 || status=1 ;;
+    # S: cron sweep (W13) through wrangler's /__scheduled.
+    S) run_suite S S yes 1000 1000 false 100 $BIG $BIG $BIG --test-scheduled || status=1 ;;
+    M) [ -d "${OLD_WORKER_DIR:-}" ] || { echo "M needs OLD_WORKER_DIR"; status=1; continue; }
+       D_ARGS=(--var COOLDOWN_MS:300 --var REJECT_COOLDOWN_MS:300 --var CLUSTER_DAILY_BUDGET_DEVNET:60000)
+       WORKER_DIR="$OLD_WORKER_DIR" run_suite D M yes 1000 1000 false 2 30000 $BIG 40000 "${D_ARGS[@]}" || status=1
+       run_suite D2 M no 0 0 0 0 0 0 0 "${D_ARGS[@]}" || status=1 ;;
+    # Cluster rent budget = one declared create (client-g's V3-2), so client-h's create is refused
+    # by the cluster after its own project admitted it.
+    F) run_suite F F yes 1000 1000 false 100 $BIG $BIG $BIG --var COOLDOWN_MS:300 --var CLUSTER_DAILY_RENT_BUDGET_DEVNET:1100000 || status=1 ;;
+    *) echo "unknown suite $s"; status=1 ;;
+  esac
+done
+exit $status

@@ -1,0 +1,44 @@
+[package]
+name = "gasless-relayer"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+worker = { version = "=0.8.7", features = ["d1"] }
+solana-transaction = { version = "5.1", features = ["verify"] }
+solana-message = "5.1"
+solana-signature = "3"
+solana-keypair = "4.0"
+solana-signer = "4.0"
+wincode = "0.6"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+solana-pubkey = "4"
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await-macro"] }
+wasm-bindgen = "0.2"
+# Variable-length base58 (inner-ix data in Compiled / PartiallyDecoded shapes, v3 §4.3).
+bs58 = { version = "0.5.1", default-features = false, features = ["alloc"] }
+# Building the cron sweep tx (v3 W13); already in the tree through solana-message.
+solana-instruction = "4"
+solana-hash = "4"
+
+[dev-dependencies]
+# PDA derivation in examples/progtx (live devnet tests); not part of the Wasm build.
+solana-pubkey = { version = "4", features = ["curve25519"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+
+# Wasm randomness backend (solana-ed25519 -> rand -> getrandom 0.4; 0.3 also in tree).
+# Signing is deterministic; these only satisfy the link-time backend requirement.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
+getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
