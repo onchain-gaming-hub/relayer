@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # LOCAL ONLY: registers (or re-activates) a devnet project in the local D1 used by `wrangler dev`.
-# Production projects are added by hand per spec v2 §10 (maintainer runs remote D1 commands).
+# Production projects are added by hand per spec v2 §10 (a hub admin runs remote D1 commands).
 # Usage: scripts/dev-project.sh <clientId> <SLUG> <fee_payer_pubkey> <origin> [user_daily_quota]
 #   The secret FEE_PAYER_<SLUG> must already be in .dev.vars (cargo run -q --example keygen -- <SLUG>).
 set -euo pipefail
