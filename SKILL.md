@@ -23,6 +23,7 @@ description: Operator and onboarding guide for the blockchain-games-hub gasless 
   - **memo**: Memo v2 with a prefix.
   - **program**: instructions of registered programs, matched by discriminator and account count, with optional payer slot, refund slot and sweeps.
 - **blockchain-games-hub uses a single project (H-3, 2026-10-10).** Every hub program is registered in the hub-web project, and the platform funds that wallet itself (H-5).
+  - **Until the hub-web project exists, the hub demo runs on `STG_POC` (H-10, temporary):** lobby and rewards-pool are registered there, and hub-web's origins are allowed (section 2.2).
 
 ## 2. What is deployed (devnet only · mainnet is disabled)
 
@@ -42,19 +43,23 @@ description: Operator and onboarding guide for the blockchain-games-hub gasless 
 ### 2.2 Registered projects (D1 remote)
 | slug | `aud` (Web3Auth clientId · Sapphire Devnet) | origin | fee payer | settings |
 |---|---|---|---|---|
-| `STG_POC` | `BCBRRKiatPMMJBRPEdNaqI-fRZ0w3Z1C0J0Q51ypmz2vEYAkQLbCpRFA7L_cgK2ylavoMkdFIOWcKJCLg6JKns4` | `https://gasless-poc-frontend.pages.dev` | `hp1nnTcTLqrBczEGujPFhvtXzL2HJRxnBumeU216xyr` | active · quota 100/day · 60 RPM · fee budget 1 SOL/day · rent budget 0.05 SOL/day · min balance 0.05 SOL · cooldown = Worker default |
+| `STG_POC` | `BCBRRKiatPMMJBRPEdNaqI-fRZ0w3Z1C0J0Q51ypmz2vEYAkQLbCpRFA7L_cgK2ylavoMkdFIOWcKJCLg6JKns4` | `https://gasless-poc-frontend.pages.dev` · `http://localhost:5173` · `https://hub-web-b7m.pages.dev` (hub demo) | `hp1nnTcTLqrBczEGujPFhvtXzL2HJRxnBumeU216xyr` | active · quota 300/day · 60 RPM · fee budget 1 SOL/day · rent budget 1 SOL/day · min balance 0.05 SOL · cooldown 1,000 ms |
+
+Values read from D1 and `GET /relayer?project=<aud>` on 2026-10-12.
 
 `STG_POC` policy:
 - memo with prefix `gasless-poc:` (128 bytes)
 - program testkit (pinned to slot `509032443`): `create`, `close_thing`, `noop`, `fail_retryable`, `open_room`
 - sweep `close_room`
-- limits: `max_instructions` 4, `max_cu` 400,000, no priority fee
+- program lobby (pinned to slot `509795184`, retryable 6000–6003 + 3012): `init_claim`, `create_room`, `quick_match_create`, `rematch_create` (payer slot 1) · `join_room`, `quick_match_join`, `rematch_join`, `leave_room`, `ready`, `leave_seat`, `add_bot`, `remove_bot`, `kick_player`, `request_start`, `tick` (crank)
+- program rewards-pool (pinned to slot `509454201`, retryable 6015): `claim_sol`, `claim_token`, `claim_token_with_ata`
+- limits: `max_instructions` 8 (Claim All), `max_cu` 400,000, no priority fee
 - check: `npx wrangler d1 execute gasless-relayer-audit --remote --command "SELECT slug, status, policy FROM projects"`
 
 ### 2.3 Wallets (pubkeys only · never put a private key in docs, git or on the command line)
 | Role | pubkey | Where the key lives | Balance on 2026-10-11 |
 |---|---|---|---|
-| `STG_POC` fee payer (staging) | `hp1nnTcTLqrBczEGujPFhvtXzL2HJRxnBumeU216xyr` | Worker secret `FEE_PAYER_STG_POC`, backup in `relayer/.dev.vars` | 1.999865 SOL |
+| `STG_POC` fee payer (staging) | `hp1nnTcTLqrBczEGujPFhvtXzL2HJRxnBumeU216xyr` | Worker secret `FEE_PAYER_STG_POC`, backup in `relayer/.dev.vars` | 1.996434 SOL (2026-10-12) |
 | Local live-test fee payer | `FSrvuAXPpjuSDjZxc24j2dsnFa1K4Au9s5vavqHcN989` | `relayer/.dev.vars` (`FEE_PAYER_LIVE_V3`) | 0.19663 SOL · **3 testkit `Room` accounts** are still open (1-hour retention rooms from earlier live runs, ~1,061,720 lamports of rent each). The sweep in the next `run-live.sh` run closes them. The staging cron does not touch them, because it only searches accounts whose `rent_payer` is that project's own wallet |
 | Local dev fee payer (`wrangler dev` + local FE) | `7uA1QxYTnzXzNBoVaE4gbLvXzxtPLjzvWAQqvmcMU5Cc` | `relayer/.dev.vars` (`FEE_PAYER_POC`) | 1.99993 SOL |
 | testkit deployer / upgrade authority | `Ej77KMCVLEcDTrSjXHTLHTjMZUAr5F46PFrDw6MVVe7F` | `~/.config/solana/testkit-deployer-devnet.json` (outside the repo) | 1.00756 SOL |
@@ -67,8 +72,9 @@ description: Operator and onboarding guide for the blockchain-games-hub gasless 
 |---|---|---|---|
 | **testkit** (the relayer's own · Anchor 1.2.1 · repo `solana-poc/testkit`) | `Bh4GY79ytnEZ4t3ZGf7qUVooaSKYyC8sM1uJpiM2xdCW` | `Bx4QouRTySJqMCPDhBStWY5EPzvkk5iFQrkvkU9Nq6YU` · slot **509032443** · authority `Ej77KM…` | Registered in `STG_POC` (pinned) |
 | platform-core (platform-core team) | `AJnPSYsn7J2muHfKztRtpZz5kBP94dWkNZLr9aMhu18G` | `4HDMqVpFQQLwrSXrzR4yEPpBTPk5ZZ864gGGsumjdadk` · slot 509128032 · authority `HRstpEJNgPzXUPMQmDFef4HzAfydbqK6KorqFuzMsTvy` | **Not registered.** It is never sponsored, and it must not be a top-level ix in a tx sent through the relayer |
-| rewards-pool (rewards-pool team) | `HgApfwjAg1L2FJL3fX7A4WX5yfhrVV8k9Ahii5Pn8HVW` | `CnmWkV6B1uXQ8fSiPtDBodeBWu6CfoqXhvAqgTZmL9Dk` · slot 509454201 · authority `HRstpE…` (same) | **Waiting to be registered** in the hub project once hub-web is deployed. Its policy has passed testing on devnet (`tests/live/rewards-pool-policy.json`) |
-| lobby (lobby team) | `5zdBSvep3yV6v1SVD67uw9N5Wb3eT9Hp9D3eg4YSRqRu` | `5uWN3vjanUhyhQzpa4oVhjhp1otjaWq85FeNV9SporKu` · slot **509795184** · authority `HRstpE…` (same) | **Waiting to be registered** in the hub project. Open request for a per-user daily rent cap in the relayer (not implemented yet; required before real players). Per L14, lobby closes its accounts with its own Lobby Worker and does not use the relayer's sweep |
+| rewards-pool (rewards-pool team) | `HgApfwjAg1L2FJL3fX7A4WX5yfhrVV8k9Ahii5Pn8HVW` | `CnmWkV6B1uXQ8fSiPtDBodeBWu6CfoqXhvAqgTZmL9Dk` · slot 509454201 · authority `HRstpE…` (same) | **Registered in `STG_POC`** (pinned · 2026-10-11 · temporary for the hub demo, H-10). Moves to the hub-web project when it exists. Live-tested policy: `tests/live/rewards-pool-policy.json` |
+| lobby (lobby team) | `5zdBSvep3yV6v1SVD67uw9N5Wb3eT9Hp9D3eg4YSRqRu` | `5uWN3vjanUhyhQzpa4oVhjhp1otjaWq85FeNV9SporKu` · slot **509795184** · authority `HRstpE…` (same) | **Registered in `STG_POC`** (pinned · 2026-10-11 · temporary for the hub demo, H-10). Moves to the hub-web project when it exists. Open request for a per-user daily rent cap in the relayer (not implemented yet; required before real players). Per L14, lobby closes its accounts with its own Lobby Worker and does not use the relayer's sweep |
+| demo-game (hub demo game) | `9QfKXj2jLzTy73zmusjduz1ymvomjNindC11xzUkxcD7` | `AZeMgEguDP1JHUs6vvrmYRKJjgfPz5TkUWhk32CJEsXE` · slot 509932792 · authority `HHYUu4WTG8h5pyrfD6uXW9HTzPF5p6fgZxY1iApBZWjw` | Deployed on devnet. **Not registered** in any relayer project (checked with `GET /relayer` on 2026-10-12), so its txs are not sponsored |
 
 testkit instructions (discriminator · accounts):
 - `create` `181ec828051c0777` · [user s, payer w s (payer slot 1), thing PDA `["thing", user]` w, system]

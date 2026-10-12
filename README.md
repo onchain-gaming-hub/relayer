@@ -3,12 +3,16 @@
 Multi-project gasless relayer for Solana — Cloudflare Worker in Rust/Wasm with Durable Objects and D1.
 One project = one Web3Auth clientId (`aud`) = one fee payer wallet = one cluster.
 Spec: `../docs/plans/2026-10-06_multi-project-relayer-v2-spec.md` (extends `2026-10-05_gasless-relayer-poc-spec.md`).
-Phases 1–2 are done: registry, per-project fee payers, project/cluster throttles, and persistent daily limits
-(UTC day) — tx count per user, fee budget per project and per cluster. Devnet only until Phase 5 is approved.
-**v3 (program actions, spec `../docs/plans/2026-10-08_program-actions-v3-spec.md`): Phase 1 done** — the policy
-engine (registered programs/instructions, payer and refund slots, ComputeBudget ceilings, declared fee/rent) runs on
-every program-action tx, which then answers **503 `program_actions_disabled`** until Phase 2 adds simulation +
-inner-ix verification and version pinning. Memo txs are unaffected.
+v2 (registry, per-project fee payers, project/cluster throttles, persistent daily limits per UTC day — tx count per
+user, fee budget per project and per cluster) is done. **Devnet only:** mainnet is disabled.
+**v3 (program actions, spec `../docs/plans/2026-10-08_program-actions-v3-spec.md`): Phases 0–6 done and running on
+devnet staging since 2026-10-09.** A project registers Solana programs and instructions; the relayer then sponsors
+them with: an allowlist of programs/instructions, payer and refund slots for rent, ComputeBudget ceilings, simulation +
+inner-instruction verification, a program version pin (`deploy_slot`), separate daily fee and rent budgets,
+per-project cooldown/backoff, retryable custom errors (409), and a cron sweep that closes expired accounts and returns
+their rent (every 5 minutes). Memo txs work as before.
+Live on staging (2026-10-12): the test program `testkit` and the hub's `lobby` and `rewards-pool` programs. Status,
+ids and limits: `SKILL.md` §2. Not built yet: a per-user daily rent cap.
 
 ```
 POST /relay                    { "transaction": "<base64 wire tx>" }   Authorization: Bearer <Web3Auth idToken>
