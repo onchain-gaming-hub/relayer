@@ -22,6 +22,7 @@ description: Best practices for designing a Solana program and frontend that use
 - The relayer **does not cache program state**. The chain is the only source of truth.
 - Every program to be sponsored must be **registered in the project the player logs in with**. A program shared by several projects is registered separately in each one.
 - **blockchain-games-hub (H-3, 2026-10-10):** the hub has **one project**, the Web3Auth clientId of hub-web.
+  - Until that project exists, the hub demo uses the `STG_POC` project (H-10, temporary). Current registrations: `relayer/SKILL.md` §2.
   - Every hub program (lobby, rewards-pool, games) is registered as a program action in that project. There is no separate project or clientId per game.
   - To disable one game, remove its program from the policy (never leave the policy empty).
   - Quota, budget, RPM, cooldown, `max_instructions` and the fee payer wallet are shared by all games.
